@@ -266,15 +266,18 @@ struct AboutPage {
           // ---- 顶部卡：图标 + 应用名 + 副标题 + 版本（版本行兼作 C13 隐藏入口） ----
           Column() {
             Row() {
-              // 第 10 条：图标与真机统一。旧引用 app.media.ic_app 是**封面兜底图**（192x256 非方形、
-              // 浅灰底 + 小书本），跟启动器上看到的图标本来就不是同一张 —— 这是「关于页图标和实际图标不统一」的根因。
-              // 换成启动器真正在合成的 app.media.layered_image（= background.png 纯蓝底 + foreground.png 白色书本，
-              // 与启动器逐像素同源；SDK 判据：Image 的入参是 PixelMap | ResourceStr | DrawableDescriptor（component/image.d.ts:506），
-              // 而 @ohos.arkui.drawableDescriptor.d.ts:161-188 的 LayeredDrawableDescriptor 注释写明「传入的资源 ID 属于
-              // 含 foreground 与 background 的 JSON 文件」时即由它承接，绘制序 background → mask → foreground。
-              // 21 张 media png 是出包红线，一个字节未动，只换引用。borderRadius 复刻启动器的圆角遮罩；
-              // 万一真机把这层资源渲染成空白，单行兜底 = 换回 $r('app.media.app_icon')（与 startIcon 逐字节相同、同一造型）。
-              Image($r('app.media.layered_image'))
+              // 图标与真机统一（s10 第 10 条提出 → s12 第 4 条结案，两次都动这行，口径以本注释为准）。
+              // 旧引用 app.media.ic_app 是**封面兜底图**（192x256 非方形、浅灰底 + 小书本），跟启动器上看到的
+              // 图标不是同一张 —— 这是「关于页图标和实际图标不统一」的原始根因。
+              // s10 曾换成启动器合成的 app.media.layered_image（background.png 纯蓝底 + foreground.png 白色书本），
+              // 理由 = 与启动器逐像素同源（LayeredDrawableDescriptor，@ohos.arkui.drawableDescriptor.d.ts:161-188）。
+              // **s12 真机实测该改法不成立**：Image 组件里 layered_image 渲染成整块纯白（截图量算 = 图标区
+              // (150,330)-(400,560) 内 54,453 个像素全是 (255,255,255)，而 app_icon.png 主色是 (10,89,247) 蓝
+              // 66,548 像素）⇒ 启动器会自己合成 background+foreground，Image 组件不会，只拿到那层 JSON 描述符
+              // 就画了个空。**结论：Image 组件必须引用成品位图 app_icon**（与 startIcon 逐字节相同、同一造型）。
+              // module.json5:16 的 icon 仍是 layered_image —— 那是启动器用途（启动器会合成），**不要跟着改**。
+              // 21 张 media png 是出包红线，一个字节未动，只换引用。borderRadius 复刻启动器的圆角遮罩。
+              Image($r('app.media.app_icon'))
                 .width(64)
                 .height(64)
                 .borderRadius(14)

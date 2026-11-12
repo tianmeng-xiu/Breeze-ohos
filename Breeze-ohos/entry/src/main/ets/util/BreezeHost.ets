@@ -309,7 +309,15 @@ export class BreezeHost {
     const c0: string = s.charAt(0);
     const c1: string = s.charAt(s.length - 1);
     if (!((c0 === '{' && c1 === '}') || (c0 === '[' && c1 === ']'))) {
-      return v;
+      // s12 第 1/3 条：**只额外放行「成对双引号且能 parse 成字符串」这一种形态**。
+      // 真插件写标量凭据一律是 save_plugin_config(key, JSON.stringify(值))（jmComic bundle 偏移 54959、
+      // bikaComic 偏移 74385 实测）⇒ 落盘形态正是带引号的 JSON 字符串字面量；上游 Dart 侧
+      // plugin_config_bridge.dart:70-81 无条件 jsonDecode 会把引号还原掉，我方旧实现不还原 ⇒
+      // 插件拿回的账号名与 token 都是带引号的字符串（引号是内容的一部分）：哔咔把它塞进请求头
+      // （bundle 偏移 46721）⇒ 401 ⇒ getUserInfoBundle 抛 + 云收藏回 unauthorized。
+      // 仍然**不放行**裸 true/false/数字（开关项按字符串比的老缺陷，见上面的 ⚠ 注释）。
+      const un: string | null = BreezeHost.unwrapJsonStringLiteral(s);
+      return un === null ? v : un;
     }
     try {
       const parsed: ESObject = JSON.parse(s) as ESObject;
@@ -320,6 +328,49 @@ export class BreezeHost {
       // 形似 JSON 但解析失败 ⇒ 原样存字符串（上游同样是 catch 后返回原文）
     }
     return v;
+  }
+
+  /**
+   * 拆「JSON 字符串字面量」：首尾成对双引号且 JSON.parse 出的是**字符串** ⇒ 返回内容，否则 null。
+   * 只认这一种形态是有意的（s12 定案）：上游无条件 jsonDecode 连 'true'/'12' 也会洗掉类型，
+   *  MangaDex 类插件的取值器写 String(v) 与 'true' 比字符串 ⇒ 放宽会退回「开关看着没生效」；
+   *  而凭据/账号名这条真链路落盘形态恰好只有「带引号的字符串字面量」这一种，放行它就够。
+   */
+  private static unwrapJsonStringLiteral(s: string): string | null {
+    const t: string = s.trim();
+    if (t.length < 2 || t.charAt(0) !== '"' || t.charAt(t.length - 1) !== '"') {
+      return null;
+    }
+    try {
+      const p: ESObject = JSON.parse(t) as ESObject;
+      if (typeof p === 'string') {
+        return p as string;
+      }
+    } catch (e) {
+      // 首尾是引号但不是合法字面量（值里本来就带引号）⇒ 原样，绝不猜
+    }
+    return null;
+  }
+
+  /**
+   * 读桶时**幂等归一**存量脏值（s12 第 1/3 条的第二半，缺它则真机升级后仍坏）：
+   * 脏值是上一版 decodeMaybeJson 不收引号时写进去的（bucket 里存着带引号的字符串），
+   * 只修写入侧 = 老用户必须重登一次才好。这里在**读**的出口按同一条判据还原 ⇒
+   * 老库无需迁移立刻可鉴权；下一次 saveConfig 会把归一后的桶整体写回，自然就干净了。
+   * 只做一层、只动字符串值：对象/数组/数字/布尔一律原样（对象是当年 {} 分支正常解出来的）。
+   */
+  private static healBucket(obj: ESObject): ESObject {
+    const keys: string[] = Object.keys(obj);
+    for (let i = 0; i < keys.length; i++) {
+      const v: ESObject = obj[keys[i]];
+      if (typeof v === 'string') {
+        const un: string | null = BreezeHost.unwrapJsonStringLiteral(v as string);
+        if (un !== null) {
+          obj[keys[i]] = un;
+        }
+      }
+    }
+    return obj;
   }
 
   /**
@@ -382,7 +433,7 @@ export class BreezeHost {
     try {
       const obj: ESObject = JSON.parse(raw);
       if (obj !== null && obj !== undefined && typeof obj === 'object' && !Array.isArray(obj)) {
-        return obj;
+        return BreezeHost.healBucket(obj);
       }
     } catch (e) {
       Logger.w('plugin_config 桶 ' + runtime + ' 内容非法，重建空桶');

@@ -35,6 +35,318 @@ import { Logger } from '../../util/Logger';
 // 整批探测上限的权威值在 data/cloud/CloudFavoriteSync（PROBE_BATCH_MS=12000）。
 // 旧版这里另有一份 40000 且全文没用到 = 「重新检查持续加载」没有上限的成因之一，s11 删掉。
 
+// ==== 展示面脱敏与登录态指引（s12 第 3 条的界面面）begin ====
+/**
+ * 云收藏的失败文案直接来自插件回包，里面可能整段带上插件写进宿主持久化的账号数据
+ * （真机截图实测：data 里 password 的值是明文，整段甩在页面上）。这一组只做展示面处理：
+ *  - sanitizeErrText：命中凭据类键名就把它的**值**换成三个星号（键名保留，用户还要看得出
+ *    是哪里出的错），其余文字一律不动；再把连续空白压成一个空格（原文是多行 JSON，逐行
+ *    铺开占半屏且没有信息量），最后限长；
+ *  - loginExpiredHint：原文含 unauthorized、登录过期、重新登录 时补一行可操作指引。
+ * 根因（插件存进配置的标量被 JSON 字面量污染）在 util/BreezeHost.ets 侧修：本文件不判根因、
+ * 不改数据，只在写进 this.message 的出口统一过一遍。
+ */
+/** 命中即打码其值的键名（小写比对；account 与 username 不在列，口径由派工给定）。 */
+const SECRET_KEYS: string[] = [
+  'password', 'passwd', 'pwd', 'token', 'jwt', 'cookie', 'set-cookie',
+  'authorization', 'secret', 'apikey', 'api_key', 'access_token',
+  'refresh_token', '密码'
+];
+/** 展示上限：那段 scheme 加 data 的原文有几百字符，占满半屏。 */
+const ERR_TEXT_MAX: number = 400;
+/** 超限时保留的头/尾长度：原因常落在尾部（unauthorized 就在尾段），只留头部会把原因切掉。 */
+const ERR_HEAD_MAX: number = 280;
+const ERR_TAIL_MAX: number = 120;
+/** 触发登录态指引的关键词（小写比对）。 */
+const LOGIN_KEYS: string[] = ['unauthorized', '登录过期', '重新登录'];
+
+/** 反斜杠：多处判定要用，集中一处免得每行写转义。 */
+const BSL: string = '\\';
+
+/** 待打码区间（原文下标，左闭右开）；必须是已声明类，严格模式不认裸对象字面量。 */
+class MaskSpan {
+  start: number = 0;
+  end: number = 0;
+
+  constructor(start: number, end: number) {
+    this.start = start;
+    this.end = end;
+  }
+}
+
+/**
+ * 已转小写的原文里判「单词字符」：键名两侧紧贴字母或数字就不算命中，挡掉 passwordless、
+ * tokens 这类单词变形；**下划线刻意不算单词字符** —— password_md5、access_token、user_pwd
+ * 这种下划线键名正是真凭据的常见写法，宁可多打码也不能漏（漏一个就是把明文留在屏幕上）。
+ */
+function isWordCh(ch: string): boolean {
+  if (ch.length === 0) {
+    return false;
+  }
+  if (ch >= 'a' && ch <= 'z') {
+    return true;
+  }
+  return ch >= '0' && ch <= '9';
+}
+
+function keyStandalone(s: string, at: number, keyLen: number): boolean {
+  const before: string = at === 0 ? '' : s.charAt(at - 1);
+  const after: string = at + keyLen >= s.length ? '' : s.charAt(at + keyLen);
+  return !isWordCh(before) && !isWordCh(after);
+}
+
+function isBlankCh(ch: string): boolean {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
+/** 结构化终止符：JSON 的逗号分号括号、query 的与号、中文标点（中文文案里的天然断点）。 */
+function isStructStop(ch: string): boolean {
+  return ch === ',' || ch === ';' || ch === '&' || ch === '}' || ch === ']'
+    || ch === '，' || ch === '。' || ch === '、';
+}
+
+/** 裸值的终止符：空白或结构化终止符。引号与反斜杠**刻意不算**（否则转义值一个字符都吃不掉）。 */
+function isBareStop(ch: string): boolean {
+  return isBlankCh(ch) || isStructStop(ch);
+}
+
+function skipBlank(s: string, i: number): number {
+  let p: number = i;
+  while (p < s.length && isBlankCh(s.charAt(p))) {
+    p += 1;
+  }
+  return p;
+}
+
+/** 从 p 往回数紧贴 p 的连续反斜杠个数（判引号是被转义过的还是真收尾）。 */
+function backRun(s: string, p: number): number {
+  let k: number = 0;
+  while (p - 1 - k >= 0 && s.charAt(p - 1 - k) === BSL) {
+    k += 1;
+  }
+  return k;
+}
+
+/**
+ * 结构化边界，只在引号形态当兜底：多层转义时按引号找不到闭合，会一路跑到文末，
+ * 把后面整段可读信息吃掉 ⇒ 那种情况退到最近的结构化边界，宁可多打码一个字段，
+ * 也不把半屏原文留在屏幕上。
+ */
+function valueBoundary(s: string, i: number): number {
+  for (let p: number = i; p < s.length; p++) {
+    if (isStructStop(s.charAt(p))) {
+      return p;
+    }
+  }
+  return s.length;
+}
+
+/**
+ * 从开引号之后扫到闭引号之后（含闭引号）。判闭合看反斜杠条数的奇偶：
+ * 普通串里偶数条（含 0 条）之后的引号才是闭引号；被转义过一层的值相反，奇数条才算。
+ */
+function valueSpanQuoted(s: string, from: number, escForm: boolean): number {
+  const wantOdd: boolean = escForm;
+  for (let p: number = from; p < s.length; p++) {
+    if (s.charAt(p) === '"') {
+      const odd: boolean = backRun(s, p) % 2 === 1;
+      if (odd === wantOdd) {
+        return p + 1;
+      }
+    }
+  }
+  return s.length;
+}
+
+/**
+ * 从值的起始下标扫到结束（不含）；返回等于入参表示这里没有值，调用方跳过这一处。
+ * 三种形态都要覆盖：普通双引号串、被转义过一层或多层的引号串（真机截图正是这种）、裸值。
+ */
+function valueSpan(s: string, i: number): number {
+  const n: number = s.length;
+  if (i >= n) {
+    return i;
+  }
+  // 值开头可能是一串反斜杠再加引号：一层转义是 1 条，套两层是 3 条，都要认
+  let run: number = 0;
+  while (i + run < n && s.charAt(i + run) === BSL) {
+    run += 1;
+  }
+  if (run > 0 && s.charAt(i + run) === '"') {
+    // 两侧兜底：没扫到闭合引号（返回串尾）⇒ 退到结构化边界，别把后面整段可读信息吃掉；
+    // 扫到了闭合引号 ⇒ 与结构化边界**取大**。取大是防「值被 stringify 套两层时奇偶判据反掉、
+    // 找到的闭合点早于值的真实结束」⇒ 星号后面漏明文。代价 = 极端情况多打码一个字段，
+    // 安全侧取舍（宁可多打码，不能漏明文）。
+    const q: number = valueSpanQuoted(s, i + run + 1, run % 2 === 1);
+    if (q >= n) {
+      return valueBoundary(s, i);
+    }
+    const bd: number = valueBoundary(s, i);
+    return q >= bd ? q : bd;
+  }
+  if (s.charAt(i) === '"') {
+    const q2: number = valueSpanQuoted(s, i + 1, false);
+    if (q2 >= n) {
+      return valueBoundary(s, i);
+    }
+    const bd2: number = valueBoundary(s, i);
+    return q2 >= bd2 ? q2 : bd2;
+  }
+  let p: number = i;
+  while (p < n && !isBareStop(s.charAt(p))) {
+    p += 1;
+  }
+  if (p === i) {
+    return i;
+  }
+  // 认证头的值本身含空格（Bearer 加一段 token）：先只吃到空格，认出这一档再往后吃到结构边界
+  const head: string = s.slice(i, p).toLowerCase();
+  if (head === 'bearer' || head === 'basic' || head === 'digest') {
+    while (p < n && !isStructStop(s.charAt(p))) {
+      p += 1;
+    }
+  }
+  return p;
+}
+
+/** 连续空白压成一个空格并去首尾：只并空白，不删任何词。 */
+function collapseBlank(s: string): string {
+  const out: string[] = [];
+  let needSpace: boolean = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch: string = s.charAt(i);
+    if (isBlankCh(ch)) {
+      if (out.length > 0) {
+        needSpace = true;
+      }
+      continue;
+    }
+    if (needSpace) {
+      out.push(' ');
+      needSpace = false;
+    }
+    out.push(ch);
+  }
+  return out.join('');
+}
+
+/** 限长：超长时留头留尾（原因常落在尾部，只留头会把 unauthorized 切掉），中间标出省略字数。 */
+function clampErrText(text: string): string {
+  if (text.length <= ERR_TEXT_MAX) {
+    return text;
+  }
+  const omitted: number = text.length - ERR_HEAD_MAX - ERR_TAIL_MAX;
+  if (omitted <= 0) {
+    return text.slice(0, ERR_TEXT_MAX);
+  }
+  return text.slice(0, ERR_HEAD_MAX) + ' …（中间省略 ' + omitted + ' 字）… ' +
+    text.slice(text.length - ERR_TAIL_MAX);
+}
+
+/**
+ * 写进页面之前统一过这里：凭据值打码 → 并空白 → 限长。
+ * 保守口径：只替换值、不删其他文字，unauthorized 与 message 这类可读信息一律留下
+ * （登录态指引还要靠这些词判定）。
+ */
+function sanitizeErrText(raw: string): string {
+  if (raw.length === 0) {
+    return '';
+  }
+  const low: string = raw.toLowerCase();
+  // toLowerCase 对极少数字符会改变长度，长度一变下面这些下标就对不上原文：
+  // 这种情况宁可整段不打码（照样并空白与限长），也不按错位的下标去切值
+  if (low.length !== raw.length) {
+    return clampErrText(collapseBlank(raw));
+  }
+  const spans: MaskSpan[] = [];
+  for (let k = 0; k < SECRET_KEYS.length; k++) {
+    const key: string = SECRET_KEYS[k];
+    let from: number = 0;
+    // 上界 = 原文长度：每轮 from 至少前进 key.length，这个 guard 只是防呆（不依赖它终止）
+    let guard: number = 0;
+    while (from < low.length && guard <= low.length) {
+      guard += 1;
+      const at: number = low.indexOf(key, from);
+      if (at < 0) {
+        break;
+      }
+      from = at + key.length;
+      if (!keyStandalone(low, at, key.length)) {
+        continue;
+      }
+      let p: number = at + key.length;
+      // 键名尾巴（下划线续接的部分，如 password_md5 的 _md5）一起吃掉再判分隔符
+      while (p < low.length && (low.charAt(p) === '_' || isWordCh(low.charAt(p)))) {
+        p += 1;
+      }
+      // 再吃键名自己的收尾引号（转义形态是好几条反斜杠加引号），才认得到后面的冒号或等号
+      if (low.charAt(p) === '"') {
+        p += 1;
+      } else if (low.charAt(p) === BSL) {
+        const rb: number = backRun(low, p + 1);
+        if (rb > 0 && p + rb < low.length && low.charAt(p + rb) === '"') {
+          p += rb + 1;
+        }
+      }
+      p = skipBlank(low, p);
+      const sep: string = low.charAt(p);
+      if (sep !== ':' && sep !== '=' && sep !== '：') {
+        continue;
+      }
+      const vs: number = skipBlank(low, p + 1);
+      const ve: number = valueSpan(low, vs);
+      if (ve > vs) {
+        spans.push(new MaskSpan(vs, ve));
+      }
+    }
+  }
+  spans.sort((a: MaskSpan, b: MaskSpan): number => a.start - b.start);
+  const parts: string[] = [];
+  let cursor: number = 0;
+  for (let i = 0; i < spans.length; i++) {
+    const sp: MaskSpan = spans[i];
+    if (sp.start < cursor) {
+      // 与上一段重叠（cookie 也会命中 set-cookie 的尾巴）：跳过，不重复打码
+      continue;
+    }
+    if (sp.start > cursor) {
+      parts.push(raw.slice(cursor, sp.start));
+    }
+    parts.push('***');
+    cursor = sp.end;
+  }
+  if (cursor < raw.length) {
+    parts.push(raw.slice(cursor));
+  }
+  return clampErrText(collapseBlank(parts.join('')));
+}
+
+/**
+ * 登录态失效时补一行可操作指引。**只给文案**：不调登录、不加跳转（登录页路由参数不归本页）。
+ * 文案不硬编码插件名；who 传当前选中源的展示名，拿不到就走通用路径描述。
+ */
+function loginExpiredHint(raw: string, who: string): string {
+  if (raw.length === 0) {
+    return '';
+  }
+  const low: string = raw.toLowerCase();
+  let hit: boolean = false;
+  for (let i = 0; i < LOGIN_KEYS.length; i++) {
+    if (low.indexOf(LOGIN_KEYS[i]) >= 0) {
+      hit = true;
+      break;
+    }
+  }
+  if (!hit) {
+    return '';
+  }
+  const path: string = who.length > 0
+    ? ('更多 - 插件管理 - ' + who + ' - 账号登录')
+    : '更多 - 插件管理 - 对应插件 - 账号登录';
+  return '这一步不用重试：该源站的登录态已失效，请到「' + path + '」重新登录，再回来同步。';
+}
+// ==== 展示面脱敏与登录态指引（s12 第 3 条的界面面）end ====
+
 export class CloudPageStatus {
   static readonly IDLE: string = 'idle';
   static readonly PROBING: string = 'probing';
@@ -57,6 +369,11 @@ export struct CloudPage {
   @State status: string = CloudPageStatus.IDLE;
   /** 结果/错因文案（失败也走它，页内常驻显示，不靠 toast 一闪而过）。 */
   @State message: string = '';
+  /**
+   * 失败时的可操作指引（只在命中登录态判据时非空）。**必须是 @State**：它直接喂 Text，
+   * 非状态变量的变化不触发重渲染（s11 那个按钮永远灰 = 同族坑）。
+   */
+  @State failedHint: string = '';
   /** 同步中的实时条数。 */
   @State liveCount: number = 0;
 
@@ -114,6 +431,7 @@ export struct CloudPage {
     }
     this.probing = true;
     this.status = CloudPageStatus.PROBING;
+    this.failedHint = '';
     this.message = '';
     try {
       const all: CloudCapability[] = await CloudFavoriteSync.listCapabilities();
@@ -135,6 +453,7 @@ export struct CloudPage {
         this.status = CloudPageStatus.IDLE;
         if (pending > 0) {
           this.message = '还有 ' + pending + ' 个插件没及时回应，可点「重新检查」再看一次。';
+          this.failedHint = '';
         }
       }, Anim.contentIn, Anim.curveEaseOut());
       Logger.i('云收藏能力探测：支持 ' + ok.length + '/' + all.length + ' 个插件源，未回应 ' + pending + ' 个');
@@ -143,7 +462,10 @@ export struct CloudPage {
     } catch (err) {
       Logger.ex('云收藏能力探测异常', err as Object);
       this.status = CloudPageStatus.FAILED;
-      this.message = (err as Error).message;
+      // 探测异常的原文同样可能带插件配置（探测里要读插件设置）⇒ 同一口径先脱敏再上屏；
+      // 探测阶段没有选中源，指引只能给通用路径
+      this.message = sanitizeErrText((err as Error).message);
+      this.failedHint = loginExpiredHint((err as Error).message, '');
     } finally {
       this.probing = false;
       // 兜底：status 仍停在 PROBING 说明上面两条路都没落回（极端：Anim.to 未执行）。
@@ -216,6 +538,7 @@ export struct CloudPage {
     this.syncing = true;
     this.status = CloudPageStatus.SYNCING;
     this.liveCount = 0;
+    this.failedHint = '';
     this.message = '';
     try {
       const res: CloudSyncResult = await CloudFavoriteSync.sync(c.sourceId,
@@ -226,6 +549,7 @@ export struct CloudPage {
         const tail: string = res.reachedEnd ? '' : '（已达本次上限，可再点一次继续）';
         this.status = CloudPageStatus.DONE;
         this.message = '已同步 ' + res.synced + ' 条到书架，其中新增 ' + res.added + ' 条' + tail;
+        this.failedHint = '';
         // 书架页靠 AppStorage 'shelfRevision' 静默重查（同 DetailPage 加/移书架的口径）：真新增了才推。
         if (res.added > 0) {
           const cur: number = AppStorage.get<number>('shelfRevision') ?? 0;
@@ -233,12 +557,17 @@ export struct CloudPage {
         }
       } else {
         this.status = CloudPageStatus.FAILED;
-        // 未登录等插件自抛的中文提示原样透出，不加前缀（用户要看到插件自己的话）。
-        this.message = res.err.length > 0 ? res.err : '同步失败';
+        // 未登录等插件自抛的中文提示原样透出，不加前缀（用户要看到插件自己的话）；
+        const why: string = res.err.length > 0 ? res.err : '同步失败';
+        // 原文里可能整段带插件账号与明文密码（真机截图实测）⇒ 必须先过 sanitizeErrText
+        this.message = sanitizeErrText(why);
+        this.failedHint = loginExpiredHint(why, this.nameOf(c));
       }
     } catch (err) {
       this.status = CloudPageStatus.FAILED;
-      this.message = (err as Error).message;
+      // 原文同样可能是插件自抛的整段回包 ⇒ 与失败出口同一口径：先脱敏再上屏
+      this.message = sanitizeErrText((err as Error).message);
+      this.failedHint = loginExpiredHint((err as Error).message, this.nameOf(c));
       Logger.ex('云收藏同步按钮异常', err as Object);
     } finally {
       this.syncing = false;
@@ -272,6 +601,7 @@ export struct CloudPage {
           Anim.to((): void => {
             this.sourceIndex = i;
             this.message = '';
+            this.failedHint = '';
             this.status = CloudPageStatus.IDLE;
           }, Anim.contentIn, Anim.curveEaseOut());
         }
@@ -375,6 +705,16 @@ export struct CloudPage {
                 .width('100%')
                 .textAlign(TextAlign.Start)
                 .margin({ top: 12 })
+            }
+
+            // 登录态失效另起一行可操作指引：原文只有 unauthorized 这类词，用户不知道下一步做什么
+            if (this.failedHint.length > 0) {
+              Text(this.failedHint)
+                .fontSize(13)
+                .fontColor(Theme.brand)
+                .width('100%')
+                .textAlign(TextAlign.Start)
+                .margin({ top: 8 })
             }
 
             if (this.status === CloudPageStatus.DONE) {

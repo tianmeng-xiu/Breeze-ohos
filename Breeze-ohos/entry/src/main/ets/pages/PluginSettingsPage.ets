@@ -391,6 +391,25 @@ struct PluginSettingsPage {
     // 的唯一入口，收掉或锁死等于把人锁在门外（BUG-A 同类的错误：修一个显示问题、堵死一条主路径）。
     const switchable: boolean = this.bundle.canLogin || hasLogout;
 
+    // s12 第 2 条（真机 2026-11-12 20:18，禁漫天堂 0.0.7）：顶卡不在 info 档（= 卡片上没有
+    // 「已登录」那一行）⇒ 账号名没有展示位，可见设置项里凡是键名像账号键的项一律不进列表
+    // （下面字段循环里那条）。
+    // 现场根因：auth.account 落在 IDENTIFIER_SEGMENTS ⇒ isCredentialKey 判 false ⇒ 它不属于
+    // BUG3-b 那条凭据剔除；而未登录时 infoMode=false ⇒ canTakeOver=false、cardName 为空串，
+    // 两道去重闸都放行 ⇒ 未登录态下面挂着一行可点可改的用户名（用户报的「登出后用户名依旧在，
+    // 并且可以修改」）。与 dropAccountFields 是两条互补判据：那条管「已登录时去掉同值重复项」
+    // （要有 cardName 才动手），这条管「未登录时不留可改残留」（恰恰是 cardName 为空那一档）。
+    //
+    // 为什么还要 && switchable（lead 结案收窄，原实现只看顶卡档位）：本文件既有防锁死原则
+    // （上面 switchable 的注释）= 用户没有别的登录出路时，那一行就是填账号的唯一入口，绝不能隐。
+    // 两个效果都是实测/在册取证要保的：① 在线翻译类插件（canShowUserInfo=false、canLogin=false、
+    // 无登出动作）设置项里有一项 key=translate.email，归一后以 email 结尾会被「像账号键」误命中
+    // ⇒ 无卡档下被隐掉，用户再也填不了那个可选邮箱；② 未来出现「无登录页 + 无登录卡 + 账号项
+    // 是纯持久化字段」的插件时不会把人锁死。禁漫天堂 canLogin=true 且自报 clearPluginSession、
+    // 哔咔 canLogin=true ⇒ switchable 恒真 ⇒ 本条对两个真机现场一点没削弱。
+    const hideAccountRows: boolean = switchable && this.topCardMode() !== 'info';
+
+
     // 要求6：登出入口只留一处。卡片上那行「退出登录」的显示条件就是顶卡走 'info' 档，即上面那个
     // infoMode（与 topCardMode() 第一档同判据，不再重述第三遍）。该档成立时把动作组里同 fnPath 的
     // 这条**隐掉**，否则同一页出现两个登出入口（用户第 5 条就在抱怨重复项）。其余档位（登录卡 /
@@ -413,6 +432,13 @@ struct PluginSettingsPage {
         const f: SettingField = sec.fields[j];
         // BUG3-b：password 类字段既不能显示现值、也不给编辑入口（值仍在 values 里，插件自己读得到）
         if (f.kind === 'password' || isCredentialKey(f.key)) {
+          continue;
+        }
+        // s12 第 2 条：未登录档（顶卡非 info **且用户另有登录出路**）隐掉账号名行。**带 fnPath 的项不隐** —— 那是插件自报的
+        // 服务端 setter（与 :1068 / :1105 同一条 fnPath 例外，用户明示的「除非上游提供对云端用户名的
+        // 修改」），隐掉等于抹掉插件自己给的账号通路。非账号项一律不受本条影响。
+        if (hideAccountRows && f.fnPath.length === 0
+          && looksLikeUsernameKey(normalizeDisplayKey(f.key))) {
           continue;
         }
         kept.push(f);
