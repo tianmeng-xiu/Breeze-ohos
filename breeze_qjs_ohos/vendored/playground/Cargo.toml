@@ -1,0 +1,81 @@
+[package]
+name = "rquickjs_playground"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["host-fs"]
+host-fs = []
+# 域名前置（IP 直连 / SNI 绕过）。默认关闭。
+# web_runtime.rs 里注册 __http_set/get/clear_front_hosts 三个全局函数的
+# `#[cfg(feature = "host-fronting")]` 就落在这个 crate，所以 feature 必须
+# 声明在这里；windcore 通过 `host-fronting = ["rquickjs_playground/host-fronting"]` 转发。
+host-fronting = []
+
+[dependencies]
+rquickjs = { version = "0.12.0", features = ["futures", "parallel", "loader", "macro"] }
+fluent-bundle = "0.15"
+unic-langid = { version = "0.9", features = ["macros"] }
+serde_json = "1.0.150"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = [
+    "rt-multi-thread",
+    "rt",
+    "macros",
+    "sync",
+    "time",
+] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "http2",
+    "json",
+    "stream",
+    "charset",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "cookies",
+    "multipart",
+    "rustls-no-provider",
+    "system-proxy",
+    "socks",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+reqwest-middleware = { version = "0.5.2", features = [
+    "form",
+    "json",
+    "multipart",
+    "query",
+] }
+http = "1.0"
+async-trait = "0.1.51"
+anyhow = "1.0.102"
+tracing = "0.1.44"
+base64 = "0.22.1"
+filetime = "0.2.29"
+getrandom = "0.4.3"
+hmac = "0.12.1"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+pbkdf2 = "0.12.2"
+uuid = { version = "1.23.3", features = ["v4", "fast-rng"] }
+url = "2.5.8"
+md5 = "0.8.0"
+aes = "0.8.4"
+cbc = "0.1.2"
+aes-gcm = "0.10.3"
+flate2 = "1.1.9"
+srcmap-sourcemap = "0.3.9"
+scraper = "0.27.0"
+ego-tree = "0.11.0"
+regex = "1.12.4"
+subtle = "2.6"
+jiff = "0.2.32"
+jiff-icu = "0.2.2"
+icu = "2.2.0"
+writeable = "0.6"
+
+[dev-dependencies]
+axum = "0.8.9"
+tiny_http = "0.12.0"
+regex = "1.12.4"

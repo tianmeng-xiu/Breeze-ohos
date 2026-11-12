@@ -1,0 +1,20 @@
+# 职责：breeze_qjs_ohos 交叉编译 OpenHarmony 的工具链配置（linker / cc-rs / bindgen）。
+#
+# 本文件随源码入库，因此**只允许出现与机器无关的配置**。
+# 所有含本机绝对路径的项（NDK clang / sysroot / libclang / mingw 头文件目录 / 临时目录 /
+# git CA bundle 与镜像）都在同目录的 `config.local.toml` 里，该文件已 gitignore，由
+#     node scripts/sync_cargo_config.cjs
+# 从仓库根现算生成（可用 OHOS_ROOT / OHOS_NDK / OHOS_MINGW_INC 等环境变量覆盖，见该脚本头部）。
+# 下面第一行的 include 会把它并进来；optional = true 表示文件不存在时 cargo 直接忽略，
+# 因此没生成过 local 配置的机器只是编不动交叉目标，不会报"配置文件错误"。
+include = [{ path = "config.local.toml", optional = true }]
+
+[target.aarch64-unknown-linux-ohos]
+rustflags = [
+  # NDK 的 *-ohos-clang 是 sh shim，Windows 下不能直接 exec，所以用 clang.exe 当链接器，
+  # target 与 sysroot 经 link-arg 传进去（sysroot 那条在 config.local.toml 里）。
+  "-C", "link-arg=--target=aarch64-linux-ohos",
+  # 必须显式 DT_NEEDED libace_napi.z.so：不链时 napi_* 全是无来源的 UNDEF（NEEDED 只剩 libc.so），
+  # 真机 dlopen 解析不到符号 → ArkTS `import from 'libxxx.so'` 拿到 undefined（真机首验踩到）。
+  "-C", "link-arg=-lace_napi.z",
+]

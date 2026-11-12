@@ -1,0 +1,66 @@
+# 职责：S1 spike —— 验证 rquickjs_playground 及其宿主依赖链能否交叉编译到 aarch64-unknown-linux-ohos。
+# 阶段1（零依赖 hello）：已通过，产物 libbreeze_qjs_ohos.so 559,152B。
+# 阶段2：引入 playground 的真实依赖集（不含 axum：它只被 src/tests/task_runtime.rs 使用）。
+# 注意：rquickjs 的 "macro" feature 会让 rquickjs-sys 也为**宿主**编译一份 quickjs C 源码
+# （rquickjs-macro → rquickjs-core → rquickjs-sys，proc-macro 必须 host 构建）——本机无 MSVC，
+# 正用 msys2 mingw-w64 gcc 兜底；先用无 macro 的配置打通目标侧，再补 macro 验证宿主侧。
+[package]
+name = "breeze_qjs_ohos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "breeze_qjs_ohos"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 上游 playground 的本地副本（src/js/locales 原样拷入，仅改 Cargo.toml 的 rustls provider / 去掉 bindgen）
+rquickjs_playground = { path = "vendored/playground" }
+rquickjs = { version = "0.12.0", features = ["futures", "parallel", "loader", "macro"] }
+fluent-bundle = "0.15"
+unic-langid = { version = "0.9", features = ["macros"] }
+serde_json = "1.0.150"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "rt", "macros", "sync", "time"] }
+# 关键偏差：上游用 reqwest 的 "rustls"（= aws-lc-rs provider），aws-lc-sys 需要 cmake + 一整套
+# 交叉构建脚本（本机无 cmake，且 OHOS 交叉时还要传 toolchain 文件）——改用 "rustls-no-provider"
+# + 自选 ring provider（ring 0.17 用 cc/asm 即可，NDK clang 能编），启动时 install_default 一次。
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "http2", "json", "stream", "charset", "gzip", "brotli", "deflate", "zstd",
+    "cookies", "multipart", "rustls-no-provider", "system-proxy", "socks",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+reqwest-middleware = { version = "0.5.2", features = ["form", "json", "multipart", "query"] }
+http = "1.0"
+async-trait = "0.1.51"
+anyhow = "1.0.102"
+tracing = "0.1.44"
+base64 = "0.22.1"
+filetime = "0.2.29"
+getrandom = "0.4.3"
+hmac = "0.12.1"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+pbkdf2 = "0.12.2"
+uuid = { version = "1.23.3", features = ["v4", "fast-rng"] }
+url = "2.5.8"
+md5 = "0.8.0"
+aes = "0.8.4"
+cbc = "0.1.2"
+aes-gcm = "0.10.3"
+flate2 = "1.1.9"
+srcmap-sourcemap = "0.3.9"
+scraper = "0.27.0"
+ego-tree = "0.11.0"
+regex = "1.12.4"
+subtle = "2.6"
+jiff = "0.2.32"
+jiff-icu = "0.2.2"
+icu = "2.2.0"
+writeable = "0.6"
+
+# 与上游一致：rquickjs-sys 0.12 交叉编译补丁（DelSkayn/rquickjs#709）。
+# 已 vendor 到本地（deretame fork + quickjs-ng 0.15.1@fd0a021 源码），并把版本号对齐到 0.12.2
+# 以便命中 rquickjs-core 0.12.2 的 ^0.12.2 依赖约束（否则 patch 显示 unused）。
+[patch.crates-io]
+rquickjs-sys = { path = "vendored/rquickjs-sys" }

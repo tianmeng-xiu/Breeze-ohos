@@ -1,0 +1,86 @@
+/**
+ * 职责：动效基线 —— 动效时长/曲线 Token 的唯一来源 + 统一动效入口 Anim.to()。
+ * 依赖：@kit.ArkUI curves（springMotion / cubicBezierCurve 已由 spike SPIKE-04/06 实证可编译）。
+ * 规范：
+ *  - Anim.disabled 恒 false：settings.ANIMATOR_DURATION_SCALE 自 API21 废弃、API26 d.ts 已不导出，
+ *    全 SDK 无 reduce-motion 替代 API（spike SPIKE-09b 实证），要关动效走应用内偏好开关（本期不做）。
+ *  - Anim.to() 内部走 UIContext.animateTo（禁全局 animateTo，§3）。UIContext 需在组件树里绑定：
+ *    BreezeBottomTab.aboutToAppear 里 Anim.bind(this.getUIContext())（Index 禁段不动，故不在那里绑）。
+ *    未绑定 / disabled / dur<=0 时直接执行 op（不动画），行为退化为改造前。
+ */
+import { curves } from '@kit.ArkUI';
+
+/** §3 动效 Token */
+export class Anim {
+  // ---------------- 时长（ms） ----------------
+  /** 页签切换（spring） */
+  static readonly tabSwitch: number = 260;
+  /** SymbolGlyph 弹跳动效 */
+  static readonly iconBounce: number = 220;
+  /** 顶栏收起 / 展开 */
+  static readonly barCollapse: number = 280;
+  /** 内容进场（透明度 + 上移 12vp） */
+  static readonly contentIn: number = 220;
+  /** 顶栏标题淡切 */
+  static readonly topBarFade: number = 180;
+
+  // ---------------- 曲线 ----------------
+  /** 页签切换曲线：springMotion(response=0.34, damping=0.85)（§3，与 spike 一致） */
+  static curveTabSwitch(): curves.ICurve {
+    return curves.springMotion(0.34, 0.85);
+  }
+
+  /** 顶栏收起/展开曲线：EaseInOut（cubicBezier 0.4,0,0.2,1） */
+  static curveBarCollapse(): curves.ICurve {
+    return curves.cubicBezierCurve(0.4, 0, 0.2, 1);
+  }
+
+  /** 内容进场 / 标题淡切曲线：EaseOut（cubicBezier 0.33,1,0.68,1） */
+  static curveEaseOut(): curves.ICurve {
+    return curves.cubicBezierCurve(0.33, 1, 0.68, 1);
+  }
+
+  // ---------------- 闸门与入口 ----------------
+  /** 动效总闸：恒 false（见文件头说明 —— 系统缩放 API 已废弃不可读，无替代） */
+  static readonly disabled: boolean = false;
+
+  /** UIContext 绑定（组件 aboutToAppear 里调；未绑定时 to() 直接执行） */
+  private static ctx: UIContext | null = null;
+
+  static bind(ctx: UIContext): void {
+    Anim.ctx = ctx;
+  }
+
+  /**
+   * 统一动效入口：dur<=0 / disabled / 未绑定 UIContext ⇒ 直接执行 op（等价旧行为）。
+   * curve 不传默认 EaseOut。
+   */
+  static to(op: () => void, dur: number, curve?: curves.ICurve): void {
+    const c: UIContext | null = Anim.ctx;
+    if (Anim.disabled || c === null || dur <= 0) {
+      op();
+      return;
+    }
+    c.animateTo({ duration: dur, curve: curve ?? Anim.curveEaseOut() }, () => {
+      op();
+    });
+  }
+
+  // ---------------- 顶栏滚动进度（C6-① → C5 消费） ----------------
+  /** 斜坡高度：内容从 0 滚到 80vp，顶栏由全透明渐变到全实底（§7 A5） */
+  static readonly topBarRampVp: number = 80;
+
+  /**
+   * 把滚动偏移折算成 0–1 进度写入 AppStorage 'topBarProgress'（AppKeys.topBarProgress）。
+   * 各页滚动容器的 onDidScroll 直接调它，禁在页面里写斜坡常量。
+   */
+  static reportTopBar(offsetVp: number): void {
+    let p: number = 0;
+    if (offsetVp >= Anim.topBarRampVp) {
+      p = 1;
+    } else if (offsetVp > 0) {
+      p = offsetVp / Anim.topBarRampVp;
+    }
+    AppStorage.setOrCreate<number>('topBarProgress', p);
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/ReaderPage",
+    "pages/PluginManagerPage",
+    "pages/HistoryPage",
+    "pages/SearchPage",
+    "pages/PluginSettingsPage",
+    "pages/DetailPage",
+    "pages/CommentPage",
+    "pages/SettingPage",
+    "pages/PluginLoginPage",
+    "pages/AboutPage"
+  ]
+}

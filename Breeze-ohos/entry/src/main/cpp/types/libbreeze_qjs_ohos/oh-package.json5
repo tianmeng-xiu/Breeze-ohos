@@ -1,0 +1,8 @@
+{
+  "name": "libbreeze_qjs_ohos.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "Breeze plugin engine (rquickjs + upstream playground), prebuilt by scripts/build_rust_ohos.sh",
+  "author": "Breeze",
+  "license": "GPL-3.0"
+}

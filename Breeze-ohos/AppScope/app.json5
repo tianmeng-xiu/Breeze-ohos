@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.breeze.ohos",
+    "vendor": "breeze",
+    "versionCode": 3000037,
+    "versionName": "3.0.37",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}

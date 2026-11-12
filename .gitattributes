@@ -1,0 +1,16 @@
+# 行尾统一：本仓库文本一律 LF 入库、LF 检出。
+# 原因：scripts/*.sh 是 bash 脚本，检出成 CRLF 会让 bash 报 "$'\r': command not found"；
+# 上游 PortableGit 的 system 配置里 core.autocrlf=true，会静默改写工作区，故在此显式钉死。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.hap binary
+*.hsp binary
+*.so binary
+*.ttf binary
+*.woff binary
+*.zip binary

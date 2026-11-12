@@ -1,0 +1,92 @@
+# ── 构建产物（不属于源码，GPL 义务由 README/BUILD_ENV.md 提供重建方法）──
+out/
+*.hap
+*.hsp
+*.so
+entry/build/
+*/build/
+build/
+.cxx/
+.hvigor/
+toolchain/.hvigor/
+toolchain/.npm-cache/
+toolchain/.ohpm/
+*.log
+
+# Rust 构建目录（体积大且可再生）
+target/
+**/target/
+
+# ── 本地工具链：不是本项目源码，体积数 GB，且各自有独立许可 ──
+toolchain/
+
+# ── 上游参考克隆：不属于本仓库内容（许可与来源见 NOTICE.md）──
+# 直接 clone 的上游 Flutter 原版，仅供逆向比对契约，禁止随本仓库分发
+Breeze/
+# 参考项目源码快照与探针脚本
+_tmp/
+_nexte/
+nexte/
+qingye*/
+
+# ── IDE / 包管理缓存 ──
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+oh_modules/
+**/oh_modules/
+node_modules/
+**/node_modules/
+.clangd
+.clang-format
+.cache/
+
+# ── 本地签名材料：绝对禁止入库（含私钥/证书口令）──
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.cer
+*.p7b
+**/signature/
+sign*.json
+.harmony/
+
+# ── 仅本地使用的脚本目录：整体不入库（用户 2026-11-12 定案）──
+# 任何「只用于本机」或「自带敏感信息（门禁词表、自造 CA、测试口令）」的脚本一律放这里。
+# 为什么必须整目录排除：开源发布门禁的词表本身就是敏感内容，写在仓库里的脚本内
+# （哪怕拆段构造）等于把词表公开 —— 2026-11-11 就是因此泄露过一次 provider 名称。
+# 因此门禁脚本与词表都在这里，仓库内不留任何词表，也无须「门禁豁免自己」。
+script-local/
+
+# ── 本地私有配置 ──
+.env
+.env.*
+local.properties
+*.local.md
+
+# ── 内部过程文档 / 计划与待办：不随本仓库开源发布（用户决定）──
+# docs/ 下是移植过程日志、需求台账、方案与交接记录，含本机路径与内部细节，只在本地保留。
+# 因此对外文档只有 README.md 与 NOTICE.md —— 两者必须自包含，不得引用 docs/ 内路径。
+docs/
+# 早期可行性验证工程（S1 编译闭环最小工程 + 悬浮窗探针，各带一个 184 KB 测试用
+# rawfile/asset.bin）：对使用者无价值且会稀释 GPL 义务范围，本地保留、不入库。
+hello-ohos/
+spike-float/
+# 机器相关的 cargo 配置（由 scripts/sync_cargo_config.cjs 从仓库根生成，
+# 含本机 SDK/工具链绝对路径，禁止入库）
+breeze_qjs_ohos/.cargo/config.local.toml
+
+# ── 未被构建引用的 vendoring 来源副本 ──
+# 该目录是 deretame/rquickjs 的一次克隆（内含嵌套 .git），曾用于取交叉编译补丁，
+# 现已把需要的内容 vendor 进 rquickjs-sys/ 与 playground/。实测：两个 Cargo.lock 与
+# 全部 Cargo.toml 对它 0 引用（rquickjs / -core / -macro 走 crates.io，
+# rquickjs-sys 走 [patch.crates-io] path = vendored/rquickjs-sys）。
+# 保留嵌套 .git 会被 git 记成 gitlink（mode 160000、无 .gitmodules）⇒ 别人 clone 后
+# 该目录为空、git 还会提示 "clones will not contain the contents"，故整目录不入库。
+breeze_qjs_ohos/vendored/rquickjs-fork/
+
+# 构建期某个进程把未展开的 %SystemDrive% 当成相对路径，在仓库根建了同名目录（Windows 图标缓存 db）。
+# 每次出包都可能出现；已把 2026-11-11 那次移到 _tmp/junk_SystemDrive_20261111/，这里兜住避免污染工作树。
+%SystemDrive%/
