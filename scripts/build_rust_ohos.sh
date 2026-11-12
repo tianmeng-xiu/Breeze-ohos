@@ -20,6 +20,29 @@
 #     （其默认 target 就是 x86_64-w64-windows-gnu）+ msys2 mingw-w64 头文件。
 #   * 交叉编译所需的 CC/CXX/AR/sysroot/libclang 等含本机路径的变量放在
 #     breeze_qjs_ohos/.cargo/config.local.toml（gitignore），本脚本每次运行前自动生成。
+#
+# 原生模块装载三要件（真机踩过，缺一不可；ArkTS 侧 import from "libbreeze_qjs_ohos.so" 静默返回
+# undefined 而不是报错，所以只能按这三条逐项自查）：
+#   1) nm_modname 必须严格等于 so 文件名去掉 lib 前缀与 .so 后缀，本项目 = breeze_qjs_ohos。
+#   2) cdylib 必须显式链 NAPI：.cargo/config.toml 的 [target.aarch64-unknown-linux-ohos].rustflags
+#      加 -C link-arg=-lace_napi.z；用 llvm-objdump -p 验 NEEDED 里有 libace_napi.z.so（只有
+#      libc.so 就是错的）。
+#   3) ArkTS 侧要声明原生包：entry/oh-package.json5 的 dependencies 写
+#      "libbreeze_qjs_ohos.so": "file:./src/main/cpp/types/libbreeze_qjs_ohos"，该目录含
+#      oh-package.json5 + index.d.ts；index.d.ts 里不能 export const eval（严格模式保留字，
+#      报 10505001），改 interface + declare const + export default。改完要 ohpm install --all。
+#
+# 手写 NAPI 导出注册的 C 串陷阱（本 crate 的 src/lib.rs 已按此实现，新增导出请照抄）：
+#   凡是签名里没有 length 参数的 NAPI API —— napi_set_named_property、napi_has_named_property、
+#   napi_get_named_property，以及 napi_module 的 nm_modname / nm_filename —— 名字只能传 NUL 结尾
+#   C 串。递 Rust &'static str 的 as_ptr() 既不报编译错也不崩：字面量指向 .rodata 的链接器合并池，
+#   不保证后面紧跟 0x00，于是第一个键（凑巧有 NUL）侥幸可用，其余全部注册到连读的垃圾键上。
+#   ArkTS 侧表现 = import 成功、模块对象拿到了、但只有 init 可调、其余全 undefined，报
+#   "X is not callable"，容易被误判成「模块没注册」。正确写法 = ExportSpec.name: &'static CStr
+#   配 c"init" 这类字面量；注册循环不要首个失败就 return（一项连坐全部），逐项容错 +
+#   napi_has_named_property 回读自检。字节级判据 = 读 .so 找「前置 0x00 + 名字 + 紧跟 0x00」
+#   的出现次数，坏包 1/16、好包 16/16。
+#   整包哈希不可复现（HAP 是 zip，头部内嵌 DOS 时间戳），比对包内内容请逐 entry 比 sha256。
 # ============================================================================
 set -uo pipefail
 
