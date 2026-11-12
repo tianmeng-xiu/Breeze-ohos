@@ -1,6 +1,9 @@
 /**
  * 职责：阅读器路由页（二级页，无底栏、无公共顶栏，顶栏由 ReaderView 自行控制显隐）。
  * 依赖：view/reader/ReaderView、view/reader/ReaderParams。
+ * 第 4 条：本页面加 onPageHide 推 historyRevision。阅读进度落库点在 view/reader/ReaderView.ets 的 saveProgress
+ *   （换页与返回键都调，很频繁）⇒ 不在那里查条数；退出阅读器的出口（返回键、手势返回、被新页压栈）只有本页的
+ *   onPageHide 全覆盖，所以只推一个版本号，条数由 view/mine/MinePage.ets 自己重算。
  * 对应 Flutter：lib/page/comic_read/comic_read_page.dart。
  */
 import { router } from '@kit.ArkUI';
@@ -32,6 +35,14 @@ struct ReaderPage {
     } catch (e) {
       // 参数缺失时保持空路由参数，ReaderView 内做空态处理
     }
+  }
+
+  /**
+   * 第 4 条：@Entry 页被 router 弹出或被新页盖住都会回调 onPageHide ⇒ 这是退出阅读器的全覆盖出口。
+   * 这里只推版本号、不查库（查库与口径判断都在 MinePage.recountHistory，与 HistoryPage 同一条 SELECT）。
+   */
+  onPageHide(): void {
+    AppStorage.setOrCreate<number>('historyRevision', (AppStorage.get<number>('historyRevision') ?? 0) + 1);
   }
 
   build() {

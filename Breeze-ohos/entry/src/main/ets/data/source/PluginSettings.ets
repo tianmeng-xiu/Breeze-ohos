@@ -52,6 +52,15 @@ const PREF_NAME: string = 'plugin_config';
 // 原 s7a 的 HIDDEN_ACTION='clearPluginSession' 已放开（缺陷③登录页落地）。
 // 「跑完这条 action 就跳登录页」的判定挪到 pages/PluginSettingsPage.ets 的 runAction（上游
 // view/plugin_settings_page.dart:729 同口径），本文件不再过滤它。
+
+/**
+ * 登出用的 fnPath（要求6，2026-11-12）。**唯一权威常量**：页面侧（能力组跳登录页的判定 +
+ * 用户信息卡那行「退出登录」）与本文件的 PluginSettings.logout 都引它，不再各写字面量。
+ * 只有**自报了这个动作**的插件才谈得上登出 —— 它来自 getCapabilitiesBundle 的 actions，
+ * 没实现登录的插件压根不会有这条，页面据此不显示登出入口（不硬编码支持某个插件）。
+ */
+export const LOGOUT_FN: string = 'clearPluginSession';
+
 /**
  * getInfo 可能自发网络请求（真机上一半的插件 getInfo 会打自家站点），本地要有上限但不能太紧：
  *  s7b 的 3.5s 是照抄插件管理页 loadRow 的口径，那个场景在列表里、必须快；
@@ -90,6 +99,16 @@ export class SettingSection {
 export class CapabilityAction {
   title: string = '';
   fnPath: string = '';
+}
+
+/**
+ * 登出结果（要求6）。**必须带 ok**：runAction 返回的是 toast 文案串，失败也只是一句
+ * 「执行失败：xxx」，调用方拿它无法判成败；而登出要「成功才刷新回登录态、失败给原因」，
+ * 所以单独给一个真成败出口，文案仍复用它（msg 成功=插件回的 message，失败=带原因的串）。
+ */
+export class LogoutResult {
+  ok: boolean = false;
+  msg: string = '';
 }
 
 /** getSettingsBundle + getCapabilitiesBundle + getUserInfoBundle 的聚合结果。 */
@@ -145,6 +164,12 @@ class RawResult {
   ok: boolean = false;
   json: string = '';
   err: string = '';
+}
+
+/** 能力动作调用的内部结果：ok 才是真成败（runAction 的字符串返回不足以判成败）。 */
+class ActionResult {
+  ok: boolean = false;
+  msg: string = '';
 }
 
 /** 从 unknown 异常提取 message 原文（同 Index.ets:86 已验证写法）。 */
@@ -463,20 +488,61 @@ export class PluginSettings {
     return '';
   }
 
-  /** 执行能力动作（上游 _runAction：成功优先显示插件回的 message 字段）。返回 toast 文案。 */
-  static async runAction(uuid: string, action: CapabilityAction): Promise<string> {
-    if (action.fnPath.length === 0) {
-      return '该操作缺少 fnPath';
+  /**
+   * 跑一个能力动作 fnPath 的**内部唯一实现**：返回真成败 + 可直接展示的文案。
+   * 入参形态仍走 ARGS_EMPTY = '[{\"extern\":{}}]'（§24 契约：插件永远收到恰好一个对象且必带 extern）
+   * ⇒ 登出与其余能力动作共用这一条，不另开第二条调用路径。
+   */
+  private static async callAction(uuid: string, fnPath: string,
+    title: string): Promise<ActionResult> {
+    const r = new ActionResult();
+    if (fnPath.length === 0) {
+      r.msg = '该操作缺少 fnPath';
+      return r;
     }
     try {
       // 上游 _runAction（view/plugin_settings_page.dart:719-720）core:{} + extern:{}
-      const raw: string = await bundleCall(uuid, action.fnPath, ARGS_EMPTY);
+      const raw: string = await bundleCall(uuid, fnPath, ARGS_EMPTY);
       const o: ESObject = jparse(raw);
       const msg: string = jisEmpty(o) ? '' : jstr(o, 'message', '');
-      return msg.length > 0 ? msg : ('已执行：' + action.title);
+      r.ok = true;
+      r.msg = msg.length > 0 ? msg : ('已执行：' + title);
     } catch (e) {
-      return '执行失败：' + em(e as Object);
+      r.msg = '执行失败：' + em(e as Object);
     }
+    return r;
+  }
+
+  /** 执行能力动作（上游 _runAction：成功优先显示插件回的 message 字段）。返回 toast 文案。 */
+  static async runAction(uuid: string, action: CapabilityAction): Promise<string> {
+    const r: ActionResult = await PluginSettings.callAction(uuid, action.fnPath, action.title);
+    return r.msg;
+  }
+
+  /**
+   * 登出（要求6）：调插件自报的 clearPluginSession，返回真成败 + 文案。不抛。
+   *
+   * 两条刻意的**不做**，都在此留档（免得后来人「顺手补全」把用户设置删了）：
+   *  ① **不清宿主配置桶**（preferences plugin_config 的 uuid 桶）。桶是**平铺**的，凭据与普通
+   *     设置（图源/线路/清晰度偏好）混在同一层（见 mergeValues 注释与 BreezeHost.saveConfig），
+   *     宿主无从区分哪些键属于会话 ⇒ 清桶 = 把用户所有设置一起清掉。登出只通知插件，
+   *     插件自己爱清哪条清哪条（它调 save_plugin_config 写的键它自己知道）。
+   *  ② **不动诊断计数 cfg=save/load**（util/BreezeHost.ets:344-347）。那是**进程内**「插件调用
+   *     持久化通道次数」的取证计数，语义是「这个插件有没有在用宿主持久化」，不是配置内容；
+   *     登出把它清零等于抹掉取证现场。s8 真机 cfg=0/9 = 该插件 0 次调用宿主持久化通道 ⇒
+   *     这类插件的会话根本不在宿主这边，登出对「杀进程后还要不要重登」无能为力，
+   *     页面文案也据此**不承诺**「退出后不会自动登录」之类。
+   */
+  static async logout(uuid: string): Promise<LogoutResult> {
+    const out = new LogoutResult();
+    if (uuid.length === 0) {
+      out.msg = '缺少插件参数';
+      return out;
+    }
+    const r: ActionResult = await PluginSettings.callAction(uuid, LOGOUT_FN, '退出登录');
+    out.ok = r.ok;
+    out.msg = r.msg;
+    return out;
   }
 
   /**

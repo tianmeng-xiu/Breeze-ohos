@@ -6,6 +6,10 @@
  *      （toolChipGap 与 toolChipRowH）相加得 51.5，不再手抄两个数各算各的（同 BUG6 定案的口径）。
  *      s5i：搜索框改纯入口（点击 push pages/SearchPage，NextE 样式，记录/来源切换都在搜索页）；
  *      图源 chip 条随 pluginSourceEpoch 与插件管理页联动刷新（任务 A）。
+ * s10 第 7 条（用户 11-12 13:48）：图源选择跨启动记忆 —— chip 选中即把**源 id**（不是下标）写进
+ *      view/search/LastSourceStore（复用 PreferenceStore 单例）；进页与 epoch 刷新都按 id 复原，
+ *      源被卸载才回落第一个。本页是 TabContent 子组件，aboutToAppear 只跑一次，故复原挂在
+ *      loadPopular 取到列表之后（每次取列表都校验一次 id 是否还在，比挂在生命周期可靠）。
  * 依赖：StateViews / Theme / Anim；data 层 SourceManager / MangaSource。公共顶栏由 pages/Index.ets 统一提供。
  * 对应 Flutter：lib/page/discover/view/discover_page.dart（原版为插件市场，鸿蒙端简化为源列表+排行榜+搜索）。
  */
@@ -20,6 +24,8 @@ import { SourceManager } from '../../data/source/SourceManager';
 import { MangaSource } from '../../data/source/Source';
 import { MangaSummary, SourceInfo } from '../../data/model/Models';
 import { DetailParams } from '../detail/DetailParams';
+import { LastSourceStore } from '../search/LastSourceStore';
+import { Logger } from '../../util/Logger';
 
 @Component
 export struct DiscoverPage {
@@ -33,6 +39,13 @@ export struct DiscoverPage {
   @StorageProp('pluginSourceEpoch') @Watch('onSourceEpoch') pluginEpoch: number = 0;
   @State sources: SourceInfo[] = [];
   @State sourceIndex: number = 0;
+
+  /**
+   * 本次进程里用户是否手动选过源（第 7 条）。false = 还没选过 ⇒ loadPopular 取到列表后按上次记忆复原；
+   * true = 用户的选择优先，取列表时不许被记忆覆盖（否则切完源后来一次 epoch 刷新就把用户选的回滚了）。
+   * 不用 @State：只参与判断，不参与渲染。
+   */
+  private userPickedSource: boolean = false;
   @State items: MangaSummary[] = [];
   @State loading: boolean = true;
   @State errorMsg: string = '';
@@ -115,15 +128,20 @@ export struct DiscoverPage {
         return;
       }
     }
+    // 第 7 条：优先按 id 保住当前选中的源（id 比名字稳：插件改了显示名不该把用户的选择弄丢），
+    // id 查不到再按名字兜一次（同一源换了 id 的极端情况），两样都没有才回落第一个。
+    const curId: string = this.sourceId(this.sourceIndex);
     const curName: string = this.sourceName(this.sourceIndex);
-    let keep: number = -1;
-    for (let i = 0; i < next.length; i++) {
-      if (next[i].name === curName) {
-        keep = i;
-        break;
+    this.sources = next;
+    let keep: number = LastSourceStore.indexOfSource(next, curId);
+    if (keep < 0) {
+      for (let i = 0; i < next.length; i++) {
+        if (next[i].name === curName) {
+          keep = i;
+          break;
+        }
       }
     }
-    this.sources = next;
     this.sourceIndex = keep >= 0 ? keep : 0;
     this.loadPopular();
   }
@@ -157,6 +175,15 @@ export struct DiscoverPage {
     try {
       const sm: SourceManager = SourceManager.getInstance();
       this.sources = sm.list();
+      // 第 7 条：用户还没手动选过 ⇒ 按上次记忆复原（存的是源 id，插件装卸改变了顺序也不会选错）。
+      // 记忆里的源已被卸载（indexOfSource 返回 -1）就保持 0，即原来的「第一个源」口径。
+      if (!this.userPickedSource) {
+        const mem: number = LastSourceStore.indexOfSource(this.sources, LastSourceStore.readDiscoverId());
+        if (mem >= 0) {
+          this.sourceIndex = mem;
+          Logger.i('[Discover] restore source index=' + mem + ' id=' + this.sources[mem].id);
+        }
+      }
       if (this.sources.length === 0) {
         this.animContent((): void => {
           this.items = [];
@@ -205,6 +232,14 @@ export struct DiscoverPage {
     return this.sources[i].name;
   }
 
+  /** 同上按 id 取（第 7 条的落盘与复原都吃 id）。 */
+  private sourceId(i: number): string {
+    if (i < 0 || i >= this.sources.length) {
+      return '';
+    }
+    return this.sources[i].id;
+  }
+
   @Builder
   SourceChip(i: number) {
     Text(this.sourceName(i))
@@ -223,6 +258,10 @@ export struct DiscoverPage {
           Anim.to((): void => {
             this.sourceIndex = i;
           }, Anim.contentIn, Anim.curveEaseOut());
+          // 第 7 条：选中即落盘（写 id 而不是下标），并立起「用户选过」的旗，
+          // 之后 loadPopular 重取列表时不会再拿上次记忆把这次选择覆盖掉。
+          this.userPickedSource = true;
+          LastSourceStore.writeDiscoverId(this.sourceId(i));
           this.loadPopular();
         }
       })

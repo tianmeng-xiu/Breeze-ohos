@@ -40,6 +40,15 @@ export struct BreezeTopBar {
   @Prop showSearch: boolean = false;
   /** 滚动进度 0–1：0=透明无分隔线，1=实底+分隔线（介于中间按比例给分隔线不透明度） */
   @Prop scrollProgress: number = 1;
+  /**
+   * s11 第 7 条（用户 11-12 16:15 report 第 7 条「统一搜索页上下配色」）：
+   * 打开后实底档底色从 cardColor 换成页面底色 Theme.background，与页面根容器同一个令牌
+   * ⇒ 顶栏与下方不再「一白一灰」两块皮。
+   * 默认 false = 其余页面行为逐字节不变（本轮口径 = 只统一搜索页，不动全局顶栏）。
+   * 影响面：只有显式传 true 的调用点会变；本仓现九个 BreezeTopBar 调用点里只有 SearchPage 传。
+   * 与 R6 无冲突：只替换实底档的取值，玻璃档仍走 systemMaterial 那条路。
+   */
+  @Prop flatBackground: boolean = false;
   /** 返回回调（默认 router.back 由调用方决定） */
   onBack: () => void = () => {};
   /** 右侧动作回调 */
@@ -74,6 +83,11 @@ export struct BreezeTopBar {
    */
   private useGlass(): boolean {
     return SurfaceMaterial.hasMaterial() && this.p() < 0.5;
+  }
+
+  /** 实底档底色：默认卡片色（浮在内容之上的传统顶栏）；flatBackground 打开后与页面底色同令牌 */
+  private solidBg(): string {
+    return this.flatBackground ? Theme.background(this.isDark) : Theme.cardColor(this.isDark);
   }
 
   build() {
@@ -163,6 +177,6 @@ export struct BreezeTopBar {
     // R6：玻璃档与实底档二选一。玻璃档 backgroundColor 传 Transparent（不给真实填充），
     // 实底档 systemMaterial 传 undefined（SDK 声明允许 undefined ⇒ 属性不生效）
     .systemMaterial(this.useGlass() ? SurfaceMaterial.topBarMaterial(this.isDark) : undefined)
-    .backgroundColor(this.useGlass() ? Color.Transparent : Theme.cardColor(this.isDark))
+    .backgroundColor(this.useGlass() ? Color.Transparent : this.solidBg())
   }
 }

@@ -1,6 +1,6 @@
 /**
  * 职责：关于页（第 11 条路由 pages/AboutPage）—— 应用名、版本、仓库入口，加上 README 里的免责声明与许可声明。
- * 入口：「更多」页「关于」分组的「版本」「开源许可」两行 + 底部页脚文案（view/mine/MinePage.ets）。
+ * 入口：第 9 条合并后 =「更多」页「关于」分组唯一一行「关于」；底部页脚改成纯文案不再跳页（同页入口只留一项）。
  * 版式：顶部大卡（图标 + 应用名 + 副标题 + 版本）→「应用」分组（可点的行）→「项目性质」「与上游的关系」
  *      「责任限制」「许可」四段。卡片、行高、字号全部复用 view/common/Theme 的 Theme 与 Dim 令牌，
  *      浅色深色两套都成立。按第 5 条(1) 口径**整页不画 Divider**：卡片底色与页面底色已有层次，段距由 padding 给。
@@ -253,6 +253,9 @@ struct AboutPage {
         title: '关于',
         showBack: true,
         scrollProgress: 1,
+        // 新七条第 7 条（lead 裁定 11-12 17:00）：全站路由页统一打开 flatBackground —— 顶栏实底档与本页根容器
+        // 同吃 Theme.background，消除「顶栏一块色、页面一块色」的两块皮。开关默认 false，一级页不受影响。
+        flatBackground: true,
         onBack: (): void => {
           router.back();
         }
@@ -263,7 +266,15 @@ struct AboutPage {
           // ---- 顶部卡：图标 + 应用名 + 副标题 + 版本（版本行兼作 C13 隐藏入口） ----
           Column() {
             Row() {
-              Image($r('app.media.ic_app'))
+              // 第 10 条：图标与真机统一。旧引用 app.media.ic_app 是**封面兜底图**（192x256 非方形、
+              // 浅灰底 + 小书本），跟启动器上看到的图标本来就不是同一张 —— 这是「关于页图标和实际图标不统一」的根因。
+              // 换成启动器真正在合成的 app.media.layered_image（= background.png 纯蓝底 + foreground.png 白色书本，
+              // 与启动器逐像素同源；SDK 判据：Image 的入参是 PixelMap | ResourceStr | DrawableDescriptor（component/image.d.ts:506），
+              // 而 @ohos.arkui.drawableDescriptor.d.ts:161-188 的 LayeredDrawableDescriptor 注释写明「传入的资源 ID 属于
+              // 含 foreground 与 background 的 JSON 文件」时即由它承接，绘制序 background → mask → foreground。
+              // 21 张 media png 是出包红线，一个字节未动，只换引用。borderRadius 复刻启动器的圆角遮罩；
+              // 万一真机把这层资源渲染成空白，单行兜底 = 换回 $r('app.media.app_icon')（与 startIcon 逐字节相同、同一造型）。
+              Image($r('app.media.layered_image'))
                 .width(64)
                 .height(64)
                 .borderRadius(14)

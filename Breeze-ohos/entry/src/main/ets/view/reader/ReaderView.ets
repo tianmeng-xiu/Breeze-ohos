@@ -307,7 +307,14 @@ export struct ReaderView {
         .height(Dim.backHit)
         .borderRadius(Dim.backHit / 2)
         .onClick(() => {
-          this.saveProgress();
+          // s10 第 4 条补口：进度落库是异步的，旧写法「发了不等」= 首次读某本书时新增的 history 行
+          // 可能落在 pages/ReaderPage.onPageHide 那次 bump 之后 ⇒ 该场景「更多」页条数少 1。
+          // 刻意不 await：把返回按钮交给一次 DB 写，库一卡就把人困在阅读页里。改成落库完成后
+          // 再补推一次版本号；saveProgress 内部已 catch，所以 then 必然执行。重复 bump 无害 =
+          // MinePage.recountHistory 幂等且有 historyBusy 闸门（口径同 view/mine/MinePage.ets:143）。
+          this.saveProgress().then((): void => {
+            AppStorage.setOrCreate<number>('historyRevision', (AppStorage.get<number>('historyRevision') ?? 0) + 1);
+          });
           router.back();
         })
 

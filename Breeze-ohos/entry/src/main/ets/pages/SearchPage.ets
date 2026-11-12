@@ -12,6 +12,16 @@
  *      键盘弹起后整体上移到键盘上方、收起后回原位；无记录时不再显示「暂无搜索记录」占位，整块留空。
  *      键盘避让选型 = UIContext.setKeyboardAvoidMode(RESIZE)，理由与还原口径见 setKbAvoid 注释。
  *      同一条追加（lead 批准）：输入框右侧改用官方 searchButton「搜索」，点击复用 onSubmit，见 build 内注释。
+ * s10 需求 2 与 7（用户 11-12 13:48 report 第 2、7 条）：
+ *      2 =「特殊情况下输入法弹起时搜索记录不上移」⇒ 除页面生命周期那三处挂点外，再在输入框
+ *        进入编辑态（即将弹键盘）时补发一次 RESIZE，setKbAvoid 内带回读校验与日志（见该函数注释）。
+ *      7 =「最后一次退出时选中的源，下次进入默认选中」⇒ chip 选中源按 id 落盘
+ *        （view/search/LastSourceStore，复用 PreferenceStore 单例），reloadChips 优先回填该 id。
+ * s11 需求 6 与 7（用户 11-12 16:15 report 第 6、7 条）：
+ *      6 =「详情页点标签 / 作者直接搜对应源」⇒ 路由参数多带一个 keyword（view/search/SearchEntryParams），
+ *        aboutToAppear 先选源后灌词并自动搜一次；带词进入不再自动聚焦（不弹键盘，见 entryWithKeyword）。
+ *      7 =「统一搜索页上下配色」⇒ 本页 BreezeTopBar 传 flatBackground: true，
+ *        顶栏实底档底色从 cardColor 换成本页根容器同一个 Theme.background。
  * 失败口径：多源聚合时单源 try/catch 收集错误，有结果就显示（顶部一条部分失败横幅），
  *      全失败才 ErrorView（文案带失败源）。
  * 点击：结果卡跳详情页（pages/DetailPage，参数类 view/detail/DetailParams，路由在 main_pages.json 登记）。
@@ -30,6 +40,7 @@ import { MangaSummary, SourceInfo } from '../data/model/Models';
 import { SearchHistory } from '../data/kv/SearchHistory';
 import { DetailParams } from '../view/detail/DetailParams';
 import { GlassStyle, GlassButton } from '../view/common/GlassStyle';
+import { LastSourceStore } from '../view/search/LastSourceStore';
 import { Logger } from '../util/Logger';
 
 /** 聚合搜索伪图源 id（chips 行首「全部」）。 */
@@ -62,6 +73,16 @@ struct SearchPage {
   @State partialMsg: string = '';
   /** T9 需求 2：工具区随累计滚动收起（滞回判据见 syncToolCollapse） */
   @State toolCollapsed: boolean = false;
+
+  /**
+   * s11 第 6 条：本次是不是「带词进来」（详情页点作者名 / 标签）。
+   * 只读一次（build 首帧喂 defaultFocus），普通字段即可，不需要 @State：
+   * defaultFocus 是组件创建时才生效的属性，之后再变也没有重读的意义。
+   * 作用 = 带词进来时不自动聚焦 ⇒ 不弹输入法。理由：这条路径的意图是「看结果」，
+   * 而键盘弹起会吃掉小屏近一半高度（参考机 303vp / 814vp），刚落地就被盖住一半结果
+   * 属于会被当新 bug 报回来的观感。用户想改词时自己点输入框，避让链照旧生效。
+   */
+  private entryWithKeyword: boolean = false;
 
   /** 结果栅格绑 scroller：Grid.onDidScroll 只给每帧增量 ⇒ 绝对偏移必须从 scroller 读 */
   private gridScroller: Scroller = new Scroller();
@@ -208,13 +229,36 @@ struct SearchPage {
    * ⚠ 档位是 **UIContext（窗口）级**属性，不是页面级：本页离开后不还原就会把详情页评论输入框、
    *   插件登录页头像输入框的避让方式一起改掉。故 onPageShow 上 RESIZE、onPageHide 与
    *   aboutToDisappear 还原成 SDK 口径的默认值 OFFSET（UIContext.d.ts:4826）。
-   *   aboutToAppear 也补一次：getUIContext 过早可能拿不到实例，拿不到就交给 onPageShow。
+   *   aboutToAppear 也补一次：getUIContext 过早可能拿不到实例，拿不到就交给后面的挂点。
+   *
+   * 第 2 条补的那一手（用户 11-12 13:48「特殊情况下输入法弹起时搜索记录不上移，大部分情况正常」）：
+   * 上面三个挂点都在「页面可见」这一层，而避让量是键盘 show 事件里算的 —— 冷启动首帧
+   * .defaultFocus(true) 抢跑、或从详情页返回本页时时序抖动，都可能出现「键盘先弹、档位后落」。
+   * 那一档下 OFFSET 的判据是「焦点输入框会不会被键盘遮住」，本页输入框在顶上、根本没被遮
+   * ⇒ 整页一步都不挪 ⇒ 记录区原地不动 = 用户看到的「不上移」；等档位随后落到 RESIZE，
+   * 这一次弹起也不会再补算，只有下一次弹键盘才正常 —— 与「说不清触发方法」完全对得上。
+   * 正解见 build 里 Search 的 onEditChange：在「即将弹键盘」那一刻再下发一次（幂等）。
+   * 这里额外带回读校验（UIContext.d.ts:4845 getKeyboardAvoidMode）：档位对不对直接进日志，
+   * 真机回传时不用靠复现猜。
    */
   private setKbAvoid(useResize: boolean): void {
+    const want: number = useResize ? KeyboardAvoidMode.RESIZE : KeyboardAvoidMode.OFFSET;
+    const wantName: string = useResize ? 'RESIZE' : 'OFFSET';
+    let back: number = -1;
     try {
-      this.getUIContext().setKeyboardAvoidMode(useResize ? KeyboardAvoidMode.RESIZE : KeyboardAvoidMode.OFFSET);
+      const ctx: UIContext = this.getUIContext();
+      ctx.setKeyboardAvoidMode(useResize ? KeyboardAvoidMode.RESIZE : KeyboardAvoidMode.OFFSET);
+      back = ctx.getKeyboardAvoidMode();
     } catch (e) {
-      Logger.i('[Search] setKeyboardAvoidMode skipped (no UIContext yet)');
+      Logger.i('[Search] kbAvoid skipped (no UIContext yet) want=' + wantName);
+      return;
+    }
+    // 读数口径 0/1/2/3/4 = OFFSET / RESIZE / OFFSET_WITH_CARET / RESIZE_WITH_CARET / NONE
+    // （实体枚举 @ohos.arkui.UIContext.d.ts:5645，别和 component/common.d.ts:26918 那个同名诱饵混）
+    if (back !== want) {
+      Logger.e('[Search] kbAvoid MISMATCH want=' + wantName + '(' + want + ') got=' + back);
+    } else {
+      Logger.i('[Search] kbAvoid=' + wantName);
     }
   }
 
@@ -235,23 +279,48 @@ struct SearchPage {
     this.history = SearchHistory.list();
     AppStorage.setOrCreate<number>('searchHistoryCount', this.history.length);
     this.reloadChips(true);
-    // 入口可带 sourceId（SearchEntryParams）⇒ 默认选中该源
+    // s11 第 6 条：入口可带 sourceId 与 keyword（SearchEntryParams）。
+    // sourceId ⇒ 默认选中该源；keyword ⇒ 灌进输入框并就地搜一次（详情页点作者名 / 标签的入口）。
+    // 顺序很重要：先选源、后搜（doSearch 吃 currentChipId()，源没定就先搜错源）。
+    let entryKw: string = '';
+    let entrySid: string = '';
+    let sidFound: boolean = false;
     try {
       const raw: Object = router.getParams();
       if (raw !== null && raw !== undefined) {
         const src: ESObject = raw;
         const sid: string = src.sourceId !== undefined ? String(src.sourceId) : '';
+        entrySid = sid;
         if (sid.length > 0) {
           for (let i = 0; i < this.chips.length; i++) {
             if (this.chips[i].id === sid) {
               this.chipIndex = i;
+              sidFound = true;
               break;
             }
           }
         }
+        entryKw = src.keyword !== undefined ? String(src.keyword).trim() : '';
       }
     } catch (e) {
       // 参数缺失无所谓，默认已选第一个真实源
+    }
+    if (entryKw.length > 0 && entrySid.length > 0 && !sidFound) {
+      // 带词进来但指定源已经找不到了（详情页停留期间插件被卸）：这条路径的意图是「搜这个词」，
+      // 落到「上次记忆的另一个源」会给出毫不相干的窄结果 ⇒ 回落到 chip 0 = 全部聚合，
+      // 至少不漏。只带 sourceId 不带词的老路径行为逐字未变（仍按 reloadChips 的记忆口径）。
+      this.chipIndex = 0;
+      Logger.i('[Search] entry source gone, fallback ALL: ' + entrySid);
+    }
+    if (entryKw.length > 0) {
+      // aboutToAppear 在首帧 build 之前 ⇒ 这里赋值，Search({ value: this.keyword }) 首次绘制就带词，
+      // 不会出现「空框闪一下再长出一串字」。随后直接搜：doSearch 内部的 resetViewForNewSearch
+      // 里 scrollEdge 会因为 Grid 还没挂载而抛错，那处已有 try/catch 兜住（注释写着首次搜索）。
+      // 不挂 onAppear 再搜的理由：那会让 searched 先以 false 画一帧「搜索记录」空态再跳结果，白闪一下。
+      this.keyword = entryKw;
+      this.entryWithKeyword = true;
+      Logger.i('[Search] entry keyword=' + entryKw + ' source=' + this.currentChipId());
+      this.doSearch();
     }
   }
 
@@ -259,7 +328,12 @@ struct SearchPage {
     this.reloadChips(false);
   }
 
-  /** 重建 chip 条；clampFirst=true 时默认选第一个真实源（首次进入）。 */
+  /**
+   * 重建 chip 条。选中位按 id 复原（第 7 条：插件装卸会让列表长度与顺序变化，故一律比 id、不比下标）。
+   * clampFirst=true（首次进入）：上次记忆命中就用它，否则老口径「第一个真实源」（下标 1，0 是聚合项「全部」）。
+   * clampFirst=false（pluginSourceEpoch 刷新）：先保住当前选中的那个源（epoch bump 不该把用户选的源换掉），
+   * 当前选中已被卸载才退到上次记忆，两样都没有才回落 0。
+   */
   private reloadChips(clampFirst: boolean): void {
     const srcs: SourceInfo[] = SourceManager.getInstance().list();
     const all: SourceInfo = { id: ALL_SOURCES_ID, name: '全部', language: '' };
@@ -267,12 +341,21 @@ struct SearchPage {
     for (let i = 0; i < srcs.length; i++) {
       next.push(srcs[i]);
     }
+    // 重排之前先记下当前选中的 id（this.chips 还是旧列表，下标才有意义）
+    const keepId: string = (this.chipIndex >= 0 && this.chipIndex < this.chips.length)
+      ? this.chips[this.chipIndex].id : '';
     this.chips = next;
     if (clampFirst) {
-      this.chipIndex = next.length > 1 ? 1 : 0;
-    } else if (this.chipIndex >= next.length) {
-      this.chipIndex = 0;
+      const mem: number = LastSourceStore.indexOfSource(next, LastSourceStore.readSearchId());
+      this.chipIndex = mem >= 0 ? mem : (next.length > 1 ? 1 : 0);
+      Logger.i('[Search] restore source index=' + this.chipIndex + ' id=' + this.currentChipId());
+      return;
     }
+    let idx: number = LastSourceStore.indexOfSource(next, keepId);
+    if (idx < 0) {
+      idx = LastSourceStore.indexOfSource(next, LastSourceStore.readSearchId());
+    }
+    this.chipIndex = idx >= 0 ? idx : 0;
   }
 
   /** 结果卡「图源」小字：按条目 sourceId 反查 chip 名（聚合搜索时各条目源不同）。 */
@@ -474,6 +557,14 @@ struct SearchPage {
       BreezeTopBar({
         title: '搜索',
         showBack: true,
+        // s11 第 7 条（用户 11-12 16:15 report 第 7 条「顶栏纯白、下面页面底色浅灰」）：
+        // 本页顶栏此前吃顶栏组件的默认实底令牌 cardColor（浅色 #FFFFFF），而本页根容器的
+        // backgroundColor 吃 Theme.background（浅色 #F1F3F5、深色 dBg #000000 对比 dCard #1C1C1E）⇒ 两块皮。
+        // flatBackground 是 BreezeTopBar 本轮新增的开关（默认 false，其余页面零变化），
+        // 打开后实底档换成与本页根容器同一个 Theme.background ⇒ 顶栏与页面无缝。
+        // 本页 scrollProgress 未传（默认 1）= 恒实底档，所以效果是全程同色，滚动中也不会跳色；
+        // R6 互斥红线未碰：玻璃档（真机无材质，进不去）仍走 systemMaterial 那条分支。
+        flatBackground: true,
         onBack: (): void => {
           router.back();
         }
@@ -495,12 +586,25 @@ struct SearchPage {
           // 默认 #FF182431 就是深色底上近黑的根因）。textFont 继续只管字号。
           .fontColor(Theme.text1(this.isDark))
           .textFont({ size: 14 })
-          .defaultFocus(true)
+          // s9 口径（无词进入 = 顶栏图标 / 发现页残留入口）：自动聚焦、直接弹键盘，一个字没改。
+          // s11 第 6 条新增档：带词进来时不聚焦（判据与理由见 entryWithKeyword 字段注释）。
+          // 键盘避让那条链（RESIZE 下发 + onEditChange 补发 + 离开还原）两档共用，未做任何改动。
+          .defaultFocus(!this.entryWithKeyword)
           .onChange((value: string) => {
             this.keyword = value;
           })
           .onSubmit(() => {
             this.doSearch();
+          })
+          // s10 第 2 条：输入框进入编辑态（= 键盘即将弹起）时把 RESIZE 档再下发一次。
+          // SDK search.d.ts:631-644 onEditChange 原文「The text box is in the editing state when it has the
+          // caret placed in it」，@since 12 ⇒ 真机 API26 可用；它是键盘 show 之前最后一次本页可控的时机，
+          // 正好堵住「键盘先弹、档位后落」那个时序缝（详见 setKbAvoid 注释）。setKbAvoid 幂等，
+          // 常态下这一次读回的还是 RESIZE，只会多一行 kbAvoid=RESIZE 日志，不改布局、不触发重排。
+          .onEditChange((editing: boolean) => {
+            if (editing) {
+              this.setKbAvoid(true);
+            }
           })
           // s9 需求 5 追加（lead 批准，用官方 API 不自拼 Row）：输入框右侧「搜索」文字按钮。
           // SDK search.d.ts:524 searchButton(value: ResourceStr, option?: SearchButtonOptions)，@since 8，
@@ -560,6 +664,9 @@ struct SearchPage {
                       Anim.to((): void => {
                         this.chipIndex = index;
                       }, Anim.contentIn, Anim.curveEaseOut());
+                      // 第 7 条：选中即落盘（存 chip.id，不存下标）。不抓「退出」时机 —— 选中即写幂等、
+                      // 开销一次 flush，异步且内部吞异常；下次进页由 reloadChips 按 id 回填。
+                      LastSourceStore.writeSearchId(chip.id);
                       // 已出结果时切源直接重搜（NextE 行为：结果跟着源走）
                       if (this.searched && this.keyword.trim().length > 0) {
                         this.doSearch();

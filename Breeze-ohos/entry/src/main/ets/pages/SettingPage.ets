@@ -3,9 +3,13 @@
  *      四个死配置键在这里获得唯一 UI 入口：阅读方向（READ_DIRECTION）、放大后点按平移
  *      （READER_TAP_TO_SCROLL）、自定义 User-Agent（USER_AGENT）、Cookie 管理（COOKIE_PREFIX）。
  *      另把「存储」两行从 toast 占位改成真数据（图片缓存占用 / 清理缓存）。
- *      BUG2 修复口径：占用统计走 diskUsageAsync（异步分批 + 20s 超时），失败/未就绪
+ *      BUG2 修复口径：占用统计走 diskUsageAsync（异步分批 + 批间让帧），失败/未就绪
  *      都是可点重试的文案而不是永远「统计中」；清空后立即重测，并推 cacheRevision
  *      版本号驱动「更多」页存储行重算（两页文案共用 data/image/ImageCache 的 CacheUsageText）。
+ *      s9 真机复现（11-12 回传「统计持续失败、点重试无效」）后追加：统计侧的三段时限、
+ *      单飞与取消、以及「数不完交部分结果」全在 ImageCache.diskUsageAsync（那里是唯一真源，
+ *      本页只负责发起与展示）；本页另加「手动重试失败时 toast 出真实错因」，因为旧文案
+ *      只有「统计失败，点此重试」六个字，真机回传一张截图无法定位。
  * 依赖：util/UserSettings（读写与即时生效）、data/net/CookieJar（host 名单与单站清除）、
  *      data/image/ImageCache（磁盘占用与清理）、view/common 目录（顶栏、主题）。
  * 入口：pages/Index → MinePage「通用设置」→ router.pushUrl('pages/SettingPage')。
@@ -59,6 +63,8 @@ struct SettingPage {
   @State cacheFiles: number = 0;
   /** 统计在途标记：连点与 reload 复用同一次统计，不并发跑两遍 */
   @State cacheBusy: boolean = false;
+  /** 统计轮次序号（不进 @State：只用来判迟到，不参与渲染），见 measureCache */
+  private measureSeq: number = 0;
 
   aboutToAppear(): void {
     this.reload();
@@ -82,15 +88,34 @@ struct SettingPage {
    * 占用统计（BUG2 真因所在）：旧实现把 diskUsage()（listFileSync + 每文件 statSync）
    * 塞进 setTimeout(16) —— setTimeout 只是延后一帧，整串同步系统调用仍在 UI 线程上跑完，
    * 文件一多就把设置页首帧卡白，且任一次调用抛错时只把数字写成 0，看着像「0 B」而不是失败。
-   * 现在走 diskUsageAsync：列举与 stat 都在 native 线程，每 64 个一批、批间让出一帧，
-   * 整体 20s 超时 ⇒ 三种结束路径都有确定文案（完成 / 失败可重试 / 目录未就绪可重试）。
+   * 现在走 diskUsageAsync：列举与 stat 都在 native 线程，每 64 个一批、批间让出一帧。
+   *
+   * 关于「点重试无效」（本轮派工书要我验到底的一条）：本页的 busy 闸门**不是**卡死点 ——
+   * 下面 then 与 catch 两条路径都写了 cacheBusy=false，链上没有任何不 settle 的 await
+   * （init 内部的 doInit 全程是同步系统调用，必然 settle）。真正「无效」的原因是旧
+   * diskUsageAsync 把「20s 超时」判成失败、且超时后不取消旧 walk（withTimeout 用
+   * Promise.race 且计时器不 clear）：每次点重试只是再挂一条完整 walk 上去，旧的还在原地
+   * 抢同一批文件，越点越慢、每次都撞同一条超时 ⇒ 用户看到的就是「点了没反应，还是失败」。
+   * 修法放在唯一真源 ImageCache（单飞复用 + 代数取消 + 软预算交部分结果），
+   * 本页只补一条「手动重试失败时把错因弹出来」，自动首测保持安静。
+   *
+   * fromTap=true 表示这是用户点出来的重试；force=true 供 clearCache 用：
+   * clear() 会取消在途统计，但被取消那条要等当前批跑完才 settle、busy 才放开，
+   * 清理后的必测若走普通闸门会被「还没 settle 的旧轮」吞掉，于是清理后行内停在旧数。
+   * force 直接开新一轮（旧轮因 seq 过期自动作废）；ImageCache 侧是单飞的，
+   * 就算真有在途也只是复用它，不会叠第二条 walk。
    */
-  private measureCache(): void {
-    if (this.cacheBusy) {
+  private measureCache(fromTap: boolean = false, force: boolean = false): void {
+    if (this.cacheBusy && !force) {
       return;
     }
     this.cacheBusy = true;
     this.cachePhase = CacheUsageText.P_MEASURING;
+    // 本轮序号：clear() 会取消在途统计，被取消那条仍会在稍后 settle（交部分结果）。
+    // 若它晚于清理后的新一轮落地，就会把清理前的旧数字写回来 ⇒ 迟到的旧一轮一律丢弃，
+    // cacheBusy 也交给最新那一轮复位（与 ImageCache 侧 recordQuality 的代数守卫同一条思路）。
+    const seq: number = this.measureSeq + 1;
+    this.measureSeq = seq;
     // 追加 B（cache-fix 报的残留）：ImageCache.init 只排在 DataBootstrap 里，而 EntryAbility
     // 是 fire-and-forget 不 await ⇒ 冷启动直进设置页可能跑到 init 前面，cacheRoot 空串时
     // ensureCacheRoot() 只能返回 false（没 context 算不出 cacheDir），于是「未就绪，点此重试」点了不动。
@@ -105,6 +130,9 @@ struct SettingPage {
         return ImageCache.getInstance().diskUsageAsync();
       })
       .then((u: DiskUsage): void => {
+        if (seq !== this.measureSeq) {
+          return;
+        }
         this.cacheBusy = false;
         this.cacheBytes = u.bytes;
         this.cacheFiles = u.files;
@@ -113,8 +141,16 @@ struct SettingPage {
       })
       .catch((err: Object): void => {
         Logger.ex('统计缓存失败', err);
+        if (seq !== this.measureSeq) {
+          return;
+        }
         this.cacheBusy = false;
+        // 具体 code 与 message 由 ImageCache.walkUsage 写进 CacheUsageText（两页共用的口径），
+        // 行内文案因此带得出错因；toast 只对手动重试弹这一次
         this.cachePhase = CacheUsageText.P_FAILED;
+        if (fromTap) {
+          this.toast('缓存统计失败：' + ((err as Error).message ?? String(err)));
+        }
       });
   }
 
@@ -212,12 +248,14 @@ struct SettingPage {
   private async clearCache(): Promise<void> {
     try {
       await ImageCache.getInstance().clear();
-      this.measureCache();
+      // force：此刻被 clear 取消的旧轮可能还没 settle，普通闸门会把这次必测吞掉
+      this.measureCache(false, true);
       ImageCache.bumpCacheRevision();
       this.toast('已清空图片缓存');
     } catch (err) {
-      // 清理失败不改动已显示的占用数字，只提示；重测一次让数字与磁盘现状对齐
-      this.measureCache();
+      // 清理失败不改动已显示的占用数字，只提示；重测一次让数字与磁盘现状对齐。
+      // 这里同样要 force：clear() 首行已取消在途统计，那条旧轮没 settle 前 busy 还是 true。
+      this.measureCache(false, true);
       this.toast('清理失败：' + (err as Error).message);
     }
   }
@@ -525,6 +563,9 @@ struct SettingPage {
           title: '设置',
           showBack: true,
           scrollProgress: 1,
+          // 新七条第 7 条（lead 裁定 11-12 17:00）：全站路由页统一打开 flatBackground —— 顶栏实底档与本页根容器
+          // 同吃 Theme.background，消除「顶栏一块色、页面一块色」的两块皮。开关默认 false，一级页不受影响。
+          flatBackground: true,
           onBack: (): void => {
             router.back();
           }
@@ -625,7 +666,8 @@ struct SettingPage {
                   return this.cacheSummary();
                 },
                 false, (): void => {
-                  this.measureCache();
+                  // 点按 = 用户显式重试 ⇒ 失败要把错因弹出来（fromTap）
+                  this.measureCache(true);
                 })
               // 第 5 条(1)：卡片底色与页面底色已有层次，不再画明显分割线，行距由 padding 提供
               this.ManageRow('清空图片缓存',

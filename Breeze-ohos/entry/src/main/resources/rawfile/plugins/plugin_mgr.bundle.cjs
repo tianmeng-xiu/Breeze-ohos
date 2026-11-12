@@ -16,6 +16,19 @@
  * 从诊断自测（selftest.bundle.cjs）毕业为正式宿主 JS 载荷；ArkTS 只 bundleLoad + bundleCall，
  * 清单落盘/装载/删除仍由 ArkTS（PluginStore + bundleLoadFromPath）执行。
  *
+ * v1.1.0 -> v1.2.0 修的是真机「商店内下载部分插件报 HTTP 404」（用户 2026-11-12 report.txt 第 8 条，举例绅士漫画）：
+ *   根因（已取证）：SEED 21 条里有 9 条的 GitHub 仓库压根没有 Release —— 2026-11-12 逐条实测
+ *   GET api.github.com/repos/<repo>/releases/latest = 404 且 /tags 也是空数组：漫画柜 / 如漫画 /
+ *   蛙漫3 / 包子漫画 / hitomi / JJ漫画 / nhentai / 绅士漫画 / WEBTOON。这 9 条在 npm 上都有包
+ *   （registry.npmmirror.com 与 registry.npmjs.org 双 200），但 v1.1.0 的 installLatest 是
+ *   「releaseLatest 一失败就直接 return」，连下面已经配好的 npm CDN 候选都没跑到 ⇒ 用户看到的就是
+ *   release API 透传上来的 404（代理对无 Release 的仓库照样回 404，所以 attempts 里记到 HTTP 404）。
+ *   v1.2.0 三条改动：一、release 取不到不再 return，改成「没有 release 也照走 npm 链」；
+ *   二、新增 npmLatest() 解析 registry 拿 dist-tags.latest 与 tarball，并把 CDN 的 latest 别名加进
+ *   候选（jsdelivr 系支持 latest 别名，9 条无 Release 的包本机实测全 200）；
+ *   三、失败时把 release 状态码与逐源摘要拼进 err，商店 toast 上一眼能看出卡在哪个源。
+ *   checkUpdates 同步受益：那 9 条不再一律记 err=no-release，改用 npm latest 比版本。
+ *
  * 对 ArkTS 的契约（返回全部 JSON-safe；fnPath 不带 default 前缀；四个名字与 v1.0.0 完全一致）：
  *   getInfo()                       -> {name,version,uuid,src}
  *   fetchIndex()                    -> {ok,total,via,err,items:[IndexItem]}
@@ -25,15 +38,17 @@
  *   checkUpdates(listJson)          -> {ok,results:[{uuid,local,latest,hasUpdate,assetUrl,err}],indexVia}
  *       listJson = JSON.stringify([{uuid,version},...])；只查清单里出现的 uuid。
  *   installLatest(uuid)             -> {ok,uuid,name,version,asset,bytes,sha256,savedTo,via,err,attempts,writeMode,sizeOnDisk,sizeOk}
- *       下载有序回退：npm CDN（有 npmName 时）-> release 资产代理 -> release 资产直链；
+ *       下载有序回退（v1.2.0）：npm CDN（registry latest -> release tag -> latest 别名）-> npm tarball
+ *       -> release 资产代理 -> release 资产直链 -> npm CDN(清单声明版本)；release 取不到（含 404 =
+ *       该仓库压根没有 Release）不再截断链路，继续往 npm 系走；
  *       落盘 <root>/plugins/<uuid前段>-<tag>.bundle.cjs，只下载不装载（装载/登记归 ArkTS）。
  * 超时红线：Rust CALL_TIMEOUT 30s ⇒ 所有多源循环共用一个 26s 预算（DL_BUDGET_MS），
  * 预算耗尽立即停止换源并在 err 里标 'budget-exhausted'，绝不让 fnPath 超时被 Rust 掐死。
  */
 'use strict';
 (function () {
-  var SRC = 'plugin-mgr-0002';
-  var VERSION = '1.1.0';
+  var SRC = 'plugin-mgr-0003';
+  var VERSION = '1.2.0';
 
   // —— 端点（全部照抄上游 Flutter 在用的、且本机 curl 逐条实测过的那批）——
   var INDEX_URL = 'https://raw.githubusercontent.com/breeze-project-org/Breeze-plugin-list/main/plugins_data.json';
@@ -54,13 +69,17 @@
     'https://github.cnxiaobai.com/'
   ];
   // jsdelivr 系 npm CDN（上游 _cdnMirrors 子集，本机实测 cdn.jsdmirror.cn / jsd.onmicrosoft.cn = 200）
+  // 两者都支持 latest 别名（v1.2.0 实测 = 无 Release 的那批全 200）⇒ 别名是通用兜底。
   var NPM_CDN = ['https://cdn.jsdmirror.cn/', 'https://jsd.onmicrosoft.cn/'];
+  // npm registry（v1.2.0 新增，只用于拿 dist-tags.latest 与 tarball；npmmirror 国内实测 100ms 级）
+  var NPM_REGISTRY = ['https://registry.npmmirror.com/', 'https://registry.npmjs.org/'];
   var UA = 'Breeze/3.0';
 
   var INDEX_MS = 2500;     // 单个索引源超时
   var RELEASE_MS = 2500;   // 单个 release API 源超时
   var DL_SOURCE_MS = 5000; // 单个下载源超时
   var DL_BUDGET_MS = 26000;
+  var NPM_RESOLVE_MS = 2500; // 单个 npm registry 源超时（v1.2.0）
   var CHECK_CONCURRENCY = 3;
   var CHECK_MAX = 12;
 
@@ -176,8 +195,9 @@
       var c = cands[i];
       var g = await tryGet(c.url, ms, asText);
       g.label = c.label;
-      tries.push({ label: c.label, ok: g.ok, status: g.status, bytes: g.bytes, ms: g.ms, err: g.err ? g.err.slice(0, 90) : '' });
-      if (g.ok) { g.via = c.label; g.tries = tries; return g; }
+      // v1.2.0：候选可带 ver（下载候选用它标版本），命中时原样带出去 ⇒ out.version 与实际内容同源
+      tries.push({ label: c.label, ok: g.ok, status: g.status, bytes: g.bytes, ms: g.ms, ver: c.ver || '', err: g.err ? g.err.slice(0, 90) : '' });
+      if (g.ok) { g.via = c.label; g.ver = c.ver || ''; g.tries = tries; return g; }
     }
     var bad = tries.length ? tries[tries.length - 1] : null;
     var fail = {
@@ -186,6 +206,19 @@
     };
     fail.via = ''; fail.tries = tries;
     return fail;
+  }
+
+  /** 逐源尝试摘要拼一行（v1.2.0）：失败时并进 err，商店 toast 上直接能看出卡在哪个源。 */
+  function lastSummary(tries) {
+    var a = tries || [];
+    var s = [];
+    for (var i = 0; i < a.length && i < 6; i++) {
+      var one = a[i] || {};
+      var why = one.ok ? 'ok' : (one.status ? 'HTTP ' + one.status : String(one.err || 'fail').replace(/[\r\n\t]+/g, ' ').slice(0, 24));
+      s.push(one.label + ':' + why);
+    }
+    if (a.length > 6) s.push('+' + (a.length - 6) + ' more');
+    return s.join(' | ');
   }
 
   /** 归一化两种索引形状：线上是 `{repo, manifest:{…}}` 嵌套，内嵌 SEED 是扁平 ⇒ 先取 manifest，没有就当自身。 */
@@ -268,14 +301,15 @@
     for (var i = 0; i < GH_API_MIRRORS.length; i++) cands.push({ label: 'rel-api' + (i + 1), url: GH_API_MIRRORS[i] + api });
     cands.push({ label: 'rel-api-direct', url: api });
     var g = await tryEach(cands, RELEASE_MS, true, 0);
-    if (!g.ok) return { ok: false, err: g.err || 'release-fetch-fail', via: '' };
+    // v1.2.0：状态码与逐源结果带出去 —— 调用方要区分「这个仓库没有 Release(404)」与「网络不通」
+    if (!g.ok) return { ok: false, err: g.err || 'release-fetch-fail', via: '', status: g.status || 0, tries: g.tries || [] };
     try {
       var o = JSON.parse(g.text);
       var assets = [];
       var la = o.assets || [];
       for (var k = 0; k < la.length; k++) assets.push({ name: String(la[k].name || ''), url: String(la[k].browser_download_url || '') });
-      return { ok: true, tag: stripV(o.tag_name || o.tag || ''), assets: assets, via: g.via, tries: g.tries };
-    } catch (e) { return { ok: false, err: 'release-parse:' + String(e && e.message).slice(0, 80), via: g.via }; }
+      return { ok: true, tag: stripV(o.tag_name || o.tag || ''), assets: assets, via: g.via, tries: g.tries, status: 200 };
+    } catch (e) { return { ok: false, err: 'release-parse:' + String(e && e.message).slice(0, 80), via: g.via, status: g.status || 0, tries: g.tries }; }
   }
 
   /** 只吃 .cjs（不吃 .cjs.br —— 运行时没有 brotli 解码能力，上游 Flutter 有） */
@@ -288,6 +322,31 @@
       if (!best) best = assets[i];
     }
     return best;
+  }
+
+  /**
+   * npm registry 解析（v1.2.0 新增）：只用来定版本号 + 多一条 tarball 候选。
+   * 失败返回 ok=false 不算错（CDN 的 latest 别名不依赖它）。maxSources=1 给 checkUpdates 省预算。
+   * scoped 包名里那个斜杠不能转义（registry 按原始名取），故把 encodeURIComponent 产生的 %2F 换回斜杠。
+   */
+  async function npmLatest(pkg, maxSources) {
+    var lim = maxSources > 0 ? Math.min(maxSources, NPM_REGISTRY.length) : NPM_REGISTRY.length;
+    var cands = [];
+    for (var i = 0; i < lim; i++) {
+      cands.push({ label: 'registry' + (i + 1), url: NPM_REGISTRY[i] + encodeURIComponent(pkg).replace(/%2F/g, '/') });
+    }
+    var g = await tryEach(cands, NPM_RESOLVE_MS, true, 0);
+    if (!g.ok) return { ok: false, err: g.err || 'registry-fail', tries: g.tries || [] };
+    try {
+      var o = JSON.parse(g.text);
+      var tag = String(((o['dist-tags'] || {})['latest']) || '');
+      var tar = '';
+      var vs = o.versions || {};
+      if (tag && vs[tag] && vs[tag].dist) tar = String(vs[tag].dist.tarball || '');
+      return { ok: true, tag: tag, tarball: tar, via: g.via, tries: g.tries || [] };
+    } catch (e) {
+      return { ok: false, err: 'registry-parse:' + String((e && e.message) || e).slice(0, 60), tries: g.tries || [] };
+    }
   }
 
   async function checkUpdates(listJson) {
@@ -314,11 +373,29 @@
         if (!ent) { row.err = 'not-in-index'; results.push(row); continue; }
         if (Date.now() > deadline) { row.err = 'budget-exhausted'; results.push(row); continue; }
         var r = await releaseLatest(repoOf(ent));
-        if (!r.ok || !r.tag) { row.err = r.err || 'no-release'; results.push(row); continue; }
-        row.latest = r.tag;
-        row.hasUpdate = !row.local || semverLt(row.local, r.tag);
-        var as = pickAsset(r.assets);
+        var as = r.ok ? pickAsset(r.assets) : null;
         if (as) row.assetUrl = as.url;
+        if (r.ok && r.tag) {
+          row.latest = r.tag;
+          row.hasUpdate = !row.local || semverLt(row.local, r.tag);
+          results.push(row);
+          continue;
+        }
+        // v1.2.0：仓库没有 Release（9/21 条如此）不等于「查不到更新」⇒ 退到 npm dist-tags.latest。
+        // 只花一次 registry 请求（maxSources=1），预算快到底就不再花。
+        if (ent.npmName && Date.now() < deadline - 3000) {
+          var np = await npmLatest(ent.npmName, 1);
+          if (np.ok && np.tag) {
+            row.latest = np.tag;
+            row.hasUpdate = !row.local || semverLt(row.local, np.tag);
+            results.push(row);
+            continue;
+          }
+          row.err = (r.err || 'no-release') + '&' + (np.err || 'npm-fail');
+          results.push(row);
+          continue;
+        }
+        row.err = r.err || (r.status === 404 ? 'no-release-404' : 'no-release');
         results.push(row);
       }
     }
@@ -345,33 +422,74 @@
     var repo = repoOf(ent);
     if (!repo) { out.err = 'no-repo'; return out; }
 
+    // v1.2.0：release 只是「拿 tag + 资产」的一条路，失败不再 return（SEED 里 9 条压根没有 Release）。
+    var relStatus = 0;
+    var tag = '';
+    var asset = null;
     var r = await releaseLatest(repo);
-    if (!r.ok || !r.tag) { out.err = r.err || 'no-release'; return out; }
-    var tag = r.tag;
-    var asset = pickAsset(r.assets);
-    out.version = tag;
+    if (r.ok && r.tag) {
+      tag = r.tag;
+      asset = pickAsset(r.assets);
+    } else {
+      relStatus = r.status || 0;
+    }
     out.asset = asset ? asset.name : '';
 
-    // 候选顺序照抄上游：有 npmName 先试 npm CDN（jsdelivr 系），再 release 资产代理，最后直链
-    var cands = [];
+    // npm 侧解析：先 registry 拿准确 latest，拿不到也还有 CDN 的 latest 别名兜底
+    var npmTag = '';
+    var npmTarball = '';
+    var npmTries = [];
     if (ent.npmName) {
-      var assetPath = 'npm/' + ent.npmName + '@' + tag + '/dist/' + ent.npmName + '.bundle.cjs';
-      for (var c = 0; c < NPM_CDN.length; c++) cands.push({ label: 'npm-cdn' + (c + 1), url: NPM_CDN[c] + assetPath });
+      var np = await npmLatest(ent.npmName, 0);
+      npmTries = np.tries || [];
+      if (np.ok) { npmTag = np.tag; npmTarball = np.tarball; }
     }
+
+    // 候选顺序：npm CDN（registry latest -> release tag -> latest 别名）-> npm tarball ->
+    // release 资产代理 -> release 直链 -> npm CDN(清单声明版本)。同一版本多源重复是故意的：
+    // jsdelivr 系两个镜像互为备份（v1.0.0 的教训 = 单源不通就整体失败）。
+    var cands = [];
+    var seen = {};
+    var push = function (label, url, ver) {
+      if (!url || seen[url]) return; // 去重：npm latest 与 release tag 常是同一个版本号
+      seen[url] = 1;
+      cands.push({ label: label, url: url, ver: ver || '' });
+    };
+    var pushCdn = function (ver, label) {
+      if (!ent.npmName || !ver) return;
+      var ap = 'npm/' + ent.npmName + '@' + ver + '/dist/' + ent.npmName + '.bundle.cjs';
+      for (var c = 0; c < NPM_CDN.length; c++) push(label + (c + 1), NPM_CDN[c] + ap, ver === 'latest' ? (npmTag || tag || stripV(ent.version || '')) : ver);
+    };
+    // release tag 放最前 = 与 checkUpdates 报给用户的 latest 同一口径（12 条有 Release 的老路子不变）
+    pushCdn(tag, 'npm-rel');
+    pushCdn(npmTag, 'npm-latest-tag');
+    pushCdn('latest', 'npm-alias');
+    if (npmTarball) push('npm-tarball', npmTarball, npmTag);
     if (asset && asset.url) {
-      for (var p = 0; p < GH_FILE_MIRRORS.length; p++) cands.push({ label: 'rel-mirror' + (p + 1), url: GH_FILE_MIRRORS[p] + asset.url });
-      cands.push({ label: 'rel-direct', url: asset.url });
+      for (var p = 0; p < GH_FILE_MIRRORS.length; p++) push('rel-mirror' + (p + 1), GH_FILE_MIRRORS[p] + asset.url, tag);
+      push('rel-direct', asset.url, tag);
     }
-    if (!cands.length) { out.err = 'no-cjs-asset'; return out; }
+    pushCdn(stripV(ent.version || ''), 'npm-seedver');
+    if (!cands.length) {
+      out.err = 'no-candidate(relStatus=' + relStatus + '; npm=' + (ent.npmName ? 'yes' : 'none') + ')';
+      out.attempts = npmTries;
+      return out;
+    }
 
     var g = await tryEach(cands, DL_SOURCE_MS, false, deadline);
-    out.attempts = g.tries || [];
+    out.attempts = npmTries.concat(g.tries || []);
     if (!g.ok || !g.buf) {
-      out.err = g.err === 'budget-exhausted' ? 'all-sources-timeout' : (g.err || 'all-sources-failed');
+      var why = g.err === 'budget-exhausted' ? 'all-sources-timeout' : (g.err || 'all-sources-failed');
+      out.err = why + '(relStatus=' + relStatus + '; ' + lastSummary(g.tries) + ')';
       return out;
     }
     var buf = g.buf;
     out.via = g.via;
+    // 版本口径与实际下载内容同源：命中候选自带的 ver 优先，其次 registry tag，最后清单声明版本
+    if (g.ver) tag = g.ver;
+    if (!tag && npmTag) tag = npmTag;
+    if (!tag) tag = stripV(ent.version || '');
+    out.version = tag;
     try {
       // crypto.sha256 真机验证过的入参形态是 Uint8Array/string（bridge_crypto.rs 只吃原始二进制）
       // ⇒ 裸 ArrayBuffer 先包成视图。

@@ -97,10 +97,10 @@ function em(e: Object): string {
 @Entry
 @Component
 struct Index {
-  /** 当前页签下标：0 首页 / 1 云收藏 / 2 书架 / 3 发现 / 4 更多 */
+  /** 当前页签下标（s5g 去掉首页签后的真序，与 BreezeBottomTab.TabMeta.titles 同序）：0 书架 / 1 发现 / 2 云收藏 / 3 更多 */
   @State currentIndex: number = 0;
   @StorageProp('isDark') isDark: boolean = false;
-  /** C5/C6-①：内容页滚动进度（0–1），由五个页面写入，驱动顶栏透明↔实底 */
+  /** C5/C6-①：内容页滚动进度（0–1），由四个内容页写入，驱动顶栏透明↔实底 */
   @StorageProp('topBarProgress') topBarProgress: number = 0;
 
   /** S2 诊断面板状态（真机无 hilog：一张截图 = 全部验收证据）。 */

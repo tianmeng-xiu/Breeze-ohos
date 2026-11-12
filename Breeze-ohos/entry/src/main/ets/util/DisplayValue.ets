@@ -17,6 +17,11 @@
  *     等价于只 trim），非文本字段的原值语义不变。
  *
  * 纯函数、无副作用、不读全局 ⇒ 可离线单测（_tmp/login_fix/clean_cases.cjs 覆盖八个形态）。
+ *
+ * 另附 normalizeDisplayKey：把插件的**键名**归一（小写 + 去掉点横线下划线空格冒号）。
+ * 与上面的值清洗同族 —— 都是「插件各家写法不同、显示层要归一」的口径，故放同一文件、同样只此一份。
+ * 现场 = pages/PluginSettingsPage.ets 的用户名候选键匹配（userName / user_name / auth.account /
+ * displayName 各家不同）与「用户信息与下方设置项同值去重」。
  */
 export function cleanDisplayValue(raw: string): string {
   let s: string = raw.trim();
@@ -41,4 +46,24 @@ export function cleanDisplayValue(raw: string): string {
     break;
   }
   return s.trim();
+}
+
+/**
+ * 键名归一：小写 + 剥掉所有非字母数字字符（点、横线、下划线、空格、冒号），驼峰不再特殊
+ *（userName 与 user_name 与 USER.NAME 归一到同一个 username）。
+ * 只做归一、不做翻译、不猜语义；归一后为空 ⇒ 返回空串（调用方按「没这个键」处理）。
+ */
+export function normalizeDisplayKey(key: string): string {
+  let out: string = '';
+  for (let i = 0; i < key.length; i++) {
+    const c: string = key.charAt(i);
+    if (c >= 'A' && c <= 'Z') {
+      out += String.fromCharCode(c.charCodeAt(0) + 32);
+      continue;
+    }
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      out += c;
+    }
+  }
+  return out;
 }

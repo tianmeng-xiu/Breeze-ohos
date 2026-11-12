@@ -722,7 +722,10 @@ struct PluginLoginPage {
             ? this.sch().title
             : (this.pluginName.length > 0 ? this.pluginName : '账号登录'),
           showBack: true,
-          scrollProgress: 1
+          scrollProgress: 1,
+          // 新七条第 7 条（lead 裁定 11-12 17:00）：全站路由页统一打开 flatBackground —— 顶栏实底档与本页根容器
+          // 同吃 Theme.background，消除「顶栏一块色、页面一块色」的两块皮。开关默认 false，一级页不受影响。
+          flatBackground: true
         })
 
         if (this.loading) {

@@ -168,7 +168,7 @@ export class PluginSourceAdapter implements MangaSource {
   // ---------------- 映射（runner6.cjs mirror 六函数的 ArkTS 版，改一边同步另一边） ----------------
 
   /** metadata[type in types] → ' / ' 连接的值串；无则 ''。 */
-  private metaValue(item: ESObject, type: string): string {
+  private static metaValue(item: ESObject, type: string): string {
     const md: ESObject[] = jarr(item, 'metadata');
     for (let i = 0; i < md.length; i++) {
       if (jstr(md[i], 'type', '') !== type) {
@@ -196,9 +196,9 @@ export class PluginSourceAdapter implements MangaSource {
   }
 
   /** 列表项 / 详情 comicInfo → MangaSummary（字段兜底顺序照抄 mirror；rawOverride=详情 data.raw）。 */
-  private mapItem(item: ESObject, rawOverride: ESObject | null): MangaSummary {
+  private static mapItem(item: ESObject, rawOverride: ESObject | null, sourceId: string): MangaSummary {
     const raw: ESObject = rawOverride !== null ? rawOverride : jobj(item, 'raw');
-    let author: string = this.metaValue(item, 'author');
+    let author: string = PluginSourceAdapter.metaValue(item, 'author');
     if (author.length === 0) {
       // JM comicInfo 的 author 直接挂在 item 上（不在 raw 里）= bundle 源码实测。
       author = jstr(item, 'author', '');
@@ -232,7 +232,7 @@ export class PluginSourceAdapter implements MangaSource {
     const tags: string[] = tagsSrc.slice(0, 12);
     const s: MangaSummary = {
       id: jstr(item, 'id', jstr(raw, 'id', '')),
-      sourceId: PLUGIN_SOURCE_PREFIX + this.uuid,
+      sourceId: sourceId,
       title: jstr(item, 'title', jstr(raw, 'name', '')),
       author: author,
       coverUrl: jstr(cover, 'url', ''),
@@ -242,15 +242,17 @@ export class PluginSourceAdapter implements MangaSource {
     return s;
   }
 
-  /** 列表容器：data.items 优先，退回 items（两 bundle 同构，实测）。 */
-  private itemsToSummaries(root: ESObject): MangaSummary[] {
+  /** 列表容器：data.items 优先，退回 items（两 bundle 同构，实测）。
+   *  static public：云收藏同步（data/cloud/CloudFavoriteSync）复用同一个解析器，
+   *  不再造第二套字段兜底顺序（一个事实只有一个权威位置）。 */
+  static itemsToSummaries(root: ESObject, sourceId: string): MangaSummary[] {
     let items: ESObject[] = jarr(jobj(root, 'data'), 'items');
     if (items.length === 0) {
       items = jarr(root, 'items');
     }
     const out: MangaSummary[] = [];
     for (let i = 0; i < items.length; i++) {
-      const s: MangaSummary = this.mapItem(items[i], null);
+      const s: MangaSummary = PluginSourceAdapter.mapItem(items[i], null, sourceId);
       if (s.id.length > 0 && s.title.length > 0) {
         out.push(s);
       }
@@ -276,7 +278,7 @@ export class PluginSourceAdapter implements MangaSource {
     const a: RankingArg = new RankingArg();
     a.page = p1 - 1;
     const o: ESObject = await this.call('加载热门失败', 'getRankingData', a);
-    return this.itemsToSummaries(o);
+    return PluginSourceAdapter.itemsToSummaries(o, PLUGIN_SOURCE_PREFIX + this.uuid);
   }
 
   /** 搜索：searchComic（两家均 1 基，直接透传）。 */
@@ -285,7 +287,7 @@ export class PluginSourceAdapter implements MangaSource {
     a.keyword = keyword;
     a.page = Math.max(1, Math.floor(page) || 1);
     const o: ESObject = await this.call('搜索失败', 'searchComic', a);
-    return this.itemsToSummaries(o);
+    return PluginSourceAdapter.itemsToSummaries(o, PLUGIN_SOURCE_PREFIX + this.uuid);
   }
 
   /** 详情：getComicDetail → data.normal.comicInfo（raw 兜底取 data.raw，照抄 mirror）；确认不存在返回 null。 */
@@ -308,7 +310,7 @@ export class PluginSourceAdapter implements MangaSource {
     this.rememberManga(id);
     // mirror 同款：详情项的 raw 兜底用 data.raw（comicInfo 自身没有 raw 字段）。
     const dataRaw: ESObject = jobj(data, 'raw');
-    return this.mapItem(info, jisEmpty(dataRaw) ? null : dataRaw);
+    return PluginSourceAdapter.mapItem(info, jisEmpty(dataRaw) ? null : dataRaw, PLUGIN_SOURCE_PREFIX + this.uuid);
   }
 
   private lastMangaId: string = '';

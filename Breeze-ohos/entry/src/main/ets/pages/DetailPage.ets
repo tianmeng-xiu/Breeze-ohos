@@ -23,6 +23,7 @@ import { LoadingView, ErrorView } from '../view/common/StateViews';
 import { Logger } from '../util/Logger';
 import { DetailParams } from '../view/detail/DetailParams';
 import { CommentParams } from '../view/detail/CommentParams';
+import { SearchEntryParams } from '../view/search/SearchEntryParams';
 import { ReaderParams } from '../view/reader/ReaderParams';
 import { SourceManager } from '../data/source/SourceManager';
 import { MangaSource } from '../data/source/Source';
@@ -353,6 +354,26 @@ struct DetailPage {
     this.openReader(t);
   }
 
+  /**
+   * s11 第 6 条（用户 11-12 16:15 report 第 6 条）：作者名 / 标签点一下 = 到「本页这个源」搜「这个词」。
+   * 源用 this.sourceId（详情页一直带着它，见 openReader / openComments 同一口径），
+   * 所以点标签得到的是同源的同类作品，不是把全部源搅在一起的聚合结果。
+   * 空词直接不响应（作者为空或标签是空串时点了没意义，也不弹「请输入搜索关键词」那种莫名提示）。
+   * 指定源在这期间被卸载的情况由搜索页兜底：它会回落到「全部」聚合再搜（见 SearchPage aboutToAppear
+   * 的 entry source gone 分支），这里不预判、也不做二次校验。
+   */
+  private searchBy(kw: string): void {
+    const k: string = kw.trim();
+    if (k.length === 0) {
+      return;
+    }
+    const p: SearchEntryParams = new SearchEntryParams(this.sourceId, k);
+    router.pushUrl({ url: 'pages/SearchPage', params: p })
+      .catch((e: Object): void => {
+        this.toast('打开搜索页失败：' + (e as Error).message);
+      });
+  }
+
   private openComments(): void {
     const p: CommentParams = new CommentParams(this.mangaId, this.sourceId, this.title);
     router.pushUrl({ url: 'pages/CommentPage', params: p })
@@ -365,7 +386,7 @@ struct DetailPage {
    * 书架数据变了就推版本号（AppStorage 'shelfRevision'）。
    * 书架页是 TabContent 里的子 @Component：切页签不销毁、router.back 回来也不重跑 aboutToAppear，
    * 所以只写库不通知 = 用户「加完书架看不到，重启才有」——必须走写入方 push，
-   * 与 MinePage 的 readHistoryCount（s8 二轮起 MinePage 已撤 searchHistoryCount 订阅，见 view/mine/MinePage.ets 头注释要求 6） 同口径。
+   * 与 MinePage 的 readHistoryCount 同口径（该条 s10 第 4 条起多一个写点：pages/ReaderPage.onPageHide 推 historyRevision）。
    */
   private notifyShelfChanged(): void {
     const cur: number = AppStorage.get<number>('shelfRevision') ?? 0;
@@ -524,6 +545,9 @@ struct DetailPage {
       BreezeTopBar({
         title: this.title.length > 0 ? this.title : '详情',
         showBack: true,
+        // 新七条第 7 条（lead 裁定 11-12 17:00）：全站路由页统一打开 flatBackground —— 顶栏实底档与本页根容器
+        // 同吃 Theme.background，消除「顶栏一块色、页面一块色」的两块皮。开关默认 false，一级页不受影响。
+        flatBackground: true,
         onBack: () => {
           router.back();
         }
@@ -556,6 +580,10 @@ struct DetailPage {
                   .width('100%')
 
                 if (this.manga !== null && this.manga.author.length > 0) {
+                  // s11 第 6 条：作者名可点，跳「本源 + 该作者」的搜索。
+                  // 颜色仍用 text2（不改成品牌蓝）：这行同时是「作者：xxx」的元信息，
+                  // 染蓝会让它看起来像唯一可点的东西而标签又不蓝；可点性交给按下态 clickEffect
+                  // 与点中即跳转这两条反馈（全站 chip 同口径）。
                   Text(this.manga.author)
                     .fontSize(12)
                     .fontColor(Theme.text2(this.isDark))
@@ -563,6 +591,10 @@ struct DetailPage {
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                     .margin({ top: 6 })
                     .width('100%')
+                    .clickEffect({ level: ClickEffectLevel.LIGHT })
+                    .onClick((): void => {
+                      this.searchBy(this.manga !== null ? this.manga.author : '');
+                    })
                 }
 
                 if (this.statText().length > 0) {
@@ -575,6 +607,10 @@ struct DetailPage {
 
                 if (this.manga !== null && this.manga.tags.length > 0) {
                   Flex({ wrap: FlexWrap.Wrap }) {
+                    // s11 第 6 条：标签本来就是「同类」的语义，点一下跳「本源 + 该标签」的搜索。
+                    // ForEach 的 itemBuilder 形参 t 是箭头函数形参（不是 @Builder 形参），
+                    // 按值传进来就是当次数据，闭包里直接用没有「定格首帧」那个坑
+                    // （那个坑只长在 @Builder 形参上，见本文件 ActionBtn 注释）。
                     ForEach(this.manga.tags.slice(0, 6), (t: string) => {
                       Text(t)
                         .fontSize(11)
@@ -583,6 +619,10 @@ struct DetailPage {
                         .backgroundColor(Theme.fillColor(this.isDark))
                         .borderRadius(10)
                         .margin({ right: 6, bottom: 4 })
+                        .clickEffect({ level: ClickEffectLevel.LIGHT })
+                        .onClick((): void => {
+                          this.searchBy(t);
+                        })
                     }, (t: string) => t)
                   }
                   .width('100%')

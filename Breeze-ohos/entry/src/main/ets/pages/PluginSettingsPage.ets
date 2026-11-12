@@ -29,7 +29,9 @@ import {
   PluginInfo,
   SettingField,
   SettingSection,
-  CapabilityAction
+  CapabilityAction,
+  LogoutResult,
+  LOGOUT_FN
 } from '../data/source/PluginSettings';
 import { PluginLoginParams } from '../data/source/PluginLogin';
 import { PluginStore, PluginRecord } from '../util/PluginStore';
@@ -39,11 +41,15 @@ import { PLUGIN_SOURCE_PREFIX } from '../data/source/PluginSourceAdapter';
 import { JmMode } from '../data/image/JmDeobfuscate';
 import { bundleCall, bundleUnload, pluginRemoveFile } from '../util/PluginRuntime';
 import { jstr, jbool, jparse } from '../util/JsonUtil';
-import { cleanDisplayValue } from '../util/DisplayValue';
+import { cleanDisplayValue, normalizeDisplayKey } from '../util/DisplayValue';
 import { Logger } from '../util/Logger';
 
-/** 清会话这条 action：上游跑完直接跳登录页（清 = 退出后重登），我方同口径（struct 内不能用 static，挪模块级）。 */
-const RELOGIN_FN: string = 'clearPluginSession';
+/**
+ * 「跑完这条 action 就跳登录页」的判定名（struct 内不能用 static，故模块级）。
+ * 值本身引数据层的唯一权威常量 LOGOUT_FN（data/source/PluginSettings.ets:62），不再各写字面量 ——
+ * 要求6 之后同一个 fnPath 有三个消费方：能力组的跳转判定、卡片上的登出行、数据层 PluginSettings.logout。
+ */
+const RELOGIN_FN: string = LOGOUT_FN;
 
 /** 宿主管理载荷名（与 PluginManagerView:108 的 MGR_NAME 逐字一致，更新要复用它）。 */
 const MGR_NAME: string = 'pluginMgr';
@@ -67,6 +73,17 @@ const CREDENTIAL_STRONG: string[] = ['pass', 'passwd', 'password', 'pwd', 'token
 const CREDENTIAL_WEAK: string[] = ['auth'];
 const IDENTIFIER_SEGMENTS: string[] = ['account', 'username', 'user', 'userid', 'uid', 'email',
   'mail', 'login', 'name', 'nickname'];
+
+/**
+ * 要求5（2026-11-12）：用户名的候选键，**按归一化形态**写、按优先级排。
+ * 归一 = normalizeDisplayKey（小写 + 去掉点横线下划线空格冒号），所以 'userName' / 'user_name' /
+ * 'USER.NAME' / 'auth.account' 都能命中（后者归一成 authaccount，靠后缀匹配）。
+ * 各家插件字段名不统一，真机实证：JmComic 用户信息回包用 account/email，bikaComic 用 userName，
+ * 另有插件用 nick / displayName —— 所以是「名单 + 后缀匹配」，不是精确等值。
+ * 顺序即优先级：'name' 排最后，否则它会把 username/nickname 一并后缀吃掉。
+ */
+const USERNAME_KEY_SUFFIXES: string[] = ['username', 'userid', 'nickname', 'nick', 'displayname',
+  'loginname', 'account', 'email', 'user', 'name'];
 
 /** 把 key 按 . - _ 空格冒号 与驼峰边界拆段（全小写返回）。 */
 function keySegments(key: string): string[] {
@@ -124,6 +141,22 @@ function isCredentialKey(key: string): boolean {
 }
 
 /**
+ * 归一后的键是否「像用户名键」：命中候选名单里的任一条后缀。
+ * 两处用到 —— ① 卡片取用户名；② 要求5 的「与下方账号重复只留一行」判该设置项是不是账号项。
+ * 后缀匹配会有极窄的误判面（'theaccount' 这种也算命中）；误判的后果只是少显示一行重复值，
+ * 不会丢数据，故不为此再加分段解析。
+ */
+function looksLikeUsernameKey(normKey: string): boolean {
+  for (let i = 0; i < USERNAME_KEY_SUFFIXES.length; i++) {
+    if (normKey.length >= USERNAME_KEY_SUFFIXES[i].length &&
+      normKey.endsWith(USERNAME_KEY_SUFFIXES[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 「版本」这一行（BUG4）。**必须是独立 @Component + @Prop，不能走 ManageRow @Builder**：
  * @Builder 的形参是按值传递的快照，父组件的 @State pluginVersion 后续刷新时它不会重渲染
  * —— 于是即便 getInfo 成功回来了，行上仍定格在首次 build 的「未知」（DetailPage.ets:93 的
@@ -166,48 +199,68 @@ struct PluginVersionRow {
 }
 
 /**
- * 「用户信息」这一行（BUG3-b）。与 PluginVersionRow 同因同治：
+ * 「用户信息」这一行（BUG3-b 起，要求5/要求6 于 2026-11-12 改版）。与 PluginVersionRow 同因同治：
  * @Builder 形参按值传递 ⇒ 只有外层 if 条件真的翻转时才重建（空↔非空），
- * 键集不变、只换值（例：登录后 vip 等级/昵称变了）时文案会定格在旧值；
- * @Prop 随父状态刷新。版式沿用本页原来的只读信息行 InfoRow（不带箭头、不可点）；
- * 那个 @Builder 在本次改造后无人调用，已随之下线，版式在此原地复刻。
+ * 键集不变、只换值（例：登录后昵称变了）时文案会定格在旧值；@Prop 才随父状态刷新。
+ * 版式沿用本页原来的只读信息行 InfoRow（不带箭头、不可点）。
+ *
+ * 要求5：主行只剩「已登录 · 用户名」一句，**不再逐行铺 userInfo 的原始 metadata**
+ *（原 subText 副行 = vip/message/email 那一行随之下线，见 userCardLine 注释）。
+ * 要求6：插件自报了登出动作（LOGOUT_FN）时在下面多出可点的「退出登录」一行；没报的插件
+ * 一行都不出（canLogout=false），不在这里放一个只做一半的假登出。
  */
 @Component
 struct PluginUserInfoRow {
   @StorageProp('isDark') isDark: boolean = false;
-  /** 主行：用户名/账号（userLine 已过滤凭据键） */
+  /** 主行：'已登录 · 用户名'，或用户名与下方账号项同值时的 '已登录'（要求5 去重） */
   @Prop lineText: string = '';
-  /** 副行：附加信息（userSub 已过滤凭据键），可空 */
-  @Prop subText: string = '';
+  /** 要求6：该插件 actions 里带 LOGOUT_FN 才出登出行 */
+  @Prop canLogout: boolean = false;
+  /** 登出在跑：文案换「正在退出…」并挡连点（值由外层 @State 驱动） */
+  @Prop logoutBusy: boolean = false;
+  onLogout: () => void = () => {};
 
   build() {
-    Row() {
-      Column() {
-        Text(this.lineText)
-          .fontSize(15)
-          .fontColor(Theme.text1(this.isDark))
-          .maxLines(2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-          .textAlign(TextAlign.Start)
-        if (this.subText.length > 0) {
-          Text(this.subText)
-            .fontSize(12)
-            .fontColor(Theme.text3(this.isDark))
+    Column() {
+      Row() {
+        Column() {
+          Text(this.lineText)
+            .fontSize(15)
+            .fontColor(Theme.text1(this.isDark))
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .margin({ top: 3 })
             .width('100%')
             .textAlign(TextAlign.Start)
         }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
       }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
+      .width('100%')
+      .constraintSize({ minHeight: Dim.menuItemH })
+      .padding({ top: 10, bottom: 10 })
+      .alignItems(VerticalAlign.Center)
+
+      if (this.canLogout) {
+        // 登出行（要求6）：破坏性操作 ⇒ 红色文字 + 点击后先弹确认（doLogout），这里只管触发。
+        // 与上面主行同宽同边距，靠高度与颜色区分，不画分隔线（口径同第 5 条(1) 已定的删线口径）。
+        Row() {
+          Text(this.logoutBusy ? '正在退出…' : '退出登录')
+            .fontSize(15)
+            .fontColor(this.logoutBusy ? Theme.text3(this.isDark) : Theme.error)
+            .width('100%')
+            .textAlign(TextAlign.Center)
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 44 })
+        .clickEffect({ level: ClickEffectLevel.LIGHT })
+        .onClick((): void => {
+          if (!this.logoutBusy) {
+            this.onLogout();
+          }
+        })
+      }
     }
     .width('100%')
-    .constraintSize({ minHeight: Dim.menuItemH })
-    .padding({ top: 10, bottom: 10 })
-    .alignItems(VerticalAlign.Center)
   }
 }
 
@@ -249,6 +302,22 @@ struct PluginSettingsPage {
    * BUG3-b：这里同时是脱敏闸门 —— 凭据类的键不进列表，用户信息区就摊不出密码/令牌。
    */
   @State userInfoKeys: string[] = [];
+  /**
+   * 用户信息卡的主行文案（要求5：'已登录 · 用户名' 或去重后的 '已登录'）。
+   * 派生同 viewSections —— 在 onBundleChanged 里算一次，不在 build 里现算。
+   */
+  @State userCardLine: string = '已登录';
+  // （曾在此加 @State accountName / canSwitchAccount：收掉重复账号项的判定全在 onBundleChanged 里
+  // 一次算完，build 侧不读它们 ⇒ 不留死状态，两个值退回局部常量。）
+  /** 要求6：该插件是否自报了登出动作（actions 里有 LOGOUT_FN）；false ⇒ 卡片不出登出行。 */
+  @State canLogout: boolean = false;
+  /**
+   * 「能力」组实际渲染的动作（bundle.actions 去掉与卡片登出行重复的那条，见 onBundleChanged）。
+   * 派生同 viewSections：build 会反复跑，不在里面现算。
+   */
+  @State capabilityActions: CapabilityAction[] = [];
+  /** 要求6：登出在跑（挡连点 + 文案换「正在退出…」）。 */
+  @State logoutBusy: boolean = false;
   /**
    * 设置页真正渲染的分组（bundle.sections 去掉凭据类字段、再扔掉空组）。
    * 在 onBundleChanged 里派生一次，不在 build 里现算（build 会反复跑）。
@@ -299,7 +368,44 @@ struct PluginSettingsPage {
     });
     this.userInfoKeys = keys;
 
-    const groups: SettingSection[] = [];
+    // 顶卡是否走 'info' 档（与 topCardMode() 第一档同判据）。下面两处复用同一个布尔，不再各写一遍：
+    // ① 要不要把设置列表里重复的账号项收掉；② 账号项是否按「跟随登录态」只读。
+    // 注意它**不是**登录证明，含义只是「插件声明能显示用户信息，且组里确有可展示的键」。所以插件
+    // 没实现 getUserInfoBundle、或组里的键全被凭据剔空时它是 false，那时设置项一律保持可编辑 ——
+    // 没有登录页的插件只有这一处能填账号，那种情况下收掉/锁死等于把人锁在门外。
+    const infoMode: boolean = this.bundle.canShowUserInfo && keys.length > 0;
+
+    // 要求6：登出能力按「插件自报」判定，不硬编码插件名单。先算它，因为下面「账号项要不要收掉 /
+    // 要不要锁成只读」两处都依赖它。
+    let hasLogout: boolean = false;
+    for (let i = 0; i < this.bundle.actions.length; i++) {
+      if (this.bundle.actions[i].fnPath === RELOGIN_FN) {
+        hasLogout = true;
+        break;
+      }
+    }
+    this.canLogout = hasLogout;
+
+    // 防锁死闸门（新七条第 4 条）：用户是否**另有换账号的路** —— 插件给了登录页，或给了登出动作。
+    // 只有另有出路时，设置列表里的账号项才允许收掉/锁成只读；两条都没有的插件，那一项就是填账号
+    // 的唯一入口，收掉或锁死等于把人锁在门外（BUG-A 同类的错误：修一个显示问题、堵死一条主路径）。
+    const switchable: boolean = this.bundle.canLogin || hasLogout;
+
+    // 要求6：登出入口只留一处。卡片上那行「退出登录」的显示条件就是顶卡走 'info' 档，即上面那个
+    // infoMode（与 topCardMode() 第一档同判据，不再重述第三遍）。该档成立时把动作组里同 fnPath 的
+    // 这条**隐掉**，否则同一页出现两个登出入口（用户第 5 条就在抱怨重复项）。其余档位（登录卡 /
+    // 占位卡）仍照原样渲染插件自报的这条 —— 那时卡片上没有登出行，删掉它等于抹掉插件唯一的登出路径。
+    const cardShowsLogout: boolean = hasLogout && infoMode;
+    const acts: CapabilityAction[] = [];
+    for (let i = 0; i < this.bundle.actions.length; i++) {
+      if (cardShowsLogout && this.bundle.actions[i].fnPath === RELOGIN_FN) {
+        continue;
+      }
+      acts.push(this.bundle.actions[i]);
+    }
+    this.capabilityActions = acts;
+
+    const visible: SettingSection[] = [];
     for (let i = 0; i < this.bundle.sections.length; i++) {
       const sec: SettingSection = this.bundle.sections[i];
       const kept: SettingField[] = [];
@@ -316,10 +422,25 @@ struct PluginSettingsPage {
         g.id = sec.id;
         g.title = sec.title;
         g.fields = kept;
-        groups.push(g);
+        visible.push(g);
       }
     }
-    this.viewSections = groups;
+
+    // 新七条第 4 条（2026-11-12 16:15 回传）：账号名显示在「已登录」后面同一行，且只读、下方不再
+    // 单开一项。卡片账号名的来源两级：① userInfo 候选键（插件自报的用户信息，最权威）；② 可见设置
+    // 项里键名像账号键的那一项 —— 有的插件 userInfo 不带用户名，只在 scheme.sections 给一项「用户名」，
+    // 只查 ① 就会退成「卡片只有已登录 + 下面单开一行用户名」= 本条要消灭的现场。两级都取不到 ⇒ 空串。
+    // 双重闸门 infoMode && switchable（理由见上面两处注释）：任一不成立 ⇒ 不但不收重复项，
+    // 连「从设置项借账号名上卡片」也不做。原因：不收项却把名字抄上卡片 = 同一个值在页面上出现两次，
+    // 正是本条要消灭的重复；不借名则卡片只显「已登录」、下面那行照旧可编辑，两头都不破。
+    const canTakeOver: boolean = infoMode && switchable;
+    const cardName: string = this.accountNameFrom(keys, canTakeOver ? visible : []);
+    // 「不再重复单开用户名一项」：卡片是账号名的唯一展示位，把设置列表里同值的那条账号项收掉。
+    this.viewSections = canTakeOver ? this.dropAccountFields(visible, cardName) : visible;
+
+    // 要求5 + 新七条第 4 条：主行「已登录 · 账号名」（账号名跟在登录态后面同一行）；
+    // 两级来源都取不到才落「已登录」保底行（绝不回铺原始键）。
+    this.userCardLine = cardName.length > 0 ? ('已登录 · ' + cardName) : '已登录';
   }
 
   private absPath(): string {
@@ -563,7 +684,40 @@ struct PluginSettingsPage {
     this.edit = t;
   }
 
+  /**
+   * 能力组动作入口。命中「清会话」这条时**先弹确认**再执行（要求6：登出是破坏性操作，
+   * 同一页的两个入口不能一个有确认一个没有 —— 卡片那行走 confirmLogout，这条走 confirmAction）。
+   * 这条的语义与卡片登出行不同、故不合并：上游 view/plugin_settings_page.dart:729 是「清完跳登录页
+   * 重登」，卡片那行是「清完留在本页」。两个都留着：未登录/占位档时它是唯一登出路径。
+   */
   private runAction(action: CapabilityAction): void {
+    if (action.fnPath === RELOGIN_FN) {
+      this.confirmAction(action);
+      return;
+    }
+    this.execAction(action);
+  }
+
+  /** 能力组「清会话」这条的确认弹窗（确认后仍走原 execAction ⇒ 保留跳登录页的上游语义）。 */
+  private confirmAction(action: CapabilityAction): void {
+    const opts: promptAction.ShowDialogOptions = {
+      title: action.title,
+      message: '将请求插件清除当前账号的登录状态，并跳到登录页重新登录。设置项与其它配置不受影响。',
+      buttons: [
+        { text: '继续', color: Theme.error },
+        { text: '取消', color: Theme.text2(this.isDark) }
+      ]
+    };
+    promptAction.showDialog(opts).then((res: promptAction.ShowDialogSuccessResponse): void => {
+      if (res.index !== 0) {
+        return;
+      }
+      this.execAction(action);
+    }).catch((_e: Object): void => {});
+  }
+
+  /** 原 runAction 的执行体（不含确认）。 */
+  private execAction(action: CapabilityAction): void {
     this.toast('正在执行：' + action.title);
     PluginSettings.runAction(this.uuid, action).then((msg: string): void => {
       this.toast(msg);
@@ -591,6 +745,52 @@ struct PluginSettingsPage {
       .catch((err: Error): void => {
         this.toast('打开登录页失败：' + err.message);
       });
+  }
+
+  /**
+   * 登出（要求6）：确认弹窗 → PluginSettings.logout → 成功则静默重读 bundle 回登录态 + toast，
+   * 失败只 toast 带原因。三档行为都在此：
+   *  成功：插件清了会话 ⇒ getUserInfoBundle 回空/回引号对 ⇒ userInfoKeys 空 ⇒ topCardMode 落
+   *        'login' ⇒ 顶部回到登录卡（用户要求「保留登录入口」的那条路径，与登录成功正好互逆）。
+   *  失败：不动任何状态，toast 出插件/引擎给的原因。
+   *  弹窗被取消或点遮罩（showDialog 的 Promise 会 reject，同 SearchPage 删除确认的处理）：什么都不做。
+   *
+   * 文案刻意**不承诺**「退出后不会自动登录/下次需要重新登录」：s8 真机诊断 cfg=0/9 说明这类插件
+   * 一次都没走宿主持久化通道，会话在插件自己手里，宿主只能转达登出请求，管不到它存了什么。
+   */
+  private confirmLogout(): void {
+    if (this.logoutBusy) {
+      return;
+    }
+    const opts: promptAction.ShowDialogOptions = {
+      title: '退出登录',
+      message: '将请求插件清除当前账号的登录状态。设置项与其它配置不受影响。',
+      buttons: [
+        { text: '退出登录', color: Theme.error },
+        { text: '取消', color: Theme.text2(this.isDark) }
+      ]
+    };
+    promptAction.showDialog(opts).then((res: promptAction.ShowDialogSuccessResponse): void => {
+      if (res.index !== 0) {
+        return;
+      }
+      this.logoutBusy = true;
+      PluginSettings.logout(this.uuid).then((r: LogoutResult): void => {
+        this.logoutBusy = false;
+        this.toast(r.msg);
+        if (!r.ok) {
+          return;
+        }
+        // 静默重读（不走 reload 的骨架屏）：用户信息卡与登录卡的可见性都由 bundle 驱动，
+        // 换 bundle 引用 ⇒ onBundleChanged 重算 ⇒ 顶卡自动回 'login'。
+        PluginSettings.load(this.ctx(), this.uuid).then((b: PluginSettingsBundle): void => {
+          this.bundle = b;
+        }).catch((_e: Object): void => {});
+      }).catch((e: Object): void => {
+        this.logoutBusy = false;
+        this.toast('退出失败：' + (e as Error).message);
+      });
+    }).catch((_e: Object): void => {});
   }
 
   /**
@@ -812,37 +1012,118 @@ struct PluginSettingsPage {
     return v2.length > 0 ? v2 : '未设置';
   }
 
-  private userLine(keys: string[]): string {
-    // account/email 是 s7b 真机补的：JmComic、bikaComic 的用户信息回包用的是这两个键，
-    // 原名单没有 ⇒ 落到「取 keys[0]」的兜底，标题栏显示成 uid 之类的值。
-    // 出口同过 cleanDisplayValue（BUG-B 同一规则）：命中项清洗后为空就继续找下一个候选，
-    // 与 onBundleChanged 里按清洗长度筛键集保持同一判据，不会出现「键在、值为空」的信息卡。
-    const want: string[] = ['userName', 'name', 'nickname', 'user', 'account', 'email'];
-    for (let i = 0; i < want.length; i++) {
-      if (keys.indexOf(want[i]) >= 0) {
-        const v: string | undefined = this.bundle.userInfo.get(want[i]);
+  /**
+   * 从 userInfo 里挑用户名（要求5）。**按归一化后缀 + 优先级**找：键归一（normalizeDisplayKey）后
+   * 命中 USERNAME_KEY_SUFFIXES 的某一条后缀就算候选，靠前的后缀先赢（同一后缀有多个键时按
+   * userInfo 的键序取第一个清洗后非空的）。
+   *
+   * 与旧 userLine 的两处实质差别：
+   *  ① 旧版是**精确等值**名单（userName/name/nickname/user/account/email），插件写 user_name、
+   *     auth.account、displayName 就全落空 ⇒ 走 keys[0] 兜底，把 uid 之类的值当用户名上屏；
+   *     现按归一后缀匹配，这几种写法都能命中。
+   *  ② 旧版兜底「取 keys[0]」= 用户抱怨的「拿一个不相干的原始字段顶上来」。现**删掉该兜底**，
+   *     取不到就返回空串，由调用方（onBundleChanged）落「已登录」通用保底行 —— 用户明确写了
+   *     「禁止找不到就把所有键全铺出来」，取第一个键是同一毛病的单键版。
+   * 值仍过 cleanDisplayValue（BUG-B 同一份实现），与 onBundleChanged 筛键集同判据。
+   */
+  private usernameFrom(keys: string[]): string {
+    for (let i = 0; i < USERNAME_KEY_SUFFIXES.length; i++) {
+      const suffix: string = USERNAME_KEY_SUFFIXES[i];
+      for (let j = 0; j < keys.length; j++) {
+        const nk: string = normalizeDisplayKey(keys[j]);
+        if (nk.length < suffix.length || !nk.endsWith(suffix)) {
+          continue;
+        }
+        const v: string | undefined = this.bundle.userInfo.get(keys[j]);
         const cleaned: string = v === undefined ? '' : cleanDisplayValue(v);
         if (cleaned.length > 0) {
           return cleaned;
         }
       }
     }
-    return keys.length > 0 ? cleanDisplayValue(this.bundle.userInfo.get(keys[0]) ?? '') : '';
+    return '';
   }
 
-  private userSub(keys: string[]): string {
-    // 与 userLine 同判据（清洗后才算「有值」），副行也不会漏出引号字面量
-    const want: string[] = ['vip', 'vipType', 'message', 'email', 'userId', 'id'];
-    for (let i = 0; i < want.length; i++) {
-      if (keys.indexOf(want[i]) >= 0) {
-        const v: string | undefined = this.bundle.userInfo.get(want[i]);
-        const cleaned: string = v === undefined ? '' : cleanDisplayValue(v);
-        if (cleaned.length > 0) {
-          return want[i] + '：' + cleaned;
+  /**
+   * 卡片上要显示的账号名（要求5 起用，新七条第 4 条改造）。**两级来源，按权威性排**：
+   *  ① userInfo 候选键 —— 走 usernameFrom（插件自报的用户信息，最权威，键名归一后按后缀优先级挑）；
+   *  ② 可见设置项里「键名像账号键」且清洗后非空的第一项 —— 必须留这二级：JmComic(0.0.7) 这类插件
+   *     的 userInfo 根本不带用户名，只在 scheme.sections 给一项「用户名」，只查 ① 就会退成
+   *     「卡片只有已登录 + 下面单开一行用户名」= 真机截图现场，也正是本条要消灭的形态。
+   * 两处刻意与 dropAccountFields 对齐，避免「借了名又收不掉项」造成同值出现两次：
+   *  · groups 传空数组 = 调用方在说「本插件不能由卡片接管账号展示」（闸门不通过，见 onBundleChanged
+   *    的 canTakeOver），此时整级跳过；
+   *  · 带 fnPath 的项跳过（dropAccountFields 那侧不收它，见其注释 ③），名字也就不从它借。
+   * 两级都取不到返回空串，由调用方落「已登录」保底行（绝不回铺原始键）。
+   */
+  private accountNameFrom(keys: string[], groups: SettingSection[]): string {
+    const fromInfo: string = this.usernameFrom(keys);
+    if (fromInfo.length > 0) {
+      return fromInfo;
+    }
+    for (let i = 0; i < groups.length; i++) {
+      const fields: SettingField[] = groups[i].fields;
+      for (let j = 0; j < fields.length; j++) {
+        const f: SettingField = fields[j];
+        if (f.fnPath.length > 0 || !looksLikeUsernameKey(normalizeDisplayKey(f.key))) {
+          continue;
+        }
+        const v: string = this.valOf(f); // 出口已过 cleanDisplayValue ⇒ 上屏就是它
+        if (v.length > 0) {
+          return v;
         }
       }
     }
     return '';
+  }
+
+  /**
+   * 把设置列表里与卡片账号名重复的那几行收掉（新七条第 4 条：不再重复单开用户名一项）。
+   * 收的判据三条全中：① 键名像账号键（looksLikeUsernameKey）；② 清洗后值与卡片账号名相等
+   * （忽略大小写 —— 值清洗与 BUG-B 同源，插件的「""」与空在显示层等价，比较也必须等价）；
+   * ③ 该项**不带 fnPath**。③ 就是用户那句「除非上游提供对于云端用户名的修改」的落点：
+   *   SettingField.fnPath 非空 = 上游契约里这项写值要走插件自己的 setter（服务端动作，见数据层 :84 注释），
+   *   属于插件明给的改名的路，不收（宁可值出现两次也不替插件把功能藏了）。JmComic 的 auth.account
+   *   是纯持久化字段、无 fnPath ⇒ 正常被收，卡片成为唯一展示位，也就自然没有可改的入口 = 只读。
+   * 口径核对（别照直觉写）：isCredentialKey('auth.account') **返回 false**（:68 两档口径 —— 'auth' 弱
+   *   命中但 'account' 在 IDENTIFIER_SEGMENTS 里 ⇒ 判非凭据），所以账号项**在**可见表里、会被这里收；
+   *   被 BUG3-b 提前剔掉的是 password/token/cookie 那类强凭据段，它们本来也不是用户名。
+   * 整组被收空就让它整组消失：JmComic 的「账号」组只有用户名一项（密码项已被 BUG3-b 剔掉），
+   *   留着判「组里至少保一项」等于在最主要的场景里不做事 —— 用户要的就是这一组不再单开。
+   */
+  private dropAccountFields(groups: SettingSection[], name: string): SettingSection[] {
+    if (name.length === 0) {
+      return groups;
+    }
+    const lower: string = name.toLowerCase();
+    const out: SettingSection[] = [];
+    for (let i = 0; i < groups.length; i++) {
+      const fields: SettingField[] = groups[i].fields;
+      const kept: SettingField[] = [];
+      for (let j = 0; j < fields.length; j++) {
+        const f: SettingField = fields[j];
+        if (f.fnPath.length === 0 && looksLikeUsernameKey(normalizeDisplayKey(f.key))) {
+          const v: string = this.valOf(f);
+          if (v.length > 0 && v.toLowerCase() === lower) {
+            continue;
+          }
+        }
+        kept.push(f);
+      }
+      if (kept.length === 0) {
+        continue;
+      }
+      if (kept.length === fields.length) {
+        out.push(groups[i]);
+        continue;
+      }
+      const g = new SettingSection();
+      g.id = groups[i].id;
+      g.title = groups[i].title;
+      g.fields = kept;
+      out.push(g);
+    }
+    return out;
   }
 
   // ---------------- UI ----------------
@@ -1072,6 +1353,9 @@ struct PluginSettingsPage {
           title: this.displayName.length > 0 ? this.displayName : '插件设置',
           showBack: true,
           scrollProgress: 1,
+          // 新七条第 7 条（lead 裁定 11-12 17:00）：全站路由页统一打开 flatBackground —— 顶栏实底档与本页根容器
+          // 同吃 Theme.background，消除「顶栏一块色、页面一块色」的两块皮。开关默认 false，一级页不受影响。
+          flatBackground: true,
           onBack: (): void => {
             router.back();
           }
@@ -1121,8 +1405,12 @@ struct PluginSettingsPage {
                   if (this.topCardMode() === 'info') {
                     // 独立 @Component（同 PluginVersionRow）：登录返回后同键集换值也要刷新
                     PluginUserInfoRow({
-                      lineText: this.userLine(this.userInfoKeys),
-                      subText: this.userSub(this.userInfoKeys)
+                      lineText: this.userCardLine,
+                      canLogout: this.canLogout,
+                      logoutBusy: this.logoutBusy,
+                      onLogout: (): void => {
+                        this.confirmLogout();
+                      }
                     })
                   } else {
                     Text('暂无用户信息')
@@ -1166,10 +1454,12 @@ struct PluginSettingsPage {
               }
 
               // ---- 能力动作（上游 actionsSection）----
-              if (this.bundle.actions.length > 0) {
+              if (this.capabilityActions.length > 0) {
                 this.SectionCard('能力')
                 Column() {
-                  ForEach(this.bundle.actions, (a: CapabilityAction) => {
+                  // 喂派生数组 capabilityActions（不是 bundle.actions）：与卡片登出行重复的那条已在
+                  // onBundleChanged 里隐掉；key 仍用 fnPath（动作组内 fnPath 唯一，数据层已去过空值）
+                  ForEach(this.capabilityActions, (a: CapabilityAction) => {
                     this.ManageRow(a.title, a.fnPath, false, (): void => {
                       this.runAction(a);
                     })

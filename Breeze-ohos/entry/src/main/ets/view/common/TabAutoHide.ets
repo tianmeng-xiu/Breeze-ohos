@@ -27,7 +27,7 @@
  *
  * ===== 页索引只能有一处真相 =====
  *  IDX_* 必须与 BreezeBottomTab.TabMeta.titles 顺序一致（0 书架 / 1 发现 / 2 云收藏 / 3 更多）。
- *  云收藏是纯占位页无滚动容器 ⇒ 不登记。
+ *  云收藏 s10 第 11 条起有纵向 Scroll 容器 ⇒ 已登记 IDX_CLOUD=2。
  */
 
 import { HdsTabsController, HdsAnimationMode } from '@kit.UIDesignKit';
@@ -36,6 +36,8 @@ export class TabAutoHide {
   /** 与 TabMeta.titles 对齐的页索引常量（改动底栏顺序时必须同步这里） */
   static readonly IDX_SHELF: number = 0;
   static readonly IDX_DISCOVER: number = 1;
+  /** s10 第 11 条：云收藏页重设计后有纵向 Scroll 容器，纳入收起联动（原来是占位页无滚动容器） */
+  static readonly IDX_CLOUD: number = 2;
   static readonly IDX_MINE: number = 3;
 
   /** 诊断键：写 'hds:shown' / 'hds:hidden' / 'native:…' / 'off' / 'pending'，供诊断面板 surface 行取证 */
