@@ -39,7 +39,7 @@
 #   不保证后面紧跟 0x00，于是第一个键（凑巧有 NUL）侥幸可用，其余全部注册到连读的垃圾键上。
 #   ArkTS 侧表现 = import 成功、模块对象拿到了、但只有 init 可调、其余全 undefined，报
 #   "X is not callable"，容易被误判成「模块没注册」。正确写法 = ExportSpec.name: &'static CStr
-#   配 c"init" 这类字面量；注册循环不要首个失败就 return（一项连坐全部），逐项容错 +
+#   配 c"init" 这类字面量；注册循环不要首个失败就 return（否则其余导出全部不注册），逐项容错 +
 #   napi_has_named_property 回读自检。字节级判据 = 读 .so 找「前置 0x00 + 名字 + 紧跟 0x00」
 #   的出现次数，坏包 1/16、好包 16/16。
 #   整包哈希不可复现（HAP 是 zip，头部内嵌 DOS 时间戳），比对包内内容请逐 entry 比 sha256。

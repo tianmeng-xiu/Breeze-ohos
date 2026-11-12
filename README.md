@@ -24,7 +24,7 @@ HarmonyOS / OpenHarmony 原生漫画阅读器：ArkTS（ArkUI）应用 + Rust �
 ├── Breeze-ohos/                  ArkTS 应用（entry 模块）
 │   ├── AppScope/                 应用级配置与图标
 │   └── entry/src/main/
-│       ├── ets/                  ArkTS 源码：entryability（启动闸门、深浅色、数据初始化）、pages（11 条路由）、view（10 个组件分组）、data（db / image / kv / model / net / source）、util（引擎门面、宿主路由、设置、主题、日志）
+│       ├── ets/                  ArkTS 源码：entryability（启动初始化、深浅色、数据引导）、pages（11 条路由）、view（10 个组件分组）、data（db / image / kv / model / net / source）、util（引擎门面、宿主路由、设置、主题、日志）
 │       ├── cpp/                  NAPI 类型声明（index.d.ts）
 │       ├── resources/rawfile/plugins/  3 个内置 JS 载荷
 │       └── libs/arm64-v8a/       构建产出的 .so 落点（不入库）
@@ -94,7 +94,7 @@ hdc shell bm install -p /data/local/tmp/
 以下只列影响使用决策的条目；本项目的性质与修复承诺见文末 [声明与免责](#声明与免责)。
 
 - 编译目标为 phone 与 tablet（`module.json5` 的 `deviceTypes`），但只在 HUAWEI Mate 80 Pro Max（应用内取到的型号串 = `SGT-AL10`，OpenHarmony 7.0.0.111，API 26）这一台手机上做过真机验证；平板与其他机型 / ROM 仅编译通过，未实测。
-- 阅读器功能偏薄：目前只有单图横向翻页。长条/连页模式、亮度与常亮控制、章节目录跳转、翻页动画档位等尚未实现。
+- 阅读器功能偏薄：目前只有单图横向翻页。长条/连页模式、亮度与常亮控制、章节目录跳转、翻页动画选项等尚未实现。
 - 宿主提供登录态持久化接口，插件是否调用由插件自己决定；插件登录还依赖其实现 `getLoginBundle`，未实现的插件回「该插件不支持登录」属正常行为。
 - 图片反混淆只覆盖一种形态（横向切成 N 条带并倒序），其他形态走「检测不出就不动图」的安全分支。
 - 启动窗底色只跟随系统色档：启动画面早于任何 JS 执行，手动选深色而系统当前是浅色时启动窗仍是白底。
