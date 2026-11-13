@@ -4,7 +4,9 @@
  *   （书架/发现/云收藏/更多），本页不再挂 TabContent，BreezeBottomTab 已删除对它的 import。
  *   文件保留是有意的：「继续阅读」区块将来要并入书架页（详情页与阅读记录卡的缺口），
  *   届时直接复用本文件的 recent 加载逻辑（MangaRepository.listHistory + getManga）。
- *   在并入之前，本页不参与运行时路径，页签索引常量（onRequestTab(3)）已失效，勿直接照搬。
+ *   在并入之前，本页不参与运行时路径。s14 第 2 条起底栏收敛为三签（0 书架 / 1 发现 / 2 更多），
+ *   本页三处 onRequestTab 的实参已按新序校正；旧四签口径下的 3 在新序里越界，会被
+ *   BreezeBottomTab.jumpTo 的 index >= TabMeta.count 闸门静默吞掉 = 点下去没反应。接线时按新序即可。
  * 依赖：Theme / StateViews；data 层 MangaRepository（listBookshelf / listHistory / getManga）；router。
  * 对应 Flutter：lib/page/home/view/home_page.dart（原版首页多子 Tab，鸿蒙首版收敛为继续阅读+推荐）。
  * 备注：顶部公共顶栏由 pages/Index.ets 统一提供，本页不再自绘顶栏，避免双顶栏。
@@ -104,7 +106,7 @@ export struct HomePage {
         .padding({ left: 8, right: 2 })
         .textAlign(TextAlign.End)
         .onClick(() => {
-          this.onRequestTab(3);
+          this.onRequestTab(2); // 更多（s14 起三签，旧四签写 3）
         })
     }
     .width('100%')
@@ -170,7 +172,7 @@ export struct HomePage {
       .backgroundColor(Theme.fillColor(this.isDark))
       .borderRadius(Dim.radius)
       .onClick(() => {
-        this.onRequestTab(3);
+        this.onRequestTab(1); // 发现（搜索入口；旧四签写 3 与注释本就不符）
       })
 
       if (this.loading) {
@@ -194,7 +196,7 @@ export struct HomePage {
             .height(48)
             .padding({ left: 16, right: 16 })
             .onClick(() => {
-              this.onRequestTab(3);
+              this.onRequestTab(1); // 去发现（s14 起三签，旧四签写 3）
             })
         }
         .layoutWeight(1)

@@ -34,13 +34,14 @@ import {
   LOGOUT_FN
 } from '../data/source/PluginSettings';
 import { PluginLoginParams } from '../data/source/PluginLogin';
+import { WebLoginParams } from '../data/source/WebLogin';
 import { PluginStore, PluginRecord } from '../util/PluginStore';
 import { PluginSourceRegistry } from '../data/source/PluginSourceRegistry';
 import { PluginImageOps } from '../data/source/PluginImageOps';
 import { PLUGIN_SOURCE_PREFIX } from '../data/source/PluginSourceAdapter';
 import { JmMode } from '../data/image/JmDeobfuscate';
 import { bundleCall, bundleUnload, pluginRemoveFile } from '../util/PluginRuntime';
-import { jstr, jbool, jparse } from '../util/JsonUtil';
+import { jstr, jbool, jnum, jparse, jobj, jhas, jisEmpty, jstrArr } from '../util/JsonUtil';
 import { cleanDisplayValue, normalizeDisplayKey } from '../util/DisplayValue';
 import { Logger } from '../util/Logger';
 
@@ -53,6 +54,31 @@ const RELOGIN_FN: string = LOGOUT_FN;
 
 /** 宿主管理载荷名（与 PluginManagerView:108 的 MGR_NAME 逐字一致，更新要复用它）。 */
 const MGR_NAME: string = 'pluginMgr';
+/**
+ * s15 第 8 条：本页直连引擎调动作时的入参串，与 data/source/PluginSettings.ets:48 的 ARGS_EMPTY 同串
+ * （那边未导出）。契约见 §24：插件永远收到恰好一个对象参数且必带 extern 键。
+ */
+const ACTION_ARGS: string = '[{"extern":{}}]';
+/**
+ * s15 第 8 条：rawAction 的内部结果（页面私有；数据层的 RawResult/ActionResult 未导出）。
+ * ok = 调用有没有跑通（不含业务成败）；root = 原始返回，交 tryOpenWeb 解析；msg = 可直接 toast 的文案。
+ */
+class RawActionResult {
+  ok: boolean = false;
+  root: ESObject = JSON.parse('{}');
+  msg: string = '';
+}
+/**
+ * s15 第 8 条：先从 box 取某键、拿不到再从 root 取（插件普遍把结果嵌在 data 之下
+ * = {source, data:{...}}，少数直接平铺 ⇒ 两种形态都认，谁先给出非空串用谁）。
+ */
+function pickStr(box: ESObject, root: ESObject, k: string): string {
+  const a: string = jstr(box, k, '');
+  if (a.length > 0) {
+    return a;
+  }
+  return jstr(root, k, '');
+}
 
 /**
  * 疑似凭据的键名名单（小写整段比对，见 isCredentialKey）。
@@ -397,8 +423,10 @@ struct PluginSettingsPage {
     // 现场根因：auth.account 落在 IDENTIFIER_SEGMENTS ⇒ isCredentialKey 判 false ⇒ 它不属于
     // BUG3-b 那条凭据剔除；而未登录时 infoMode=false ⇒ canTakeOver=false、cardName 为空串，
     // 两道去重闸都放行 ⇒ 未登录态下面挂着一行可点可改的用户名（用户报的「登出后用户名依旧在，
-    // 并且可以修改」）。与 dropAccountFields 是两条互补判据：那条管「已登录时去掉同值重复项」
-    // （要有 cardName 才动手），这条管「未登录时不留可改残留」（恰恰是 cardName 为空那一档）。
+    // 并且可以修改）。与 dropAccountFields 是两条互补判据：那条管「卡片接管后
+    // 去掉同键重复项」（s15 第 6 条起不再要求 cardName 非空，只看 canTakeOver），
+    // 这条管「卡片没接管时不留可改残留」（顶卡不在 info 档那一档）。
+    // 两条各管一档、互不重叠。
     //
     // 为什么还要 && switchable（lead 结案收窄，原实现只看顶卡档位）：本文件既有防锁死原则
     // （上面 switchable 的注释）= 用户没有别的登录出路时，那一行就是填账号的唯一入口，绝不能隐。
@@ -461,8 +489,12 @@ struct PluginSettingsPage {
     // 正是本条要消灭的重复；不借名则卡片只显「已登录」、下面那行照旧可编辑，两头都不破。
     const canTakeOver: boolean = infoMode && switchable;
     const cardName: string = this.accountNameFrom(keys, canTakeOver ? visible : []);
-    // 「不再重复单开用户名一项」：卡片是账号名的唯一展示位，把设置列表里同值的那条账号项收掉。
-    this.viewSections = canTakeOver ? this.dropAccountFields(visible, cardName) : visible;
+    // s15 第 6 条（用户拍板口径 A）：卡片接管后，同键可编辑项**无条件**收掉（判据见该方法注释）。
+    // 本行只需守住「接管与否」这一道闸门 = canTakeOver，它自带 switchable（有登录页或登出动作）
+    // ⇒ 收掉之后用户仍有换账号的路。另有一条天然不变量兜底：cardName 为空当且仅当 ① userInfo 候选
+    // 键都空 且 ② 可见项里没有一项「键名像账号键且值非空」（accountNameFrom 的二级就是来找它的），
+    // 所以卡片没名字时本行收掉的必然只是个空值项，不会把用户填过的账号名藏起来。
+    this.viewSections = canTakeOver ? this.dropAccountFields(visible) : visible;
 
     // 要求5 + 新七条第 4 条：主行「已登录 · 账号名」（账号名跟在登录态后面同一行）；
     // 两级来源都取不到才落「已登录」保底行（绝不回铺原始键）。
@@ -742,11 +774,30 @@ struct PluginSettingsPage {
     }).catch((_e: Object): void => {});
   }
 
-  /** 原 runAction 的执行体（不含确认）。 */
+  /**
+   * 原 runAction 的执行体（不含确认）。
+   *
+   * s15 第 8 条（用户 11-13 拍板 A 方案）改写：改前只 toast 一条字符串，插件回的 data 全丢 ⇒
+   * 判不出「这条动作其实是要开网页」。现在改成先拿结构化返回再看怎么走：**命中 openWeb ⇒ 开内嵌
+   * 登录页**（并直接 return，不再 toast、不再刷 bundle —— 跳走了刷了也白刷）；其余动作与失败路径
+   * 仍走原来的 toast，观感与改前逐字一致（含 RELOGIN_FN 跳登录页、成功后静默刷 bundle）。
+   *
+   * ★ 能力动作**全生命周期只在这里调这一次**（lead 红线）：新页不再自己探一遍动作，所有参数从
+   *   这里的返回里取、经 WebLoginParams 传过去。理由：清会话这类动作有副作用，探第二次 = 重复执行；
+   *   不能因为「eh 这条恰好无副作用」就把分发器写成可以重复调用的形状。
+   */
   private execAction(action: CapabilityAction): void {
     this.toast('正在执行：' + action.title);
-    PluginSettings.runAction(this.uuid, action).then((msg: string): void => {
-      this.toast(msg);
+    this.rawAction(action).then((r: RawActionResult): void => {
+      if (!r.ok) {
+        // 失败仍只 toast：与改前的 catch 分支同文案、同样不刷 bundle（没成功就没必要重读）
+        this.toast(r.msg);
+        return;
+      }
+      if (this.tryOpenWeb(r.root)) {
+        return;
+      }
+      this.toast(r.msg);
       if (action.fnPath === RELOGIN_FN) {
         this.openLogin();
       }
@@ -756,9 +807,106 @@ struct PluginSettingsPage {
           this.bundle = b;
         }).catch((_e: Object): void => {});
       }
-    }).catch((e: Object): void => {
-      this.toast('执行失败：' + (e as Error).message);
     });
+  }
+
+  /**
+   * s15 第 8 条：跑一个能力动作并把**原始返回**留在页面侧解析一次。
+   *
+   * 为什么在页面侧另开一条而不改数据层：PluginSettings.runAction（data/source/PluginSettings.ets:517）
+   * 的返回类型是 Promise<string>（只回 toast 文案），openUrl 在第一层就被丢掉了；而改它的签名要动
+   * data/source/PluginSettings.ets，不在本条写域。本方法与数据层 callAction(:496) 走的是**同一条**
+   * 引擎通道（同一个 bundleCall、同一份入参串 ACTION_ARGS ⇒ §24 契约不变），差别只在解析结果的去向，
+   * 没有新增第二条调用路径。文案兜底（插件没回 message ⇒ '已执行：' + title）也照抄 callAction，
+   * 保证非 openWeb 的动作 toast 出来的字与改前一字不差。
+   */
+  private rawAction(action: CapabilityAction): Promise<RawActionResult> {
+    const r: RawActionResult = new RawActionResult();
+    if (action.fnPath.length === 0) {
+      r.msg = '该操作缺少 fnPath';
+      return Promise.resolve(r);
+    }
+    return bundleCall(this.uuid, action.fnPath, ACTION_ARGS).then((raw: string): RawActionResult => {
+      const o: ESObject = jparse(raw);
+      r.ok = true;
+      r.root = o;
+      const box: ESObject = jobj(o, 'data');
+      const msg: string = pickStr(box, o, 'message');
+      r.msg = msg.length > 0 ? msg : ('已执行：' + action.title);
+      return r;
+    }).catch((e: Object): RawActionResult => {
+      r.msg = '执行失败：' + (e as Error).message;
+      return r;
+    });
+  }
+
+  /**
+   * s15 第 8 条：返回里带「去网页登录」就把参数取全并跳内嵌页；返回是否已跳（已跳 ⇒ 调用方不再 toast）。
+   *
+   * 判据两条任一成立即算：① action.type === 'openWeb'（eh 给的规范形态，实测 eh.cjs@1404075：
+   *   data.{accepted, openUrl, cookiePollIntervalMs:5e5, ignoreCookieNames:[cf_clearance],
+   *   setCookieFnPath:'setEhentaiForumCookie', action:{type:'openWeb', payload:{title,url}}, message}）；
+   * ② 同时给了 openUrl 与 setCookieFnPath（宽松档，别的插件不套 action 这层也能吃）。
+   *
+   * **只给 openUrl 不给 setCookieFnPath 不当作登录动作**：开了页也无处回传，等于把用户扔在一个
+   * 跟登录无关的网页里 ⇒ 那种情况退回 toast，至少把插件的 message 原话给用户看。
+   * 路由条目 pages/WebLoginPage 由 lead 加进 main_pages.json（本条写域不含该文件）；加之前点这条
+   * 会落到下面的 catch 提示，不会静默无反应。
+   */
+  private tryOpenWeb(root: ESObject): boolean {
+    const box: ESObject = jobj(root, 'data');
+    const act: ESObject = jobj(box, 'action');
+    const payload: ESObject = jobj(act, 'payload');
+    const type: string = jstr(act, 'type', '');
+    let url: string = jstr(payload, 'url', '');
+    if (url.length === 0) {
+      url = pickStr(box, root, 'openUrl');
+    }
+    const target: string = pickStr(box, root, 'setCookieFnPath');
+    const shaped: boolean = type === 'openWeb' || (url.length > 0 && target.length > 0);
+    if (!shaped || url.length === 0 || target.length === 0) {
+      return false;
+    }
+    const p: WebLoginParams = new WebLoginParams(this.uuid, this.displayName, this.localFile);
+    p.openUrl = url;
+    p.setCookieFnPath = target;
+    p.setTitle = jstr(payload, 'title', '');
+    let iv: number = jnum(box, 'cookiePollIntervalMs', 0);
+    if (iv <= 0) {
+      iv = jnum(root, 'cookiePollIntervalMs', 0);
+    }
+    p.pollIntervalMs = iv;
+    let ig: string[] = jstrArr(box, 'ignoreCookieNames');
+    if (ig.length === 0) {
+      ig = jstrArr(root, 'ignoreCookieNames');
+    }
+    p.ignoreCookieNames = ig;
+    p.message = pickStr(box, root, 'message');
+    // requiredNames 刻意不填：eh 没给这个字段（实测 8 份 .cjs 只有 ignoreCookieNames），
+    // 新页自己有兜底必需键名单，插件哪天开始下发就自动以插件为准
+    router.pushUrl({ url: 'pages/WebLoginPage', params: p })
+      .catch((err: Error): void => {
+        this.toast('打开网页登录失败：' + err.message);
+      });
+    return true;
+  }
+
+  /**
+   * s15 第 8 条：能力组副文案。插件侧 capabilities 只有 {title, fnPath} 两个键
+   * （实测 8 份 .cjs = bika/copy/eh/mangui/noyacg/shen/webtoon/zai，没有 description/message 字段，
+   * 数据层解析也只取这两个键并滤掉 dumpRuntimeInfo）⇒ 说明只能宿主自己按 fnPath 归类写。
+   * 认不出的动作回**空串**：ManageRow 的 sub 为空就不画那行，宁可少一行说明，
+   * 也不能把 fnPath 这种内部函数名当文案上屏（改前 :1500 就是这个观感缺陷）。（与 s12「路径不上屏」同一条口径）
+   */
+  private actionSub(a: CapabilityAction): string {
+    const fn: string = a.fnPath;
+    if (fn === RELOGIN_FN) {
+      return '清除当前账号的登录状态，随后跳到登录页';
+    }
+    if (fn.indexOf('WebLogin') >= 0) {
+      return '打开内嵌网页完成登录，登录成功后自动把凭据交回插件';
+    }
+    return '';
   }
 
   /**
@@ -921,7 +1069,8 @@ struct PluginSettingsPage {
     // 通知发现页刷新图源（与 PluginManagerView 同一个信号）
     const n: number = (AppStorage.get<number>('pluginSourceEpoch') ?? 0) + 1;
     AppStorage.setOrCreate<number>('pluginSourceEpoch', n);
-    this.toast('已删除 ' + (this.displayName.length > 0 ? this.displayName : this.localFile));
+    // s14 第 3 条：兜底不再拿落盘文件名上屏（同 view/plugins/PluginManagerView.ets 的删除 toast 口径）。
+    this.toast('已删除 ' + (this.displayName.length > 0 ? this.displayName : '插件'));
     router.back();
   }
 
@@ -1104,35 +1253,39 @@ struct PluginSettingsPage {
   }
 
   /**
-   * 把设置列表里与卡片账号名重复的那几行收掉（新七条第 4 条：不再重复单开用户名一项）。
-   * 收的判据三条全中：① 键名像账号键（looksLikeUsernameKey）；② 清洗后值与卡片账号名相等
-   * （忽略大小写 —— 值清洗与 BUG-B 同源，插件的「""」与空在显示层等价，比较也必须等价）；
-   * ③ 该项**不带 fnPath**。③ 就是用户那句「除非上游提供对于云端用户名的修改」的落点：
-   *   SettingField.fnPath 非空 = 上游契约里这项写值要走插件自己的 setter（服务端动作，见数据层 :84 注释），
-   *   属于插件明给的改名的路，不收（宁可值出现两次也不替插件把功能藏了）。JmComic 的 auth.account
-   *   是纯持久化字段、无 fnPath ⇒ 正常被收，卡片成为唯一展示位，也就自然没有可改的入口 = 只读。
-   * 口径核对（别照直觉写）：isCredentialKey('auth.account') **返回 false**（:68 两档口径 —— 'auth' 弱
+   * 把设置列表里与「卡片账号」同键的可编辑项收掉（不再重复单开用户名一项）。
+   * s15 第 6 条（2026-11-13 用户拍板的口径 A）：**信息卡接管账号展示之后，凡是与登录所用键
+   * 同名 / 同键（looksLikeUsernameKey）且不带 fnPath 的可编辑项一律不再出现在卡片下方**。
+   * 与旧判据的关系：旧的那条「清洗后值与卡片账号名相等（忽略大小写）才收」是**本判据的特例**
+   * —— 值非空且与卡片同名时两版都收；新判据多收的是「值为空」那一档。现场就是这一档：插件的
+   * 账号项是纯持久化字段、登录后也不回写值，旧判据里 v.length > 0 不成立 ⇒ 永远留在卡片下方，
+   * 用户看到的就是「已经登录了，下面还挂着一行空的、可以改的用户名」（屏幕上写「未设置」）。
+   * 两条前提都在调用点（见 onBundleChanged 里 infoMode / switchable / canTakeOver 那段），本函数
+   * 不再自造第三个条件，也不再看卡片名是否非空：
+   *  ① 只有 canTakeOver = infoMode && switchable 成立时才会调到本函数。卡片没接管（未登录、
+   *    插件没自报用户信息、或用户另无登出出路）时根本不调用 ⇒ 那一行照旧可编辑，绝不会把
+   *    用户唯一的改账号入口搬掉（switchable 防锁死闸门的理由不变）。
+   *  ② **带 fnPath 的项一律不收**：那是上游契约里明给的服务端 setter（例：更新简介 = account.slogan
+   *    + fnPath updateProfile + persist:false），收了就是替插件把功能藏了。卡片账号名那侧
+   *    （accountNameFrom）同判据跳过带 fnPath 的项，两边对齐 ⇒ 既不会借了名又收不掉项，也不会收了项却没借到名。
+   * 卡片侧的空值形态（硬约束③）：userCardLine 本来就是 cardName 非空才拼「已登录 · 名字」、
+   * 否则只显「已登录」（见 onBundleChanged 末尾），所以收掉一个空值项不会在卡片上留空白行。
+   * 口径核对（别照直觉写）：isCredentialKey('auth.account') **返回 false**（两档口径 —— 'auth' 弱
    *   命中但 'account' 在 IDENTIFIER_SEGMENTS 里 ⇒ 判非凭据），所以账号项**在**可见表里、会被这里收；
    *   被 BUG3-b 提前剔掉的是 password/token/cookie 那类强凭据段，它们本来也不是用户名。
    * 整组被收空就让它整组消失：JmComic 的「账号」组只有用户名一项（密码项已被 BUG3-b 剔掉），
    *   留着判「组里至少保一项」等于在最主要的场景里不做事 —— 用户要的就是这一组不再单开。
    */
-  private dropAccountFields(groups: SettingSection[], name: string): SettingSection[] {
-    if (name.length === 0) {
-      return groups;
-    }
-    const lower: string = name.toLowerCase();
+  private dropAccountFields(groups: SettingSection[]): SettingSection[] {
     const out: SettingSection[] = [];
     for (let i = 0; i < groups.length; i++) {
       const fields: SettingField[] = groups[i].fields;
       const kept: SettingField[] = [];
       for (let j = 0; j < fields.length; j++) {
         const f: SettingField = fields[j];
+        // 唯一判据：不带 fnPath + 键名像账号键 ⇒ 收。不再看值（旧的逐字相等判据已废止，理由见上方注释）。
         if (f.fnPath.length === 0 && looksLikeUsernameKey(normalizeDisplayKey(f.key))) {
-          const v: string = this.valOf(f);
-          if (v.length > 0 && v.toLowerCase() === lower) {
-            continue;
-          }
+          continue;
         }
         kept.push(f);
       }
@@ -1484,9 +1637,11 @@ struct PluginSettingsPage {
                 this.SectionCard('能力')
                 Column() {
                   // 喂派生数组 capabilityActions（不是 bundle.actions）：与卡片登出行重复的那条已在
-                  // onBundleChanged 里隐掉；key 仍用 fnPath（动作组内 fnPath 唯一，数据层已去过空值）
+                  // onBundleChanged 里隐掉；key 仍用 fnPath（动作组内 fnPath 唯一，数据层已去过空值）。
+                  // s15 第 8 条：副文案改走 actionSub(a) —— 原先这里直接把 a.fnPath 当副文案上屏，
+                  // 用户看到的是一串内部函数名（截图里那行 startEhentaiWebLogin）。fnPath 只当 key 用。
                   ForEach(this.capabilityActions, (a: CapabilityAction) => {
-                    this.ManageRow(a.title, a.fnPath, false, (): void => {
+                    this.ManageRow(a.title, this.actionSub(a), false, (): void => {
                       this.runAction(a);
                     })
                   }, (a: CapabilityAction) => a.fnPath)
@@ -1524,12 +1679,12 @@ struct PluginSettingsPage {
               .borderRadius(Dim.radius)
               .margin({ left: Dim.pagePadding, right: Dim.pagePadding })
 
-              Text(this.localFile)
-                .fontSize(11)
-                .fontColor(Theme.text3(this.isDark))
+              // s14 第 3 条（2026-11-13 用户裁定：面向他人使用，UI 少给实现细节）：这里原本把
+              // 落盘文件名（形如 uuid前段-标签.bundle.cjs）居中打在管理卡片下方。文件名是纯实现细节，
+              // 既不给用户信息也无从核对 ⇒ 整条撤下，只留原来的底部留白。文件名仍在 hilog 里。
+              Column()
                 .width('100%')
-                .textAlign(TextAlign.Center)
-                .margin({ top: 14, bottom: 28 })
+                .height(28)
             }
             .width('100%')
           }

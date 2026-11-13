@@ -1,14 +1,15 @@
 /**
- * 职责：云收藏页（一级 Tab 2）—— 选一个插件源站，把它站端的云端收藏同步进本地书架。
+ * 职责：云收藏页体 —— 选一个插件源站，把它站端的云端收藏同步进本地书架。
  *       对应 report.txt 第 11 条（2026-11-12）：在插件内登录账号后，自动同步该源站云端收藏至本地。
  *       原先这页是 WebDAV 占位页（整页删掉重写，占位文案已无意义：上游鸿蒙端无 WebDAV 计划）。
  * 依赖：StateViews / Theme / Anim；data/cloud/CloudFavoriteSync（能力探测 + 同步）。
- *       公共顶栏由 pages/Index.ets 统一提供，本页不自绘顶栏。
+ *       s14 第 2 条起本页由 pages/CloudSyncPage.ets 承载（那是路由页，顶栏在那一层给）；
+ *       旧的「一级 Tab 2 + 顶栏由 pages/Index.ets 统一提供」口径已被取代，用户要求云收藏不再单列页签。
  * 对应 Flutter：上游把云端收藏做成场景包直接渲染；鸿蒙端按用户口径改成「同步进本地书架」，
  *       因此本页只负责选源 + 触发 + 结果反馈，列表一律看书架（避免两份收藏两张皮）。
  * 约束：
- *  - 本页是 TabContent 子组件，router.back 回来不重跑 aboutToAppear ⇒ 图源变化统一接 AppStorage
- *    的 pluginSourceEpoch（bump 端 = view/plugins/PluginManagerView）。
+ *  - 本页原本是 TabContent 子组件、现被 router 页 pages/CloudSyncPage 嵌入：两种宿主下 router.back 回来都不重跑
+ *    aboutToAppear ⇒ 图源变化统一接 AppStorage 的 pluginSourceEpoch（bump 端 = view/plugins/PluginManagerView）。
  *  - **不接 shelfRevision 的 @Watch**（本页不是书架列表，收到版本号无事可做）；反过来同步成功后
  *    由本页推 shelfRevision，让书架页静默重查（推 = 只写 AppStorage 数字，本页不订阅 ⇒ 无回环）。
  *  - 能力探测要等数据层就绪（图源是 initDataLayer 里注册的），所以进页面先等 pluginSourceEpoch，

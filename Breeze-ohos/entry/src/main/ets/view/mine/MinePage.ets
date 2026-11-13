@@ -1,5 +1,6 @@
 /**
- * 职责：我的（一级 Tab 4，即原版「更多」）—— 分组设置列表：阅读设置 / 存储 / 记录 / 插件 / 关于，行高 56vp。
+ * 职责：我的（s14 第 2 条起为一级 Tab 2，即原版「更多」）—— 分组设置列表：阅读设置 / 存储 / 记录 /
+ *   云端 / 插件 / 关于，行高 56vp。
  * 依赖：Theme；promptAction（占位项提示）。公共顶栏由 pages/Index.ets 统一提供。
  * 对应 Flutter：lib/page/…「更多」页与其设置分组（原版为 apps_outlined 页签下的功能聚合）。
  *
@@ -15,6 +16,16 @@
  *   不再依赖用户碰巧进过书架或阅读记录页才刷新。
  * 存储两行（BUG5）：占用走 ImageCache.diskUsageAsync（文案与设置页共用 CacheUsageText），
  *   清理调 ImageCache.clear；任一入口清理后推 cacheRevision，另一页靠 @StorageProp + @Watch 重算。
+ * 第 6 条（s13）：「阅读模式」从 toast 占位改成真选项（横向翻页 / 从上向下滚动），
+ *   档位存 util/UserSettings（键 reader_scroll_mode）并同步推 AppStorage 的 readerScrollMode ⇒
+ *   阅读器还在路由栈里时改档也能立刻翻档。摘要走取值函数（不写死字符串），
+ *   交互沿用 pages/SettingPage.ets:172 阅读方向那套 showActionMenu。
+ *   「图片适配」按要求 5 保持占位不动（用户：之后完善阅读器时再处理）。
+ * 第 2 条（s14）：底栏三签化后云收藏退出底栏 ⇒ 本页新增「云端」分组，一行「从云端同步」跳
+ *   pages/CloudSyncPage（router 页，包壳复用 view/cloud/CloudPage，页面本体零改动）。
+ *   放在「记录」与「插件」之间：它既不是设置项、也不是本地记录或插件管理，而是一次性的站端 → 本地
+ *   数据搬运动作，夹在「看本地数据」与「管插件」中间正好是它的语义位置；单独成组是为了不与
+ *   「阅读记录」并列成两行（同组内两行会被读成同类操作）。
  */
 
 import { promptAction, router } from '@kit.ArkUI';
@@ -27,6 +38,7 @@ import { BreezeHost } from '../../util/BreezeHost';
 import { MangaRepository } from '../../data/db/MangaRepository';
 import { ReadProgress } from '../../data/model/Models';
 import { ImageCache, DiskUsage, CacheUsageText } from '../../data/image/ImageCache';
+import { UserSettings, ReadScrollMode, SettingLabels } from '../../util/UserSettings';
 
 @Component
 export struct MinePage {
@@ -64,16 +76,26 @@ export struct MinePage {
    * 书架页与阅读记录页原有的 readHistoryCount 写点保留不动；本页只在版本号变化时自己重算。
    */
   @StorageProp('historyRevision') @Watch('onHistoryRevision') historyRevision: number = 0;
+  /**
+   * 第 6 条：阅读模式档位（唯一写口 = util/UserSettings.setScrollMode）。
+   * @StorageProp 是为了阅读器里改档时本页摘要也跟着变；本页 aboutToAppear 再按偏好纠一次初值
+   * （冷启动没进过阅读器时，AppStorage 那个键还没人灌过，本地默认值可能与库里存的档位不符）。
+   */
+  @StorageProp('readerScrollMode') scrollMode: string = ReadScrollMode.PAGER;
   /** 第 4 条：重算闸门，防连点/连推版本号时并发查库（与 cacheBusy 同型）。 */
   private historyBusy: boolean = false;
 
   aboutToAppear(): void {
-    // T1：登记本页滚动容器（页索引 3 = 更多），底栏上滑下沉由 TabAutoHide 统一绑定
+    // T1：登记本页滚动容器（走常量不写字面量：s14 第 2 条起 IDX_MINE 由 3 改成 2），底栏上滑下沉由 TabAutoHide 统一绑定
     TabAutoHide.attach(TabAutoHide.IDX_MINE, this.mineScroller);
     this.measureCache();
     // 第 4 条：冷启动首次进本 Tab 也要取一次条数（TabContent 子组件之后不会再跑 aboutToAppear，
     //      之后就全靠 historyRevision 变化驱动）
     this.recountHistory();
+    // 第 6 条：按偏好纠档位初值，并把值灌进 AppStorage（ReaderView 可能还没建，谁先到谁灌）
+    const sm: string = UserSettings.readScrollMode();
+    UserSettings.pushScrollMode(sm);
+    this.scrollMode = sm;
     BreezeHost.appVersion().then((v: string): void => {
       this.versionText = v;
     }).catch((): void => {
@@ -191,6 +213,37 @@ export struct MinePage {
     return CacheUsageText.of(this.cachePhase, this.cacheBytes, this.cacheFiles);
   }
 
+  /** 第 6 条：阅读模式行摘要（取值函数，不写死；标签与 UserSettings.SettingLabels 同源防漂移）。 */
+  private scrollModeText(): string {
+    return this.scrollMode === ReadScrollMode.WEBTOON
+      ? SettingLabels.READ_SCROLL_MODE[1] : SettingLabels.READ_SCROLL_MODE[0];
+  }
+
+  /**
+   * 第 6 条：选阅读模式。交互与文案形态照抄 pages/SettingPage.ets:172 的「阅读方向」（同一套
+   * showActionMenu 两档），不自己发明第三种控件。setScrollMode 第一步同步推 AppStorage ⇒
+   * 本行摘要与阅读器同时跟手，第二步异步落库（失败只 toast，不回滚界面：档位是纯展示偏好）。
+   */
+  private pickScrollMode(): void {
+    promptAction.showActionMenu({
+      title: '阅读模式',
+      buttons: [
+        { text: '横向翻页（默认）', color: Theme.brand },
+        { text: '从上向下滚动（条漫）', color: Theme.brand }
+      ]
+    }).then((res: promptAction.ActionMenuSuccessResponse): void => {
+      const v: string = res.index === 1 ? ReadScrollMode.WEBTOON : ReadScrollMode.PAGER;
+      UserSettings.setScrollMode(v).catch((e: Object): void => {
+        this.toast('保存失败：' + String(e));
+      });
+      // @StorageProp 是单向下发，本地再置一次，避免摘要晚一帧才跟上
+      this.scrollMode = v;
+      this.toast(v === ReadScrollMode.WEBTOON ? '已改为从上向下滚动' : '已改为横向翻页');
+    }).catch((e: Error): void => {
+      Logger.i('阅读模式选择取消：' + e.message);
+    });
+  }
+
   @Builder
   GroupCard(title: string, items: MineMenuItem[]) {
     Column() {
@@ -250,10 +303,12 @@ export struct MinePage {
       Scroll(this.mineScroller) {
         Column() {
           this.GroupCard('阅读设置', [
+            // 第 6 条：真选项（原来写死「横向翻页」+ toast 占位）。摘要必须走取值函数：
+            // @Builder 形参按值传递，把状态值当字符串喂进去就会永远定格在首帧（本仓踩过三次）
             new MineMenuItem('阅读模式', (): string => {
-              return '横向翻页';
+              return this.scrollModeText();
             }, () => {
-              this.toast('纵横切换将在阅读器内设置');
+              this.pickScrollMode();
             }),
             new MineMenuItem('图片适配', (): string => {
               return '适应宽度';
@@ -281,6 +336,16 @@ export struct MinePage {
               return this.countText(this.readCount);
             }, () => {
               router.pushUrl({ url: 'pages/HistoryPage' });
+            })
+          ])
+
+          // s14 第 2 条：云收藏从底栏撤下后在这一行进（label 逐字 = 从云端同步）。
+          // 摘要给空串：本页不探测云收藏能力，任何摘要文案都会变成「第二份状态」需要自己维护。
+          this.GroupCard('云端', [
+            new MineMenuItem('从云端同步', (): string => {
+              return '';
+            }, (): void => {
+              router.pushUrl({ url: 'pages/CloudSyncPage' });
             })
           ])
 

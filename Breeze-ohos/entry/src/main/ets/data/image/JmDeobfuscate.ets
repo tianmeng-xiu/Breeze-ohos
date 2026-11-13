@@ -189,6 +189,25 @@ export function keepRearranged(totalBefore: number, totalAfter: number): boolean
 }
 
 /**
+ * 像素缓冲是否全零（等距抽样 4096 个字节）。**只做「绝不能把全零写回 PixelMap」这一件事**：
+ * 全零写回 = 整页涂黑，而一张真黑页与一次失败的读像素在屏上无法区分，只能靠这条日志分辨。
+ * 抽样而非全扫：判定对象是「整幅都没读进来」，任何一段非零就足以否证。
+ */
+function allZero(v: Uint8Array): boolean {
+  const n: number = v.length;
+  if (n === 0) {
+    return true;
+  }
+  const step: number = Math.max(1, Math.floor(n / 4096));
+  for (let i = 0; i < n; i += step) {
+    if (v[i] !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * 就地反混淆。intent：
  *   'force'  无条件重排（uuid 白名单 / isJm=true / 用户手动强开）
  *   'detect' 由内容自证决定，不通过就不动
@@ -231,6 +250,15 @@ export async function deobfuscatePixelMap(
     const src: ArrayBuffer = new ArrayBuffer(totalBytes);
     await pm.readPixelsToBuffer(src);
     const sv: Uint8Array = new Uint8Array(src);
+    // s14 第 5 条闸门：readPixelsToBuffer 递进未填充的缓冲时不会抛错（异步返回 undefined），
+    // 而 force 档是**无条件写回**的 —— 一旦读出来是全零，写回就等于把这一页涂成全黑。真机回传那张
+    // 「两图之间一大片纯黑」的截图，黑区宽高比 = 1252/1858 = 0.674（正常竖页比例），行高确实按真实
+    // 图比算出来了 ⇒ 黑不是布局间隙，是**一张纯黑图**。detect 档天然安全（全零 ⇒ totalRowDiff=0 ⇒
+    // keepRearranged 直接否），只有 force 档会把全零写回去，所以这里两档一律先自证再动手。
+    if (allZero(sv)) {
+      Logger.w('反混淆跳过：像素读回全零（不写回，避免造出纯黑页）');
+      return '';
+    }
 
     let before: number = 0;
     if (intent === 'detect') {

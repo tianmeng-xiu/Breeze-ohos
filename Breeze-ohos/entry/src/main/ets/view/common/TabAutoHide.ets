@@ -4,6 +4,7 @@
  *      底栏组件把控制器交进来。三方在这里汇合，收起/展开只由本类统一决策。
  * 依赖：ArkUI 的 Scroller / TabsController + @kit.UIDesignKit 的 HdsTabsController / HdsAnimationMode。
  * 调用方：view/common/BreezeBottomTab.ets（bindController）+ 三个可滚动一级页（attach / onScroll）。
+ *      s14 第 2 条起「三个可滚动一级页」= 书架 / 发现 / 更多（云收藏退出底栏，见下条页索引真相）。
  *
  * ===== s5i 重写原因（真机 s5h 反馈「底栏下沉无反应」的根因）=====
  * s5h 只调了 bindScroller / bindTabsToScrollable 然后**什么都不做**，押注「框架会自己收起」。
@@ -26,8 +27,11 @@
  *  平铺档：不收起（贴边栏收起会露出导航条区域空白，视觉更差）⇒ unbindAll() 置 off。
  *
  * ===== 页索引只能有一处真相 =====
- *  IDX_* 必须与 BreezeBottomTab.TabMeta.titles 顺序一致（0 书架 / 1 发现 / 2 云收藏 / 3 更多）。
- *  云收藏 s10 第 11 条起有纵向 Scroll 容器 ⇒ 已登记 IDX_CLOUD=2。
+ *  IDX_* 必须与 BreezeBottomTab.TabMeta.titles 顺序一致：s14 第 2 条起三签 = 0 书架 / 1 发现 / 2 更多。
+ *  旧口径（0 书架 / 1 发现 / 2 云收藏 / 3 更多）自那一条作废：云收藏整条撤出底栏，改由 router 页
+ *  pages/CloudSyncPage 承载（入口在更多页的「从云端同步」行），因此它**不再有底栏可收起**。
+ *  IDX_CLOUD 不删的理由 = view/cloud/CloudPage.ets:396 / :757 两处引用它，而那份文件本轮一个字不许改；
+ *  取值改成 -1 让它在语义上退出判向（详见常量上的注释），既保住编译也保住「嵌入态不动底栏」。
  */
 
 import { HdsTabsController, HdsAnimationMode } from '@kit.UIDesignKit';
@@ -36,9 +40,19 @@ export class TabAutoHide {
   /** 与 TabMeta.titles 对齐的页索引常量（改动底栏顺序时必须同步这里） */
   static readonly IDX_SHELF: number = 0;
   static readonly IDX_DISCOVER: number = 1;
-  /** s10 第 11 条：云收藏页重设计后有纵向 Scroll 容器，纳入收起联动（原来是占位页无滚动容器） */
-  static readonly IDX_CLOUD: number = 2;
-  static readonly IDX_MINE: number = 3;
+  /**
+   * s14 第 2 条起云收藏不再占底栏页签，此常量仅由 pages/CloudSyncPage 的嵌入页体沿用
+   * （view/cloud/CloudPage.ets:396 / :757 两处引用，该文件本轮禁改 ⇒ 常量必须留着）。
+   * 取值给 -1 = 不参与底栏收起判向：onScroll 的闸门是 index !== current 就直接只记偏移，
+   * 而 current 恒 >= 0 ⇒ 嵌入态（router 页盖住底栏）里滚页体绝不会去动底栏的收起态；
+   * 若给 2 就会与 IDX_MINE 撞号：pairOf(2) 只回第一条，onTabChanged(2) 可能拿错 scroller 复位偏移 ⇒ 判方向抖一下。
+   * 负值由 attach() 直接不登记（见那里的闸门），所以它既不进 pairs、也不会被 HdsTabsController.bindScroller
+   * 当成 TabBar 下标吃进去（声明原话 @param value = The index of the TabBar，:5809 / :5817，越界无 @throws 声明 = 行为未定义）。
+   * onScroll 那侧天然安全：闸门 index !== current 直接 return，而 current 只由 onTabChanged(Tabs 回调) 写，恒 >= 0。
+   */
+  static readonly IDX_CLOUD: number = -1;
+  /** s14 第 2 条：更多页从 3 上移到 2（底栏只剩三签） */
+  static readonly IDX_MINE: number = 2;
 
   /** 诊断键：写 'hds:shown' / 'hds:hidden' / 'native:…' / 'off' / 'pending'，供诊断面板 surface 行取证 */
   static readonly KEY: string = 'matAutoHide';
@@ -69,8 +83,15 @@ export class TabAutoHide {
   /** 动画保护窗计时器句柄，-1 = 无 */
   private static guardTimer: number = -1;
 
-  /** 页面侧调用：登记自己的滚动容器（aboutToAppear 里调一次即可） */
+  /**
+   * 页面侧调用：登记自己的滚动容器（aboutToAppear 里调一次即可）。
+   * **负下标 = 显式退出底栏联动**（唯一使用者 = TabAutoHide.IDX_CLOUD，s14 第 2 条起云收藏不占页签），
+   * 这里直接不登记：既省掉一次注定无效的 bindScroller，也让 attachedCount() 与实际页签数对齐。
+   */
   static attach(index: number, scroller: Scroller): void {
+    if (index < 0) {
+      return;
+    }
     for (let i = 0; i < TabAutoHide.pairs.length; i++) {
       if (TabAutoHide.pairs[i].scroller === scroller) {
         return;

@@ -109,6 +109,15 @@ function errBrief(err: Object): string {
   return msg;
 }
 
+/** 取 URL 的 host（解析不出来就给短前缀，只为诊断可读，绝不抛）。 */
+function hostOf(url: string): string {
+  const i: number = url.indexOf('//');
+  const rest: string = i >= 0 ? url.slice(i + 2) : url;
+  const j: number = rest.indexOf('/');
+  const h: string = j >= 0 ? rest.slice(0, j) : rest;
+  return h.length > 60 ? h.slice(0, 60) : h;
+}
+
 /** 错误码（取不到返回 0）：UI 只放数字码，完整错因留在日志里（系统 message 可能带路径）。 */
 function errCode(err: Object): number {
   const be = err as BusinessError;
@@ -354,12 +363,27 @@ export class ImageCache {
     if (url === null || url === undefined || url.length === 0) {
       throw new Error('图片地址为空');
     }
+    // s15 第 1 条可诊断化（入口总闸）：pageCalls = 真正进入取页流程的次数（URL 非空才算）。
+    // 出口侧五档互斥计数与之对账，恒等式写在 imageHint 上方。
+    ImageCache.pageCalls++;
     if (!this.ready) {
+      ImageCache.pageFailed++;
       throw new Error('图片缓存尚未初始化，请先调用 ImageCache.init(context)');
     }
 
     const ch = BytesChannels.get();
     const isPlugin: boolean = sourceId.length > 0 && sourceId.startsWith(PLUGIN_SOURCE_PREFIX);
+    if (!isPlugin) {
+      // s15 第 1 条：只记**形态**不记原值。空串是 load()（封面、头像、详情页缩略图那条路）独有的
+      // 特征，是「诊断里那一串宿主取图其实一次翻页都不是」这条解释的唯一判据；长度截到 24 ——
+      // 非插件支路的 sourceId 可能被传成完整 URL，而 URL 路径里带作品号 = 用户浏览痕迹。
+      ImageCache.lastNonPluginSource = sourceId.length === 0 ? '<empty>'
+        : (sourceId.length > 24 ? sourceId.slice(0, 24) : sourceId);
+    } else if (ch === null) {
+      // 是插件图源但那一刻通道还没接线：npSrc 与 pil 两个字段都不会赋值，现场会呈现
+      // 「pc 在涨而 npSrc/pil 都不动」这种三无形态，单独计一枚才把它跟别的形态分开。
+      ImageCache.pagePluginNoChannel++;
+    }
     let intent: string = '';
     if (isPlugin && ch !== null) {
       try {
@@ -367,11 +391,16 @@ export class ImageCache {
       } catch (err) {
         intent = '';
       }
+      // 意图串可能带插件自定义参数形态，刻意不上屏，只记长度：0 = 插件明说这张不用反混淆；
+      // 「长度大于 0 而 deobf 两档都不涨」才是真问题（s14 回传 deobf=0/0 正卡在这两者之间）。
+      ImageCache.lastPageIntentLen = intent.length;
     }
     const key: string = isPlugin ? (url + '|p|' + intent) : url;
 
     const hit: image.PixelMap | null = this.memGet(key, isPlugin);
     if (hit !== null) {
+      // 内存命中既不是插件、宿主，也不是磁盘：单列一档才能把出口恒等式闭合。
+      ImageCache.pageFromMem++;
       return hit;
     }
 
@@ -379,22 +408,49 @@ export class ImageCache {
     const path: string = this.cacheRoot + '/' + name + DISK_EXT;
 
     let buf: ArrayBuffer | null = this.readFile(path);
+    // fromNet 只区分「磁盘 vs 网络」，插件取回的字节同样算非网络，所以「字节最终来自哪条通道」
+    // 必须另钉一枚旗子，否则 pf 与 df 永远分不开。
+    let fromPlugin: boolean = false;
+    if (buf !== null) {
+      // 磁盘命中既不进插件档也不进宿主档 ⇒ 诊断行会显示 plugin=0/0 host=0/0，跟「根本没翻过页」
+      // 一模一样（真机第一次回传就是这样，白跑一趟）。这里单独计一次，两者才分得开。
+      ImageCache.pageCacheHits++;
+    }
     if (buf === null && isPlugin && ch !== null) {
       // 插件通道优先（这是「部分源画面不正常」的第一半根因：宿主 HTTP 没有插件的 Referer）
+      ImageCache.pluginImageTries++;
+      ImageCache.lastImageSource = sourceId;
+      ImageCache.lastImageHost = hostOf(url);
       try {
         const got: ArrayBuffer | null = await ch.fetch(sourceId, url);
         if (got !== null) {
           buf = got;
+          fromPlugin = true;
+          ImageCache.pluginImageHits++;
+        } else {
+        // 通道在但适配器没装载：不是异常，却等价于「这一张只能走宿主」，必须留痕
+        // s15 补计数：旧版这里只写 lastPluginImageErr，而宿主兜底一旦成功就再没痕迹；
+        // cn 与 hf 同步上涨即坐实「适配器没装载、全靠宿主硬取」这条路径。
+          ImageCache.channelNull++;
+          ImageCache.lastPluginImageErr = 'channel returned null';
         }
       } catch (err) {
+        ImageCache.pluginImageFails++;
+        ImageCache.lastPluginImageErr = errBrief(err as Object);
         Logger.w('插件取图失败，回落宿主 HTTP：' + ((err as Error).message ?? String(err)));
       }
     }
     let fromNet: boolean = buf === null;
     if (buf === null) {
+      ImageCache.hostImageTries++;
+      ImageCache.lastImageHost = hostOf(url);
       try {
         buf = await HttpClient.getInstance().getBytes(url);
       } catch (err) {
+        ImageCache.hostImageFails++;
+        // 这一条 catch 必抛 ⇒ 直接记一次失败出口（对账恒等式见字段块注释）
+        ImageCache.pageFailed++;
+        ImageCache.lastHostImageErr = errBrief(err as Object);
         throw this.wrap(err, '图片下载失败');
       }
     }
@@ -403,11 +459,13 @@ export class ImageCache {
     try {
       pm = await this.decode(buf, intent.length > 0);
     } catch (err) {
+      ImageCache.pageFailed++;
       // 磁盘文件可能已损坏：删掉，下次重新下载
       this.deleteFile(path);
       throw this.wrap(err, fromNet ? '图片解码失败' : '本地缓存图片已损坏，请重试');
     }
     if (pm === null) {
+      ImageCache.pageFailed++;
       throw new Error('图片解码失败：结果为空');
     }
 
@@ -422,8 +480,56 @@ export class ImageCache {
       }
     }
 
-    if (fromNet) {
+    // s14 第 5 条可诊断化：真机回传「上下滑动时两图之间一大片纯黑」有两种成因，屏上看不出区别 ——
+    //   ① 布局间隙（行高比图高，多出来的容器露出黑底）② 取回来/解码出来本来就是一张黑图。
+    // 量过那张截图：黑区自身宽高比 = 1252/1858 = 0.674，是正常竖页比例，说明行高按真实图比算过
+    // ⇒ 更像 ②。但没有现场计数不能定案，所以这里对**已上屏的 PixelMap** 抽中心小块自己量一遍。
+    // 刻意用 readPixelsToArea（@since 12）只取中心 16x16：整幅 readPixelsToBuffer 每张页图要多拷几 MB，
+    // 为一个诊断指标不值当。
+    const blk: number = await ImageCache.probeBlack(pm);
+    ImageCache.probed++;
+    // s15 补：-1（取样失败）此前也混进 probed 分母 ⇒ blk=0/14 分不清「14 张全有内容」
+    // 和「14 张全部取样失败」这两种相反结论。单列 u 档（imageHint 的 blk=a/b/u）。
+    if (blk === -1) {
+      ImageCache.probeUnknown++;
+    }
+    let blackPage: boolean = false;
+    if (blk === 1) {
+      ImageCache.blackPages++;
+      blackPage = true;
+      const bi: image.ImageInfo = pm.getImageInfoSync();
+      ImageCache.lastBlack = bi.size.width + 'x' + bi.size.height;
+      ImageCache.lastBlackHost = hostOf(url);
+      ImageCache.lastBlackBytes = buf.byteLength;
+      Logger.w('页图像素近乎全黑：' + bi.size.width + 'x' + bi.size.height
+        + ' bytes=' + buf.byteLength + ' host=' + hostOf(url));
+    }
+    // 纯黑页一律不落盘（连原始字节一起跳）：磁盘存的虽然是人家的原字节，但一张「解码成功、
+    // 尺寸正常、像素全黑」的页最像**站方防盗链回的黑图占位**。写盘 = 把这张占位永久钉住，
+    // 之后每次进来都命中缓存、插件通道再也不会被叫起来第二遍 ⇒ 用户看到的是「永远黑」。
+    //
+    // 现场依据（1252x1900 那张截图逐行 luma 量算）：黑区上下两条邻居页图**渲染正常**，
+    // 只有中间这一张是纯黑 ⇒ 同一插件、同一解码档位下邻居能出画 ⇒ 不是渲染档位问题，
+    // 是这一张的位图本身就是黑的（站方按页返回的占位）。所以修法在「别把它钉住」这一侧。
+    if (fromNet && !blackPage) {
       this.writeFile(path, buf);
+    }
+    // s12/s13 的旧包把黑页写进过磁盘 ⇒ 升到本版后那些文件仍会命中并画黑。这里反向自愈一次：
+    // 黑页 + 本次是磁盘命中 ⇒ 删掉这个缓存文件（本次仍显示黑，下一次进来就重新走取图）。
+    // 刻意不当场重取：重取要在同一次调用里把「取图 → 解码 → 再判黑」整条链跑第二遍，
+    // 换来的是「第一次看到黑也白等一轮」，不值当；删文件已足够让下一次恢复。
+    if (blackPage && !fromNet) {
+      this.deleteFile(path);
+      Logger.w('黑页缓存已删除，下次重取：' + hostOf(url));
+    }
+    // s15 第 1 条：出口侧唯一权威 —— 这张最终上屏的图，字节到底来自哪条通道。
+    // 只在成功返回处累加，失败那次只涨 pageCalls/pageFailed，不污染三档分布。
+    if (fromPlugin) {
+      ImageCache.pageFromPlugin++;
+    } else if (fromNet) {
+      ImageCache.pageFromHost++;
+    } else {
+      ImageCache.pageFromDisk++;
     }
     this.memPut(key, pm, isPlugin);
     return pm;
@@ -433,6 +539,300 @@ export class ImageCache {
   static deobfHits: number = 0;
   static deobfSkips: number = 0;
   static lastDeobf: string = '';
+
+  // ---- 取图链取证（s13 第 5 条：真机回传「某图源任何情况下都显示拿不到图」）----
+  /**
+   * 为什么单独记这四组数：loadPage 的插件通道 catch 之后会**静默回落宿主 HTTP**（只写 Logger.w，
+   * 页面上看不见），而宿主 HttpClient 不带插件的鉴权/风控头 ⇒ 对需要风控头的源必然拿回错误页，
+   * 最终上屏只剩一句「图片加载失败」。没有这几枚计数，一张截图区分不了下面三种情况：
+   *   A 插件取图整条没跑（tries=0 ⇒ 通道未接线 / 不是插件图源 / 命中磁盘缓存）
+   *   B 插件取图抛错、宿主兜底也失败（fails>0 且 host 也失败 ⇒ 真取不到）
+   *   C 插件取图抛错、宿主兜底回了字节（fails>0 且 host 成功 ⇒ 十有八九是错误页，
+   *     此时用户看到的是「解码失败」或画面花屏，不是「下载失败」）
+   * 三种情况的修法完全不同，所以宁可多写六枚静态计数，也不在没证据时猜修。
+   */
+  static pluginImageTries: number = 0;
+  static pluginImageHits: number = 0;
+  static pluginImageFails: number = 0;
+  static hostImageTries: number = 0;
+  static hostImageFails: number = 0;
+  /** 最后一次「插件取图」错因（含通道返回 null）。刻意截断由诊断行统一做。 */
+  static lastPluginImageErr: string = '';
+  /** 最后一次宿主 HTTP 兜底错因（判「回落有没有救回来」）。 */
+  static lastHostImageErr: string = '';
+  /** 最后一次走插件通道的图源 id（形如 plugin:uuid，多图并存时用来对上号）。 */
+  static lastImageSource: string = '';
+  /**
+   * 最后一次取图的**主机名**（刻意只到 host：像 s3 / img / storage-b 这类 CDN 域名是判
+   * 「可达性问题」还是「风控问题」的关键；完整 URL 的路径里带作品号 = 用户浏览痕迹，不进诊断）。
+   */
+  static lastImageHost: string = '';
+
+  /** 纯黑页探针：检出的纯黑页张数 / 总探测张数 / 最后一张的像素尺寸（s14 第 5 条）。 */
+  static blackPages: number = 0;
+  static probed: number = 0;
+  /** 纯黑页最后一次：主机名与原始字节数（字节数是「黑图占位」与「真黑页」的主要分辨依据）。 */
+  static lastBlackHost: string = '';
+  static lastBlackBytes: number = 0;
+  /** 页图**磁盘缓存**命中次数（与 plugin/host 两个计数互不重叠，三者相加 = 取页总次数）。 */
+  static pageCacheHits: number = 0;
+  static lastBlack: string = '';
+
+  // ---- s15 第 1 条：取图链「字节最终从哪条通道来」的可诊断化（纯取证，不改任何行为）----
+  /**
+   * 为什么要有这一组（s14 真机回传 imageChain: plugin=0/0 host=12/12 src=- deobf=0/0）：
+   * 旧的 plugin=/host= 是两个**互相重叠、且会被静默回落污染**的二维计数 —— tries 只在
+   * 「未命中磁盘 && isPlugin && 通道在」那一条分支里自增，宿主支路又无条件自增，
+   * 所以 plugin=0/0 这一项单独看什么也证明不了：可能是根本没进插件支路，也可能是
+   * 十二次全部命中磁盘之外还有别的调用方（封面/头像那条 load() 传的是空 sourceId）。
+   * 这组计数换成**互斥出口**口径：一次 loadPage 只可能落在下面六个出口里的一个，
+   * 于是有一条例程可自查的恒等式（不必再靠现场猜）：
+   *
+   *   pageFromPlugin + pageFromHost + pageFromDisk + pageFromMem + pageFailed == pageCalls
+   *
+   * （派工书原话是「pf+hf+df == pageCalls」，那条只在这一次既没命中内存、又没失败时成立；
+   *   内存命中与失败出口各占一档才能把它写成无条件恒等式。对不上账 = 有第七条出口，
+   *   说明我对 loadPage 的控制流理解有误，这本身就是最有价值的信号。）
+   *
+   * 读法上的一条硬口径（lead 11-13 17:31 现场更新 + 本机按代码修正其表述）：
+   *   用户补述「点进 pic 源漫画直接显示无法加载 + 重试按钮、连下一页都切不了」⇒ 真实形态是
+   *   整章没起来（ReaderView 章级错误分支、urls 空数组），**阅读器一次都没取页**。所以上一轮
+   *   那个 plugin=0/0 的自然解释是「阅读器根本没翻页」，而不是「sourceId 不带 plugin: 前缀」。
+   *   但这条现场不能读成「pc=0 而 host>0」：load()（封面/头像/详情页缩略图）本身就是 loadPage
+   *   的一层包装（见上方 load），而 hostImageTries 的自增点在 pageCalls 之后 ⇒ 恒有
+   *   pc >= host 那档的张数，pc=0 只可能出现在「连封面都没取过」，那时 host 必然也是 0。
+   *   「阅读器没翻页」在诊断行里的**正确读法**是：pc>0、pf=0、hf 或 df == pc、npSrc=<empty>
+   *   —— 即这些取图全部来自非插件的封面类调用，与阅读器翻页无关；这是合法组合、不是异常形态。
+   *   这组计数本轮的判据因此收窄成一条：用 npSrc 分清 host 那十几张的来源。
+   *
+   * pageCacheHits 保留不动（设置页与旧诊断行都读它）：磁盘命中除了 pageFromDisk 之外
+   * 仍照旧 ++，两个字段是同一件事的新旧两种写法，旧字段不得失效。
+   */
+  /** 进入 loadPage 且 url 非空的总次数（对账用的分母） */
+  static pageCalls: number = 0;
+  /**
+   * 出口 1/2/3：成功返回，字节来自插件通道 / 宿主 HTTP / 磁盘缓存。
+   *
+   * 三处既有行为决定这三档怎么读（本轮按派工书 D 段「只做诊断化、不改行为」原样保留，只写口径；
+   * 下面每一条都是离线桩在真代码上跑出来的，不是读代码猜的）：
+   *   ① 落盘条件是 if (fromNet && !blackPage)，而 fromNet 的定义是「进宿主支路前 buf 仍为空」
+   *      ⇒ **插件通道亲自取回的那一张从不写盘**，同一张每次翻到都要重新问插件（内存只有 24 张）。
+   *   ② 但插件图源仍可能磁盘命中：同一次调用里插件失败、回落宿主成功时，宿主字节是按**插件键**
+   *      （url + |p| + 意图后缀）落盘的，此后同键的插件调用就落在 df 这一档。
+   *   ③ 所以 df>0 不可反推「这张不是插件页」；反过来 pf>0 那张必定没落盘。
+   *      hit（旧字段）同理：既可能是 load() 的裸 url 键，也可能是 ② 那种插件键，本轮这几个字段
+   *      分不开二者 —— 想分开只能看 npSrc（本轮出现过非插件调用）与 cn/pnc（出现过宿主回落）的组合。
+   */
+  static pageFromPlugin: number = 0;
+  static pageFromHost: number = 0;
+  static pageFromDisk: number = 0;
+  /** 出口 4：内存命中，压根没走到磁盘与网络 */
+  static pageFromMem: number = 0;
+  /** 出口 5：这次没拿到图（缓存未就绪、下载失败、解码失败、解码返回空） */
+  static pageFailed: number = 0;
+  /**
+   * 是插件图源、但 BytesChannels 还没接线（install 晚于第一次取页）的次数。
+   * 这一档刻意不进上面六个出口之外的第七档，只是把「为什么会走宿主」的原因写清楚：
+   * 它表现为 npSrc 与 pil 都不赋值、pf=0 而 hf 在涨 —— 三个字段联立才能和
+   * 「适配器没装载（cn）」与「sourceId 根本不是插件源（npSrc 非空）」区分开。
+   */
+  static pagePluginNoChannel: number = 0;
+  /** 插件通道在、但 ch.fetch 返回 null 的次数（s15 补：旧版只写错误串、没有计数） */
+  static channelNull: number = 0;
+  /**
+   * 最后一次**非插件**取页的 sourceId 形态：空串记 <empty>，超过 24 字符截断。
+   * 只在 !isPlugin 那一支赋值 ⇒ 插件取页不会覆盖它，一次会话里混过多少调用都留得下最后一次。
+   * 判据强度（桩实测，别夸大）：它证明的是「**这一轮里出现过**非插件取页」，
+   * 因为只记最后一次，不能把某一张具体的 host/disk 取图归因到它。
+   * npSrc=<empty> ⇒ 出现过 load()（封面、头像、详情页缩略图那条路，sourceId 传空串）。
+   */
+  static lastNonPluginSource: string = '';
+  /**
+   * 最后一次 ch.deobfIntent 返回串的**长度**（刻意不记串本身：意图串里可能带
+   * 插件自定义参数，属用户数据）。0 = 插件说这张不用反混淆。
+   */
+  static lastPageIntentLen: number = 0;
+  /**
+   * probeBlack 返回 -1（取样失败）的次数。
+   * 必须有：probed 对 -1 也累加，所以 blk=0/14 同时兼容「14 张全都有内容」与
+   * 「14 张全部取样失败」两种相反结论。**u == b 时 blk 这条判据整体作废，
+   * 不得据 blk=0 排除黑图。**
+   */
+  static probeUnknown: number = 0;
+  /** 最后一次取样失败的原因（small WxH 或 readPixelsToArea 抛出的 code+message） */
+  static lastProbeErr: string = '';
+  /** 中心区取样边长（像素）：16x16 足够判「整幅是不是黑的」。 */
+  private static readonly BLACK_SAMPLE: number = 16;
+
+  /**
+   * 抽中心 16x16 判「这张图是不是近乎纯黑」：返回 1 = 纯黑、0 = 有内容、-1 = 取不到样本
+   * （图太小 / 区域 API 不可用 / 已释放），-1 不计入纯黑页计数。
+   * 阈值 8 而不是 0：真黑页解码成 RGBA 后常见 0~2 的底噪，而漫画页中心区必然有笔画或上色。
+   */
+  private static async probeBlack(pm: image.PixelMap): Promise<number> {
+    try {
+      const info: image.ImageInfo = pm.getImageInfoSync();
+      const side: number = ImageCache.BLACK_SAMPLE;
+      if (info.size.width < side || info.size.height < side) {
+        ImageCache.lastProbeErr = 'small ' + info.size.width + 'x' + info.size.height;
+        return -1;
+      }
+      const stride: number = side * 4;
+      const area: image.PositionArea = {
+        pixels: new ArrayBuffer(stride * side),
+        offset: 0,
+        stride: stride,
+        region: {
+          size: { width: side, height: side },
+          x: Math.floor(info.size.width / 2) - Math.floor(side / 2),
+          y: Math.floor(info.size.height / 2) - Math.floor(side / 2)
+        }
+      };
+      await pm.readPixelsToArea(area);
+      const v: Uint8Array = new Uint8Array(area.pixels);
+      let m: number = 0;
+      for (let i = 0; i < v.length; i += 4) {
+        // 区域 API 固定按 BGRA_8888 交付（SDK :2794「Only pixel data in BGRA_8888 format is supported」），
+        // 与 PixelMap 自身的 RGBA 顺序不同；判黑只看三通道最大值，通道顺序不影响结论。
+        for (let c = 0; c < 3; c++) {
+          if (v[i + c] > m) {
+            m = v[i + c];
+          }
+        }
+      }
+      return m <= 8 ? 1 : 0;
+    } catch (err) {
+      // s15 补：旧版把错因整个吞掉，blk 的 -1 到底是「图太小」还是 readPixelsToArea 在
+      // 解码产出的 PixelMap 上不可用，现场完全分不开（s14 blk=0/14 有两种相反解释）。
+      // 沿用 errBrief 口径，只截一次。
+      ImageCache.lastProbeErr = errBrief(err as Object);
+      return -1;
+    }
+  }
+
+  /**
+   * 诊断行文案（一条看完整取图链）：插件档成功/尝试、宿主兜底成功/尝试、两侧最后一次错因、
+   * 通道是否已接线、最后一次是哪个图源。未取过图时全 0，属正常。
+   */
+  static imageHint(): string {
+    const hostOk: number = ImageCache.hostImageTries - ImageCache.hostImageFails;
+    return 'plugin=' + ImageCache.pluginImageHits + '/' + ImageCache.pluginImageTries
+      + ' host=' + hostOk + '/' + ImageCache.hostImageTries
+      + ' ch=' + (BytesChannels.get() !== null ? 'on' : 'off')
+      + ' src=' + (ImageCache.lastImageSource.length > 0 ? ImageCache.lastImageSource : '-')
+      + ' host=' + (ImageCache.lastImageHost.length > 0 ? ImageCache.lastImageHost : '-')
+      + ' pErr=' + (ImageCache.lastPluginImageErr.length > 0 ? ImageCache.lastPluginImageErr : '-')
+      + ' hErr=' + (ImageCache.lastHostImageErr.length > 0 ? ImageCache.lastHostImageErr : '-')
+      + ' deobf=' + ImageCache.deobfHits + '/' + ImageCache.deobfSkips
+      // blk 三位口径：a = 判成纯黑的张数，b = 探测总张数，u = 其中取样失败（-1）的张数。
+      // u == b 时整条判据作废（详见 probeUnknown 的字段注释），不得据 a=0 排除黑图。
+      + ' blk=' + ImageCache.blackPages + '/' + ImageCache.probed + '/' + ImageCache.probeUnknown
+      + (ImageCache.lastBlack.length > 0 ? ' last=' + ImageCache.lastBlack : '')
+      + (ImageCache.lastBlackHost.length > 0 ? ' blkHost=' + ImageCache.lastBlackHost : '')
+      + (ImageCache.lastBlackBytes > 0 ? ' blkBytes=' + ImageCache.lastBlackBytes : '')
+      + ' hit=' + ImageCache.pageCacheHits
+      // ↓ 以下全部是 s15 追加，一律排在既有字段之后（旧诊断行的读法不受影响）
+      + (ImageCache.lastNonPluginSource.length > 0 ? ' npSrc=' + ImageCache.lastNonPluginSource : '')
+      + ' pf=' + ImageCache.pageFromPlugin
+      + ' hf=' + ImageCache.pageFromHost
+      + ' df=' + ImageCache.pageFromDisk
+      + ' mf=' + ImageCache.pageFromMem
+      + (ImageCache.pagePluginNoChannel > 0 ? ' pnc=' + ImageCache.pagePluginNoChannel : '')
+      + ' pc=' + ImageCache.pageCalls
+      + ' pfail=' + ImageCache.pageFailed
+      + (ImageCache.channelNull > 0 ? ' cn=' + ImageCache.channelNull : '')
+      + (ImageCache.lastPageIntentLen > 0 ? ' pil=' + ImageCache.lastPageIntentLen : '')
+      + (ImageCache.lastProbeErr.length > 0 ? ' pkb=' + ImageCache.lastProbeErr : '')
+      // s16 第 2 条：sz= 命中/读到字节/调用 三档（只在 16 号行内读，别和 17 号行的 hit= 混义）
+      + ' sz=' + ImageCache.sizeProbeHits + '/' + ImageCache.sizeProbeDisk + '/' + ImageCache.sizeProbeCalls;
+  }
+
+  /** 恒等式自查（离线桩与诊断面板都可用）：五档互斥出口相加必须等于调用总数。 */
+  static imageChainBalanced(): boolean {
+    return ImageCache.pageFromPlugin + ImageCache.pageFromHost + ImageCache.pageFromDisk
+      + ImageCache.pageFromMem + ImageCache.pageFailed === ImageCache.pageCalls;
+  }
+
+  // ------------------------------------------------------------ 尺寸预探（s16 第 2 条）
+
+  /** 预探调用总数（URL 非空且缓存已就绪才计数）。 */
+  static sizeProbeCalls: number = 0;
+  /** 其中真从磁盘读到字节的次数。 */
+  static sizeProbeDisk: number = 0;
+  /** 其中量到有效宽高比（宽与高都大于 0）的次数。 */
+  static sizeProbeHits: number = 0;
+
+  /**
+   * 只从**磁盘缓存**量图片宽高比：一次网络请求都不发，取不到一律返 0，任何异常都不外抛。
+   *
+   * 为什么要有这一枚（s16 真机第 2 条「上下滑动两图之间大片黑填充」定案）：旧链路只能等整页解码完
+   * 才能在 ReaderPageImage.aspect() 里从 PixelMap 量到真实比，于是「尺寸未知的那一帧」先按窄骨架排高、
+   * 解码完又跳到真实等比高（真机 1756x2479 约 1.4 屏）= 把黑区换成可见跳动。上游同一处是
+   * method/prefetch_image_sizes.dart：章节就绪后**只读已落盘图片的文件头**填尺寸，未下载的直接跳过、
+   * 零网络请求（本机 Breeze/lib/page/comic_read/ 逐行核过），本方法就是它的 ArkTS 等价物 ——
+   * 不整页解码同步取宽高的唯一正规入口 = image.createImageSource + ImageSource.getImageInfoSync
+   * （@ohos.multimedia.image.d.ts :4258 / :11787），用完必须 release()。Image 组件没有 autoSize
+   * （SDK component/ 全目录 grep = 0 命中，API26 无此属性，别去找）。
+   *
+   * 缓存键必须与 loadPage 逐字符同形（isPlugin 时 url 加 |p| 加 intent，否则量到的尺寸与 loadPage
+   * 命中的不是同一份缓存）：intent 走同一条 deobfIntent 通道、异常同样回落空串，两边不得各自演化。
+   * 反混淆只重排块、不改画布尺寸，所以按带意图的键读到的原始字节，宽高比与展示尺寸一致。
+   *
+   * 定位 = 优化而非功能：读不到、目录被回收、字节坏掉、GIF 首帧异常 —— 全部返 0 让调用方回落到
+   * 窄骨架，绝不能把一次预探失败变成翻页失败（故整个方法体包 try/catch，与 loadPage 的抛出口径相反）。
+   *
+   * 代价（有意接受）：同一份磁盘字节会被读两次（本方法一次、随后 loadPage 一次）。页图几百 KB 的顺序
+   * 读是毫秒级，换来首帧行高就正确；不做字节常驻 —— 缓存一页 ArrayBuffer 等于偷偷改大 LRU 内存口径。
+   */
+  async loadSize(url: string, sourceId: string, chapterId: string): Promise<number> {
+    try {
+      if (url === null || url === undefined || url.length === 0) {
+        return 0;
+      }
+      if (!this.ready) {
+        return 0;
+      }
+      ImageCache.sizeProbeCalls++;
+      const ch = BytesChannels.get();
+      const isPlugin: boolean = sourceId.length > 0 && sourceId.startsWith(PLUGIN_SOURCE_PREFIX);
+      let intent: string = '';
+      if (isPlugin && ch !== null) {
+        try {
+          intent = await ch.deobfIntent(sourceId, chapterId, url);
+        } catch (err) {
+          intent = '';
+        }
+      }
+      const key: string = isPlugin ? (url + '|p|' + intent) : url;
+      const name: string = await this.hashName(key);
+      const path: string = this.cacheRoot + '/' + name + DISK_EXT;
+      // readFile 自带 pathExists 闸门（accessSync 取返回值那条口径），目录被系统回收时返 null 而不抛。
+      const buf: ArrayBuffer | null = this.readFile(path);
+      if (buf === null) {
+        return 0;
+      }
+      ImageCache.sizeProbeDisk++;
+      const source: image.ImageSource = image.createImageSource(buf);
+      try {
+        const info: image.ImageInfo = source.getImageInfoSync();
+        const w: number = info.size.width;
+        const h: number = info.size.height;
+        if (w > 0 && h > 0) {
+          ImageCache.sizeProbeHits++;
+          return w / h;
+        }
+        return 0;
+      } finally {
+        try {
+          await source.release();
+        } catch (err) {
+          Logger.w('释放尺寸预探 ImageSource 失败');
+        }
+      }
+    } catch (err) {
+      return 0;
+    }
+  }
 
   /** 清空内存与磁盘缓存。 */
   async clear(): Promise<void> {
@@ -759,7 +1159,10 @@ export class ImageCache {
       const evicted: image.PixelMap | undefined = store.get(oldest);
       store.delete(oldest);
       // 被淘汰项是「最久未用」的图像，通常已不在屏上；释放其 native 内存，避免 RLIMIT 累积
-      if (evicted !== undefined && !evicted.isReleased) {
+      // s14：isReleased 是**方法**（@ohos.multimedia.image.d.ts:5970，@since 22）。旧写法 !evicted.isReleased
+      // 取的是方法引用（恒真值）⇒ 取反恒 false ⇒ LRU 淘汰其实从来没释放过，页图 native 内存一直堆着，
+      // 阅读器翻十几页就顶到 RLIMIT。改成真调用。
+      if (evicted !== undefined && !evicted.isReleased()) {
         evicted.release().catch((err: BusinessError) => {
           Logger.ex('PixelMap release 失败', err as Object);
         });

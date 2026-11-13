@@ -27,6 +27,9 @@ import { util } from '@kit.ArkTS';
 import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
 import { promptAction, display, router } from '@kit.ArkUI';
 import { SearchEntryParams } from '../view/search/SearchEntryParams';
+import { ImageCache } from '../data/image/ImageCache';
+import { ReaderDiag } from '../view/reader/ReaderView';
+import { PluginIconDiag } from '../view/plugins/PluginManagerView';
 
 /** rawfile 路径（不带 rawfile/ 前缀）。real.bundle.cjs 可选：缺则面板第 7 项 SKIP。 */
 const RAW_SELFTEST: string = 'plugins/selftest.bundle.cjs';
@@ -71,6 +74,14 @@ class DiagReport {
   unload: string = '';
   fileChain: string = '';
   jailEscape: string = '';
+  /** s13 第 5 条：取图链取证行原文（插件档 / 宿主兜底档 / 两侧最后一次错因）。 */
+  imageChain: string = '';
+  /** s15 第 1 条：阅读器侧取证行原文（页记账 + 章级失败落点）。 */
+  readerChain: string = '';
+  /** s15 第 3 条：插件图标取图链取证行原文（直链/镜像/失败按域名分布）。 */
+  pluginIcons: string = '';
+  /** 19 pluginConfig（s16 第 4 条取证：持久化桶名集合，跨插件账号互串判据）。 */
+  pluginConfig: string = '';
   storageRoot: string = '';
   verdict: string = '';
   items: DiagItem[] = [];
@@ -97,10 +108,12 @@ function em(e: Object): string {
 @Entry
 @Component
 struct Index {
-  /** 当前页签下标（s5g 去掉首页签后的真序，与 BreezeBottomTab.TabMeta.titles 同序）：0 书架 / 1 发现 / 2 云收藏 / 3 更多 */
+  /** 当前页签下标（与 BreezeBottomTab.TabMeta.titles 同序）：s14 第 2 条起三签 = 0 书架 / 1 发现 / 2 更多
+   *   （旧序 0 书架 / 1 发现 / 2 云收藏 / 3 更多 作废；云收藏改走 router 页 pages/CloudSyncPage）。
+   *   初值 0 = 书架，与三签口径一致，不改。 */
   @State currentIndex: number = 0;
   @StorageProp('isDark') isDark: boolean = false;
-  /** C5/C6-①：内容页滚动进度（0–1），由四个内容页写入，驱动顶栏透明↔实底 */
+  /** C5/C6-①：内容页滚动进度（0–1），由三个内容页写入，驱动顶栏透明↔实底 */
   @StorageProp('topBarProgress') topBarProgress: number = 0;
 
   /** S2 诊断面板状态（真机无 hilog：一张截图 = 全部验收证据）。 */
@@ -121,6 +134,14 @@ struct Index {
   /** S4 取证：13 fileChain 三步 scan/probe 原文 + 14 jailEscape 三类拒绝文案。 */
   private diagFileChain: string = '';
   private diagJail: string = '';
+  /** 16 imageChain 行原文（runDiag 时现算，不落盘）。 */
+  private diagImage: string = '';
+  /** 17 readerChain 行原文（同上，现算不落盘）。 */
+  private diagReader: string = '';
+  /** 18 pluginIcons 行原文（同上，现算不落盘）。 */
+  private diagIcons: string = '';
+  /** 19 pluginConfig 行原文（同上，现算不落盘）。 */
+  private diagCfg: string = '';
 
   /** 诊断面板显隐（用户 m02396 硬约束：不许压屏幕顶部 ⇒ 改底部弹层 + 可收起）。 */
   @State diagOpen: boolean = true;
@@ -888,8 +909,69 @@ struct Index {
       pushFixed(10, 'selftest', 'INFO', 'unavailable: ' + em(e as Object));
     }
 
+    // ---- 16. imageChain（INFO，不计入 verdict）：s13 第 5 条「某图源任何情况下都显示拿不到图」的取证口。
+    //      s15 判读法更新（cache-fix 离线桩 80 项实测，取代上面旧三行；旧写法会把人带偏）：
+    //        plugin=tries 单独看无意义 —— 它只在「未命中磁盘且是插件图源且通道在」那条分支自增；
+    //        先看 pf/hf/df/mf/pfail 五档：五档相加必须等于 pc，对不上就是出现了第七条出口；
+    //        hf 或 df 等于 pc 且 pf=0 ⇒ 阅读器根本没翻页，这些是封面类非插件调用（npSrc 可佐证），属合法组合；
+    //        blk=黑/取样/未知 三位：未知数 == 取样总数时整条黑图判据作废，不得据 blk=0 排除黑图；
+    //        pErr 与 hErr 同时非空 ⇒ 两侧都失败，pErr 优先当根因。
+    //      计数是本次进程累计：请先翻几页漫画再开面板，否则全 0 只说明还没取过图。
+    try {
+      const hint: string = ImageCache.imageHint();
+      this.diagImage = cut(hint, 720);
+      pushFixed(16, 'imageChain', 'INFO', hint, 720);
+    } catch (e) {
+      this.diagImage = 'throw: ' + em(e as Object);
+      pushFixed(16, 'imageChain', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
     // ---- 总判定 + 可复制 JSON。S3 起前缀 S3（第二批起判定 10 项：S2 七项 + net + download +
     //      unload；pluginIndex/selftest/exports 为 INFO 不计入），如需保留 S2 字样可回退。
+    // ---- 17. readerChain（INFO，不计入 verdict）：s15 第 1 条「进漫画点阅读直接无法加载」的取证口。
+    //      判读法：errCount 是章级五档合计（含「暂无章节」「本章节没有图片」两档非异常），
+    //      pagesOk 与它互斥 —— pagesOk>0 说明章级链路是通的，问题在取图（看 16 行）；
+    //      pagesOk=0 且 errCount>0 ⇒ 整章没起来，last= 就是屏上那句（catch 档已带插件真错因）；
+    //      两档全 0 = 本次进程根本没进过阅读器，此时 16 行 pc=0 属同因，不是取图链坏了。
+    try {
+      const rhint: string = ReaderDiag.chapterHint() + ' | ' + ReaderDiag.pageHint();
+      this.diagReader = cut(rhint, 720);
+      pushFixed(17, 'readerChain', 'INFO', rhint, 720);
+    } catch (e) {
+      this.diagReader = 'throw: ' + em(e as Object);
+      pushFixed(17, 'readerChain', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
+    // ---- 18. pluginIcons（INFO，不计入 verdict）：s15 第 3 条「插件管理里图标不显示」的取证口。
+    //      判读法：恒等式 ok + okMirror + fail == calls（balanced() 就是判这个）；
+    //      noUrl=上游索引本身没填（e-hentai 那条）与 badUrl=值不是 URL，两者都不进 calls，不污染失败率；
+    //      hosts=域名:成功/尝试 是这行最有信息量的字段 —— 14 条图标挂在 raw.githubusercontent 与
+    //      cdn.jsdelivr 上（真机对这两域被 RST，见 selftest 载荷记录），按域名一比就把「不显示」落到具体 host；
+    //      mirror=救回/尝试 全 0 且 fail 高 ⇒ 镜像档也没救活 = 真网络不可达，不是代码坏了；
+    //      skip=此前已全档落空直接占位的次数（List 复用节点反复重触发才会涨，属预期省流）。
+    try {
+      const ihint: string = PluginIconDiag.hint();
+      this.diagIcons = cut(ihint, 720);
+      pushFixed(18, 'pluginIcons', 'INFO', ihint, 720);
+    } catch (e) {
+      this.diagIcons = 'throw: ' + em(e as Object);
+      pushFixed(18, 'pluginIcons', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
+    // ---- 19. pluginConfig（INFO，不计入 verdict）：s16 第 4 条「一个插件登录后另一个插件残留帐号」的取证口。
+    //      判读法：runtimes= 是本进程见过的 runtime 桶名(次数)。只有 breeze-ohos 一枚（当前实现）
+    //      = 全部插件共用一个持久化桶，名为 auth.account / auth.password 的键在插件间互换值，
+    //      这就是跨插件账号互串的根因（上游是每插件一 runtime，天然隔离）；出现多枚（plugin_xxx 形态）
+    //      = Rust 侧分桶已生效（那一步会改 .so 且存量登录态一次性失效，需用户拍板）。
+    //      keys= 是最近一次读到的桶内键数（多插件共用时会明显大于单个插件的设置项数）。
+    try {
+      const chint: string = BreezeHost.configHint();
+      this.diagCfg = cut(chint, 720);
+      pushFixed(19, 'pluginConfig', 'INFO', chint, 720);
+    } catch (e) {
+      this.diagCfg = 'throw: ' + em(e as Object);
+      pushFixed(19, 'pluginConfig', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
     // ---- 总判定 + 可复制 JSON。S4 起前缀 S4（判定 12 项：S2 七项 + net + download + unload +
     //      fileChain + jailEscape；pluginIndex/selftest/exports 为 INFO 不计入），如需回退字样可改。
     const verdict: string = fails === 0
@@ -913,6 +995,10 @@ struct Index {
     report.unload = this.diagUnload;
     report.fileChain = this.diagFileChain;
     report.jailEscape = this.diagJail;
+    report.imageChain = this.diagImage;
+    report.readerChain = this.diagReader;
+    report.pluginIcons = this.diagIcons;
+    report.pluginConfig = this.diagCfg;
     report.storageRoot = this.diagStorageRoot;
     report.verdict = verdict;
     report.items = items;
@@ -973,7 +1059,7 @@ struct Index {
           showBack: false,
           actionText: '',
           // 需求 1（用户 m05810）：发现页那条搜索栏收进顶栏右上角，缩成一个图标。
-          // 四个一级页都放（搜索本就是全局能力），点谁都是同一个搜索页。
+          // 三个一级页都放（搜索本就是全局能力），点谁都是同一个搜索页。
           showSearch: true,
           // C5：顶栏随内容页滚动响应（0=透明 1=实底），由各页写入 AppStorage 'topBarProgress'
           scrollProgress: this.topBarProgress,

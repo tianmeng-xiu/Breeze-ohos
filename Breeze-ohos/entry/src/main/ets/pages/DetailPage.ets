@@ -10,6 +10,12 @@
  *
  * 能力缺口是常态（s6j 实测：jjmhw 无评论无点赞、MangaDex 两者都无、只有 man-hua-gui 有但那是
  *   demo 桩）⇒ 每个动作都要么可用、要么置灰并把插件给的 *Reason 当提示，绝不报错崩页面。
+ *
+ * s13 第 4 条（用户 11-12 22:12 report 第 4 条）：作者行加可点指示 = 与下方标签同款 chip。
+ *   作者与标签的 chip 观感集中在本页唯一一份 SearchChip（@Builder）里，跳转通路仍走 searchBy
+ *   （s11 第 6 条：SearchEntryParams(源 id, 词) 进 SearchPage，先选源后灌词再搜）⇒ 无新增路由参数。
+ *   可点判据 searchable() 与 searchBy 的前置等价：显示判据走 authorName()（trim 后非空），
+ *   源 id 缺失时作者行退回纯文本档，不留「看着能点、点了没反应」的死指示。
  * 依赖：data/source/SourceManager（取详情）、data/source/PluginDetail（统计/推荐/点赞）、
  *   data/db/MangaRepository（书架/章节缓存/进度）、view/common（顶栏主题状态视图）。
  * 依据系统 Kit：@kit.ArkUI（router）、@kit.ImageKit（封面 PixelMap）。
@@ -355,6 +361,23 @@ struct DetailPage {
   }
 
   /**
+   * s13 第 4 条：作者名的「显示」与「可点判据」都过这一道 trim。
+   * 有的图源会回「一串空格」这类假作者名：旧判据 length 大于 0 会把它画出来，而 searchBy 里
+   * trim 后为空直接 return ⇒ 正好是第 3 条禁止的「看着可点、点了没反应」。这里把两处判据合一。
+   */
+  private authorName(): string {
+    return this.manga !== null ? this.manga.author.trim() : '';
+  }
+
+  /**
+   * 这个词现在能不能真跳去搜：trim 后非空，且本页带着源 id（searchBy 依赖 this.sourceId，见其注释）。
+   * 判据必须与 searchBy 的前置等价，否则 chip 画出来了却什么都不做。
+   */
+  private searchable(text: string): boolean {
+    return text.trim().length > 0 && this.sourceId.length > 0;
+  }
+
+  /**
    * s11 第 6 条（用户 11-12 16:15 report 第 6 条）：作者名 / 标签点一下 = 到「本页这个源」搜「这个词」。
    * 源用 this.sourceId（详情页一直带着它，见 openReader / openComments 同一口径），
    * 所以点标签得到的是同源的同类作品，不是把全部源搅在一起的聚合结果。
@@ -540,6 +563,37 @@ struct DetailPage {
       .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: 18, bottom: 8 })
   }
 
+  /**
+   * s13 第 4 条（用户 11-12 22:12 report 第 4 条）：「点一下去搜这个词」的 chip，本页唯一样式源。
+   * 作者行与下方标签行共用它：字号、内边距、底色、圆角、按下态只写这一处（改之前标签行是本页
+   * 唯一一份 chip 样式、作者行是纯文本，grep 过没有第二份副本 ⇒ 这里抽取共用而不是新造第三份）。
+   * 颜色逐字沿用标签行（text2 打底色 fillColor）：深色档那套对比度是真机验收过的，作者行直接继承。
+   * 形参纪律（公共口径 1）：文案走取值函数 textOf 并在 Text 节点里调用 —— @Builder 形参是按值快照，
+   *   直接传字符串会把文案定格在首帧；本页 manga 是异步 load、换源重载还要重算（同坑见 ActionBtn、
+   *   SettingPage.ManageRow、AboutPage.InfoRow）。
+   * singleLine：作者名可能是「组合 / 团体」式长串，必须单行省略（改 chip 前它就是 maxLines 1）；
+   *   标签行保持原样可换行，非单行档给 99 = 事实上的不限行（给 INT32_MAX 没必要，留点余量）。
+   * topGap、bottomGap：样式本身不管版面位置，外边距数值由调用点给（标签行 0 与 4、作者行 6 与 0），
+   *   两行各自的既有间距一位不动。
+   */
+  @Builder
+  SearchChip(textOf: () => string, singleLine: boolean, topGap: number, bottomGap: number,
+             onTap: () => void) {
+    Text(textOf())
+      .fontSize(11)
+      .fontColor(Theme.text2(this.isDark))
+      .maxLines(singleLine ? 1 : 99)
+      .textOverflow({ overflow: TextOverflow.Ellipsis })
+      .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+      .backgroundColor(Theme.fillColor(this.isDark))
+      .borderRadius(10)
+      .margin({ top: topGap, right: 6, bottom: bottomGap })
+      .clickEffect({ level: ClickEffectLevel.LIGHT })
+      .onClick(() => {
+        onTap();
+      })
+  }
+
   build() {
     Column() {
       BreezeTopBar({
@@ -579,22 +633,27 @@ struct DetailPage {
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
                   .width('100%')
 
-                if (this.manga !== null && this.manga.author.length > 0) {
-                  // s11 第 6 条：作者名可点，跳「本源 + 该作者」的搜索。
-                  // 颜色仍用 text2（不改成品牌蓝）：这行同时是「作者：xxx」的元信息，
-                  // 染蓝会让它看起来像唯一可点的东西而标签又不蓝；可点性交给按下态 clickEffect
-                  // 与点中即跳转这两条反馈（全站 chip 同口径）。
-                  Text(this.manga.author)
-                    .fontSize(12)
-                    .fontColor(Theme.text2(this.isDark))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .margin({ top: 6 })
-                    .width('100%')
-                    .clickEffect({ level: ClickEffectLevel.LIGHT })
-                    .onClick((): void => {
-                      this.searchBy(this.manga !== null ? this.manga.author : '');
+                // s13 第 4 条（用户 11-12 22:12 report 第 4 条）：作者行加上与下方标签同款的 chip 外观。
+                // s11 那版已经能点，但外观仍是纯文本（只有按下态），用户看不出可点 ⇒ 才有这条。
+                // 样式与标签共用 SearchChip（本页唯一样式源），颜色沿用标签，不改成品牌蓝：
+                // 标签本来也不蓝，染蓝反而让作者像唯一可点的东西（s11 那条理由仍然成立）。
+                if (this.authorName().length > 0) {
+                  if (this.searchable(this.authorName())) {
+                    this.SearchChip((): string => {
+                      return this.authorName();
+                    }, true, 6, 0, (): void => {
+                      this.searchBy(this.authorName());
                     })
+                  } else {
+                    // 点不动就绝不长得像能点（第 3 条硬要求）：本源 id 缺失时退回纯文本档 ——
+                    // 与 chip 只差底色、圆角与点击，字号和单行省略保持一致，不留死指示。
+                    Text(this.authorName())
+                      .fontSize(11)
+                      .fontColor(Theme.text2(this.isDark))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .margin({ top: 6 })
+                  }
                 }
 
                 if (this.statText().length > 0) {
@@ -612,17 +671,24 @@ struct DetailPage {
                     // 按值传进来就是当次数据，闭包里直接用没有「定格首帧」那个坑
                     // （那个坑只长在 @Builder 形参上，见本文件 ActionBtn 注释）。
                     ForEach(this.manga.tags.slice(0, 6), (t: string) => {
-                      Text(t)
-                        .fontSize(11)
-                        .fontColor(Theme.text2(this.isDark))
-                        .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-                        .backgroundColor(Theme.fillColor(this.isDark))
-                        .borderRadius(10)
-                        .margin({ right: 6, bottom: 4 })
-                        .clickEffect({ level: ClickEffectLevel.LIGHT })
-                        .onClick((): void => {
+                      // s13 第 4 条：外观一位没动（字号、内边距、底色、圆角、右边距 6、下边距 4
+                      // 全部原值、数据源与 key 都没改），只是改成调用与作者行共用的 SearchChip，
+                      // 样式收敛成一处。判据与作者行同一个 searchable：插件偶尔回一串空白当标签
+                      // （PluginSourceAdapter.mapItem 只过掉空串、没过空白），旧版会画出一颗点不动的
+                      // 空 chip ⇒ 同一条「看着能点、点了没反应」；现在这种项退回纯文本、不给底色。
+                      if (this.searchable(t)) {
+                        this.SearchChip((): string => {
+                          return t;
+                        }, false, 0, 4, (): void => {
                           this.searchBy(t);
                         })
+                      } else {
+                        Text(t)
+                          .fontSize(11)
+                          .fontColor(Theme.text2(this.isDark))
+                          .maxLines(99)
+                          .margin({ right: 6, bottom: 4 })
+                      }
                     }, (t: string) => t)
                   }
                   .width('100%')

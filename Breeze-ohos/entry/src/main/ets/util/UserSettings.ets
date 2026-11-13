@@ -20,6 +20,17 @@
 import { PreferenceStore, PrefKeys } from '../data/kv/PreferenceStore';
 import { HttpClient, DEFAULT_UA } from '../data/net/HttpClient';
 
+/**
+ * 阅读模式取值（s13 第 6 条，存库用短码，同样「只能新增不能改既有语义」）：
+ * PAGER = 横向翻页（现役档，一页一张，Swiper）；WEBTOON = 从上向下连续滚动（条漫档，List）。
+ */
+export class ReadScrollMode {
+  /** 横向翻页（默认） */
+  static readonly PAGER: string = 'pager';
+  /** 从上向下连续滚动 */
+  static readonly WEBTOON: string = 'webtoon';
+}
+
 /** 阅读方向取值（存库用短码，改值等于改已有数据：只能新增，不能改既有语义）。 */
 export class ReadDirection {
   /** 从左到右（默认） */
@@ -32,6 +43,8 @@ export class ReadDirection {
 export class SettingLabels {
   /** 与 ReadDirection 取值顺序一一对应 */
   static readonly READ_DIRECTION: string[] = ['从左到右', '从右到左'];
+  /** 与 ReadScrollMode 取值顺序一一对应（s13 第 6 条：更多页「阅读模式」行与选项菜单共用） */
+  static readonly READ_SCROLL_MODE: string[] = ['横向翻页', '从上向下滚动'];
 }
 
 /** 设置页展示用的运行时快照（不含敏感值，Cookie 只给条目数）。 */
@@ -41,10 +54,20 @@ export class UserSettingsSnapshot {
   effectiveUserAgent: string = '';
   readDirection: string = ReadDirection.LTR;
   tapToScroll: boolean = false;
+  /** s13 第 6 条：阅读模式（pager / webtoon） */
+  scrollMode: string = ReadScrollMode.PAGER;
   cookieHostCount: number = 0;
 }
 
 export class UserSettings {
+  /**
+   * 阅读模式的配置键（s13 第 6 条）。
+   * 为什么不放进 data/kv/PreferenceStore 的 PrefKeys：本轮写域只有三个文件，PrefKeys 在写域外，
+   * 越界改它会与并行的改动撞车。键名按 PrefKeys 的口径取（短码、下划线、语义唯一），
+   * 消费点只有本模块（读写）⇒ 与 PrefKeys 里那些「一处定义多处引用」的键等价。
+   * 后续整理时可原样搬进 PrefKeys 并改成引用，值不得改（改值 = 作废老用户已存的档位）。
+   */
+  private static readonly KEY_SCROLL_MODE: string = 'reader_scroll_mode';
   /** 阅读方向；非法值（老数据或手改库）一律回落默认 */
   static readDirection(): string {
     const v: string = PreferenceStore.getInstance().getString(PrefKeys.READ_DIRECTION, ReadDirection.LTR);
@@ -58,6 +81,45 @@ export class UserSettings {
   static async setReadDirection(value: string): Promise<void> {
     await PreferenceStore.getInstance().putString(PrefKeys.READ_DIRECTION,
       value === ReadDirection.RTL ? ReadDirection.RTL : ReadDirection.LTR);
+  }
+
+  /**
+   * 阅读模式（s13 第 6 条）：非法值（老数据、手改库、以后新增档位的旧版本）一律回落 pager，
+   * 与 readDirection 同一套兜底口径 —— 兜底方向选「现役行为」，不让一次脏数据改变所有人的阅读方式。
+   */
+  static readScrollMode(): string {
+    const v: string = PreferenceStore.getInstance().getString(UserSettings.KEY_SCROLL_MODE, ReadScrollMode.PAGER);
+    return v === ReadScrollMode.WEBTOON ? ReadScrollMode.WEBTOON : ReadScrollMode.PAGER;
+  }
+
+  static isWebtoon(): boolean {
+    return UserSettings.readScrollMode() === ReadScrollMode.WEBTOON;
+  }
+
+  /**
+   * 档位的响应式副本键（AppStorage）：阅读器（view/reader/ReaderView）用 @StorageProp 加 @Watch
+   * 订阅它 ⇒ 阅读器还在路由栈里时从「更多」页改档也能立刻翻档（TabContent 子组件不重跑
+   * aboutToAppear 这条老口径在这里同样成立，靠版本号 push 是同一个套路）。
+   * 键名与写入口只在本类一处，两个消费方都调 pushScrollMode，别各自 setOrCreate。
+   */
+  static readonly STORAGE_SCROLL_MODE: string = 'readerScrollMode';
+
+  /** 同步推档位副本（不落库）：落库见 setScrollMode，两者顺序 = 先推再落，见 setScrollMode 注释 */
+  static pushScrollMode(value: string): string {
+    const v: string = value === ReadScrollMode.WEBTOON ? ReadScrollMode.WEBTOON : ReadScrollMode.PAGER;
+    AppStorage.setOrCreate<string>(UserSettings.STORAGE_SCROLL_MODE, v);
+    return v;
+  }
+
+  /**
+   * 写档：先同步推 AppStorage 副本（界面立刻响应），再异步落库（重启才需要）。
+   * 顺序反过来的话，库卡住的那几百毫秒里界面停在旧档 = 用户以为没点上会再点一次。
+   * 落库失败不回滚界面：档位是纯展示偏好，「界面跟手、重启回落」比「界面卡住」好，
+   * 失败由调用方 toast 或打日志（ReaderView 里打日志，更多页里 toast）。
+   */
+  static async setScrollMode(value: string): Promise<void> {
+    const v: string = UserSettings.pushScrollMode(value);
+    await PreferenceStore.getInstance().putString(UserSettings.KEY_SCROLL_MODE, v);
   }
 
   /** 纵向滚动模式下点按是否翻一屏；横向翻页模式不受此项影响（点按恒翻页） */
@@ -97,6 +159,7 @@ export class UserSettings {
     s.effectiveUserAgent = HttpClient.getInstance().getUserAgent();
     s.readDirection = UserSettings.readDirection();
     s.tapToScroll = UserSettings.tapToScroll();
+    s.scrollMode = UserSettings.readScrollMode();
     s.cookieHostCount = cookieHostCount;
     return s;
   }

@@ -10,6 +10,8 @@
     "pages/CommentPage",
     "pages/SettingPage",
     "pages/PluginLoginPage",
-    "pages/AboutPage"
+    "pages/AboutPage",
+    "pages/CloudSyncPage",
+    "pages/WebLoginPage"
   ]
 }

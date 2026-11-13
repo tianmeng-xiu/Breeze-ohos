@@ -84,6 +84,23 @@ export class PluginSourceAdapter implements MangaSource {
   /** chapterId → mangaId 缓存（fetchPages 补 comicId 用；容量粗限 256）。 */
   private chapterComic: Map<string, string> = new Map<string, string>();
 
+  /**
+   * ChapterInfo.id → 插件 getChapter 真正要的那个值（s15 第 1 条，只在两者不同时登记，容量同样 256）。
+   * 为什么要这枚表：插件 eps 自己给了四个可用键（id / requestId / logicalKey / storageChapterId），
+   * 而宿主只把 eps.id 装进 ChapterInfo（Models.ets 那个接口没有别的位置）。多数插件四者同值所以无嫌，
+   * 唯独哔咖（picacomic 0.1.1）的 eps.id = Mongo _id，它的 getChapter 把 chapterId 当 order 用：
+   * Number(_id) 得 NaN 再取默认 0，校验处直接抛「chapterId 不能为空」，0 次 HTTP 就失败
+   * ＝用户看到的「进去直接无法加载 + 重试，根本无法切下一页」。它自己的 requestId = String(order)。
+   *
+   * 两条刻意的设计（别改成省事的写法）：
+   *  ① **不把归一后的值写进 ChapterInfo.id**。DetailPage 用 progress.chapterId === c.id 判「读至第几页」，
+   *    且 fetchChapters 成功就 saveChapters 落库（DB 主键 chapter_id）⇒ 改 id 会让存量章节行与阅读进度同时失配。
+   *    所以对外（UI / DB / 路由参数）恒用 id，只有对插件发请求这一跳换成 out 值。
+   *  ② **只在 requestId 非空且与 id 不同时才登记**。禁漫 / Mangadex / 漫茶魂 / jjmhw 四者同值、
+   *    在猫漢无 requestId ⇒ 这张表对它们根本是空的，发出的字符串逐字节不变，不存在回归面。
+   */
+  private chapterOutKey: Map<string, string> = new Map<string, string>();
+
   constructor(uuid: string, displayName: string, localFile: string, filesDir: string) {
     this.uuid = uuid;
     this.displayName = displayName;
@@ -335,6 +352,14 @@ export class PluginSourceAdapter implements MangaSource {
       if (id.length === 0) {
         continue;
       }
+      // s15 第 1 条：把插件自己的 requestId 留下当出口值（仅当它与 id 不同，理由见字段注释）。
+      const reqId: string = jstr(e, 'requestId', '');
+      if (reqId.length > 0 && reqId !== id) {
+        if (this.chapterOutKey.size > 256) {
+          this.chapterOutKey.clear();
+        }
+        this.chapterOutKey.set(id, reqId);
+      }
       const t1: string = jstr(e, 'title', '');
       const t2: string = jstr(e, 'name', '');
       const t3: string = jstr(jobj(e, 'raw'), 'name', '');
@@ -358,10 +383,19 @@ export class PluginSourceAdapter implements MangaSource {
     return out;
   }
 
+  /**
+   * 对插件发 getChapter 时的章节 id 出口映射：未登记（多数插件）= 原样返回，
+   * 已登记（哔咖）= 换成它自己的 requestId。只包这一跳，对外层无任何影响。
+   */
+  private outChapterId(chapterId: string): string {
+    const mapped: string | undefined = this.chapterOutKey.get(chapterId);
+    return mapped !== undefined ? mapped : chapterId;
+  }
+
   /** 页表：getChapter；空页表转中文 Error（阅读器契约：失败必须抛，不能空列表白屏）。 */
   async fetchPages(chapterId: string): Promise<PageImage[]> {
     const a: ChapterArg = new ChapterArg();
-    a.chapterId = chapterId;
+    a.chapterId = this.outChapterId(chapterId);
     const cached: string | undefined = this.chapterComic.get(chapterId);
     a.comicId = cached !== undefined ? cached : this.lastMangaId;
     const o: ESObject = await this.call('加载章节内容失败', 'getChapter', a);
@@ -404,7 +438,7 @@ export class PluginSourceAdapter implements MangaSource {
   /** 页表带 extern（JM 反混淆要 name/type 时用；PageImage 只有 url，别把它当唯一来源）。 */
   async fetchPageRawList(chapterId: string): Promise<ESObject[]> {
     const a: ChapterArg = new ChapterArg();
-    a.chapterId = chapterId;
+    a.chapterId = this.outChapterId(chapterId);
     const cached: string | undefined = this.chapterComic.get(chapterId);
     a.comicId = cached !== undefined ? cached : this.lastMangaId;
     const o: ESObject = await this.call('加载章节内容失败', 'getChapter', a);

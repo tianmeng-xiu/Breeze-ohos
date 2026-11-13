@@ -67,6 +67,10 @@ export class BreezeHost {
   private static cfgSaveCalls: number = 0;
   private static cfgLoadCalls: number = 0;
   private static cfgLastError: string = '';
+  /** s16 第 4 条取证：本进程见过哪些 runtime 名往 plugin_config 写/读（键名 breeze-ohos 非敏感，可上屏）。 */
+  private static cfgRuntimes: Map<string, number> = new Map<string, number>();
+  /** 最近一次读到的桶内键数（异步回填，仅供诊断）。 */
+  private static cfgBucketInfo: string = '';
 
   /** preferences 等需要 context 的 API 使用前必须先 init（可重复调用）。 */
   static init(context: common.Context): void {
@@ -392,10 +396,22 @@ export class BreezeHost {
     }
   }
 
-  /** 诊断面板用短串：cfg=存/读次数（+最近一次失败原因），能一眼区分「插件没调」与「宿主存失败」。 */
+  /**
+   * 诊断面板用短串：cfg=存/读次数 + runtimes=本进程见过的 runtime 桶名集合(次数) + keys=最近一次读到的桶内键数
+   *            + 最近一次失败原因。能一眼区分「插件没调」与「宿主存失败」。
+   * s16 第 4 条取证：runtimes 只有 breeze-ohos 一枚 = 全部插件共用一个桶（跨插件账号互串的根因，
+   * 根治要改 Rust 把 bundle 名拼进 runtime 名 = 破 .so 红线，已报用户拍板）；出现多枚（形如 plugin_xxx）= 分桶已生效。
+   * 桶名本身非敏感（字面量 breeze-ohos），可上屏。
+   */
   static configHint(): string {
+    const names: string[] = [];
+    BreezeHost.cfgRuntimes.forEach((v: number, k: string): void => {
+      names.push(k + ':' + String(v));
+    });
     const tail: string = BreezeHost.cfgLastError.length > 0 ? (' err=' + BreezeHost.cfgLastError) : '';
-    return 'cfg=' + BreezeHost.cfgSaveCalls + '/' + BreezeHost.cfgLoadCalls + tail;
+    return 'cfg=' + BreezeHost.cfgSaveCalls + '/' + BreezeHost.cfgLoadCalls
+      + ' runtimes=' + (names.length === 0 ? '-' : names.join(','))
+      + BreezeHost.cfgBucketInfo + tail;
   }
 
   /** preferences(plugin_config) 单例：getPreferences 只跑一次，并发共享 Promise。 */
@@ -427,12 +443,25 @@ export class BreezeHost {
     return def;
   }
 
-  /** 读 runtime 桶（args[0]=runtime 名 ⇒ 一个桶一个 {key:value} JSON）。 */
+  /** 记录 runtime 名出现次数（诊断用，上限 8 枚防无界增长）。 */
+  private static markRuntime(runtime: string): void {
+    if (BreezeHost.cfgRuntimes.has(runtime)) {
+      BreezeHost.cfgRuntimes.set(runtime, (BreezeHost.cfgRuntimes.get(runtime) ?? 0) + 1);
+      return;
+    }
+    if (BreezeHost.cfgRuntimes.size < 8) {
+      BreezeHost.cfgRuntimes.set(runtime, 1);
+    }
+  }
+
+  /** 读 runtime 桶（args[0]=runtime 名 ⇒ 一个桶一个 {key:value} JSON）；顺带把桶内键数写进诊断。 */
   private static async readBucket(p: preferences.Preferences, runtime: string): Promise<ESObject> {
     const raw: string = String(p.getSync(runtime, '{}'));
     try {
       const obj: ESObject = JSON.parse(raw);
       if (obj !== null && obj !== undefined && typeof obj === 'object' && !Array.isArray(obj)) {
+        const ks: string[] = Object.keys(obj);
+        BreezeHost.cfgBucketInfo = ' keys=' + String(ks.length);
         return BreezeHost.healBucket(obj);
       }
     } catch (e) {
@@ -448,6 +477,7 @@ export class BreezeHost {
   private static async saveConfig(args: ESObject[]): Promise<void> {
     BreezeHost.cfgSaveCalls++;
     const runtime: string = BreezeHost.strOr(args.length > 0 ? args[0] : null, '_unknown');
+    BreezeHost.markRuntime(runtime);
     const key: string = BreezeHost.strOr(args.length > 1 ? args[1] : null, '');
     if (key.length === 0) {
       BreezeHost.cfgLastError = 'empty-key';
@@ -471,6 +501,7 @@ export class BreezeHost {
   private static async loadConfig(args: ESObject[]): Promise<string> {
     const runtime: string = BreezeHost.strOr(args.length > 0 ? args[0] : null, '_unknown');
     const key: string = BreezeHost.strOr(args.length > 1 ? args[1] : null, '');
+    BreezeHost.markRuntime(runtime);
     const fallback: ESObject = args.length > 2 ? args[2] : null;
     const p: preferences.Preferences = await BreezeHost.prefs();
     const bucket: ESObject = await BreezeHost.readBucket(p, runtime);

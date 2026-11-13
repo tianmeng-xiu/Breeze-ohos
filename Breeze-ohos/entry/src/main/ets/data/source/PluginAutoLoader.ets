@@ -107,9 +107,17 @@ export class PluginAutoLoader {
   /**
    * 目录有文件、清单没有 => 登记 + 装载（旧「打开」按钮的语义，现在自动做）。
    * name 走一次带超时的 getInfo（失败不影响登记，标题退回 uuid，同历史行为）。
+   * s13 第 1 条两点补强：
+   *  ① nameHint/versionHint = 商店下载时随 shopMap 落盘的名字与版本号。getInfo 可能自己发网络
+   *     请求而超时（INFO_TIMEOUT_MS 只有 3.5s），有 hint 就别让名字退化成文件名 —— 真机上
+   *     「云收藏/插件管理显示 bf99008d-0.0.7.bundle.cjs 这串」就是这么来的。
+   *  ② getInfo 成功顺手落一份原文进 PluginStore 的 getInfo 缓存（对齐 PluginSettings.info :596 的
+   *     上游 persistGetInfoJson 语义）。此前全仓只有设置页会写那枚缓存，用户没进过设置页 ⇒ 云收藏
+   *     的 resolveNames 永远读不到名字。
    * 成功返回登记用的 uuid，失败返回空串。不抛。
    */
-  static async adoptAndLoad(context: common.Context, localFile: string, indexUuid: string): Promise<string> {
+  static async adoptAndLoad(context: common.Context, localFile: string, indexUuid: string,
+    nameHint: string = '', versionHint: string = ''): Promise<string> {
     if (localFile.length === 0) {
       return "";
     }
@@ -119,6 +127,7 @@ export class PluginAutoLoader {
         return "";
       }
       let name: string = "";
+      let version: string = "";
       try {
         // getInfo 上游 argsJson 恒 "{}"（plugin_registry_service.dart:269）=> 传 "[{}]"，不是 "[]"。
         const infoJson: string = await Promise.race([
@@ -131,14 +140,33 @@ export class PluginAutoLoader {
         ]);
         const o: ESObject = jparse(infoJson);
         name = jstr(o, "name", "");
+        if (jstr(o, "version", "").length > 0) {
+          version = jstr(o, "version", "");
+        }
+        // 只在真拿到内容时落盘（与 PluginStore.saveGetInfo 的「失败绝不覆盖旧值」口径一致）
+        if (name.length > 0 || version.length > 0) {
+          await PluginStore.saveGetInfo(context, uuid, infoJson);
+        }
       } catch (e) {
         // 三方 getInfo 可能自己发网络请求，超时不影响装载与登记
+      }
+      // 没商店名就退商店名（getInfo 超时档），两级都没有才由调用方退 uuid/文件名
+      if (name.length === 0) {
+        name = nameHint;
+      }
+      if (version.length === 0) {
+        version = versionHint;
+      }
+      // 装载时（loadOne）名字还是空的 => 图源适配器显示名退成了文件名。这里拿到真名后补登记一次，
+      // 否则云收藏 chip 的 cap.name（= adapter.displayName）会一直显示落盘文件名。registerOne 幂等。
+      if (name.length > 0) {
+        PluginSourceRegistry.registerOne(context, uuid, name, localFile);
       }
       const rec: PluginRecord = new PluginRecord();
       rec.uuid = uuid;
       rec.name = name;
       rec.localFile = localFile;
-      rec.version = "";
+      rec.version = version;
       rec.sourceUrl = "";
       rec.sha256 = "";
       rec.enabled = true;

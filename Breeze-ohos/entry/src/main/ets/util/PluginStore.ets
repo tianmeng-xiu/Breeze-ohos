@@ -3,6 +3,8 @@
  *       存 PluginRecord JSON 数组（清单必须含 uuid/localFile/version/sourceUrl/sha256/enabled）。
  *       列表数据 = pluginScanDir('plugins') ⊕ 本桶 join。
  * 依赖：@kit.ArkData preferences、JsonUtil；不碰引擎（纯存储层，引擎调用在 PluginManagerView）。
+ * 口径（s14 第 3 条，2026-11-13）：本层字段一律只存**相对文件名**（localFile = scanDir 的 name），
+ *       绝对路径由调用方自己拼；因此落盘 JSON 里本来就没有 filesDir，新增字段也不许引入。
  * 约定：与宿主桥的 'plugin_config' 桶分开（那是插件自己的配置，这是宿主的安装清单）。
  */
 import { preferences } from '@kit.ArkData';
@@ -22,10 +24,24 @@ const SHOPMAP_KEY: string = 'shopmap.json';
  */
 const INFO_KEY: string = 'plugin_info.json';
 
-/** 商店映射条目（兜底）：installLatest 落盘件 name → 索引 uuid。 */
+/**
+ * 商店映射条目（兜底）：installLatest 落盘件 name → 索引 uuid。
+ * s13 第 1 条加 name/version 两列：商店索引里本来就带着中文名与版本号，下载时不存下来，
+ * 之后插件自带 getInfo 一旦超时就再没有第二个名字来源，界面上只能拿文件名顶上。
+ * 旧落盘数据没这几列 ⇒ 读出来是空串（下面 loadShopMap 走 jstr 缺省），不影响兼容。
+ * s14 第 4 条（2026-11-13 用户裁定）再加 iconUrl 一列：索引条目本来就带插件自带图标地址，
+ *       下载当时不存下来，之后列表页就再也想不起来它是谁（只能拿应用图标占位）。
+ *       存的是**索引里的远程地址字符串**，不是本地路径，也不做本地缓存。
+ */
 export class ShopMapEntry {
   file: string = '';
   indexUuid: string = '';
+  /** 商店索引里的插件名（中文显示名）；手放的文件恒空。 */
+  name: string = '';
+  /** 下载当时商店索引里的版本号；手放的文件恒空。 */
+  version: string = '';
+  /** 商店索引里的图标地址（IndexItem.iconUrl 原样）；手放的文件与老落盘数据恒空。 */
+  iconUrl: string = '';
 }
 
 /** 清单条目（uuid = bundleLoadFromPath 的注册名；localFile = pluginScanDir 的 name，join 键）。 */
@@ -246,7 +262,7 @@ export class PluginStore {
     }
   }
 
-  /** 读 file→indexUuid 映射；解析失败 ⇒ 空数组（同 loadAll 容错口径）。 */
+  /** 读 file→indexUuid（外加 s13 起的 name/version、s14 起的 iconUrl）映射；解析失败 ⇒ 空数组（同 loadAll 容错口径）。 */
   static async loadShopMap(context: common.Context): Promise<ShopMapEntry[]> {
     const out: ShopMapEntry[] = [];
     try {
@@ -265,6 +281,10 @@ export class PluginStore {
           const e = new ShopMapEntry();
           e.file = file;
           e.indexUuid = idx;
+          // 老数据缺这几列就是空串：不因此丢条目（映射本身还要用来认「这是商店下载的哪一本」）
+          e.name = jstr(it, 'name', '');
+          e.version = jstr(it, 'version', '');
+          e.iconUrl = jstr(it, 'iconUrl', '');
           out.push(e);
         }
       }
@@ -275,8 +295,10 @@ export class PluginStore {
     return out;
   }
 
-  /** 写映射（按 file upsert；同 indexUuid 的旧文件条目一并剔除 ⇒ 更新换代后只留最新落盘件）。 */
-  static async saveShopMap(context: common.Context, file: string, indexUuid: string): Promise<void> {
+  /** 写映射（按 file upsert；同 indexUuid 的旧文件条目一并剔除 ⇒ 更新换代后只留最新落盘件）。
+   *  s14：后三个形参一律带默认值 ⇒ s13 之前那两处调用点的写法依旧合法。 */
+  static async saveShopMap(context: common.Context, file: string, indexUuid: string,
+    name: string = '', version: string = '', iconUrl: string = ''): Promise<void> {
     const list: ShopMapEntry[] = await PluginStore.loadShopMap(context);
     const kept: ShopMapEntry[] = [];
     for (let i = 0; i < list.length; i++) {
@@ -288,6 +310,9 @@ export class PluginStore {
     const ne = new ShopMapEntry();
     ne.file = file;
     ne.indexUuid = indexUuid;
+    ne.name = name;
+    ne.version = version;
+    ne.iconUrl = iconUrl;
     kept.push(ne);
     const p: preferences.Preferences = await PluginStore.ensure(context);
     await p.put(SHOPMAP_KEY, JSON.stringify(kept));

@@ -1,7 +1,7 @@
 /**
- * 职责：底部标签栏（华为 BottomTab UX 规范·**悬浮胶囊形态**）+ 5 个一级页面的容器。
+ * 职责：底部标签栏（华为 BottomTab UX 规范·**悬浮胶囊形态**）+ 3 个一级页面的容器。
  * 依赖：Theme/Dim（../common/Theme）、SafeAreaUtil（../common/SafeArea）、Material（./Material）、
- *      Anim（./Anim）、5 个一级页面组件。
+ *      Anim（./Anim）、3 个一级页面组件。
  * 对应 Flutter：lib/page/navigation_bar.dart（PersistentTabView，NavBarStyle.style3，5 个 tab）。
  * 实施依据：三档降级链（HDS 材质为主 / 自绘胶囊为退 / 平铺为兜底），运行时按能力探测选层，探测见 Material.ets。
  *
@@ -39,7 +39,6 @@ import {
   HdsTabsFloatingStyle,
   HdsTabsBackgroundStyle
 } from '@kit.UIDesignKit';
-import { CloudPage } from '../cloud/CloudPage';
 import { BookshelfPage } from '../bookshelf/BookshelfPage';
 import { DiscoverPage } from '../discover/DiscoverPage';
 import { MinePage } from '../mine/MinePage';
@@ -47,23 +46,24 @@ import { MinePage } from '../mine/MinePage';
 /** 页签元数据：供底栏与 Index 顶栏共用（标题顺序必须与 TabContent 顺序一致）
  *  s5g 收敛为 4 签：用户反馈「首页和书架重复，内容一致，留一个就行」⇒ 去掉首页签，
  *  书架升为第 0 签（与原版 Flutter 底栏首签=书架一致）。HomePage.ets 暂留不删（继续阅读区块将来并入书架）。
+ *  s14 第 2 条起三签（用户 report.txt 第 2 条「云收藏不再单列一页，放进『更多』页作为一项，命名『从云端同步』」）
+ *  ⇒ 0 书架 / 1 发现 / 2 更多；云收藏整条撤出底栏，功能不删，改由 router 页 pages/CloudSyncPage 承载，
+ *  入口在 view/mine/MinePage 的「从云端同步」行。旧的 0 书架 / 1 发现 / 2 云收藏 / 3 更多 口径自本行起作废。
  */
 export class TabMeta {
-  static readonly titles: string[] = ['书架', '发现', '云收藏', '更多'];
-  static readonly count: number = 4;
+  static readonly titles: string[] = ['书架', '发现', '更多'];
+  static readonly count: number = 3;
 
   /** 未选中图标名（S0 §1.5 逐名核实存在；未核实的一律不用） */
   static readonly symbols: string[] = [
     'sys.symbol.book_pages',
     'sys.symbol.discover',
-    'sys.symbol.cloud',
     'sys.symbol.ellipsis_message'
   ];
   /** 选中图标名 */
   static readonly symbolsFill: string[] = [
     'sys.symbol.book_pages_fill',
     'sys.symbol.discover_fill',
-    'sys.symbol.cloud_fill',
     'sys.symbol.ellipsis_message_fill'
   ];
 
@@ -83,10 +83,8 @@ export class TabMeta {
     if (index === 1) {
       return $r(names[1]);
     }
-    if (index === 2) {
-      return $r(names[2]);
-    }
-    return $r(names[3]);
+    // s14 第 2 条起三签：第 2 名 = 更多（ellipsis_message），故兜底档也回到 names[2]
+    return $r(names[2]);
   }
 }
 
@@ -161,7 +159,8 @@ export struct BreezeBottomTab {
   }
 
   /** 页签图标：选中 / 未选中、浅色 / 深色 分别对应一张 PNG（PNG 无法用 fillColor 着色，故预生成三套）
-   *  s5g 起顺序 = TabMeta.titles（0 书架 / 1 发现 / 2 云收藏 / 3 更多），首页签已移除故不再用 ic_tab_home_*。
+   *  s14 第 2 条起顺序 = TabMeta.titles（0 书架 / 1 发现 / 2 更多）；首页签与云收藏签都已移出底栏，
+   *  故 ic_tab_home_* 与 ic_tab_cloud_* 两组 PNG 不再被引用（文件按出包红线原地保留，不删）。
    */
   private tabIcon(index: number, selected: boolean): Resource {
     const dark: boolean = this.isDark;
@@ -171,9 +170,7 @@ export struct BreezeBottomTab {
     if (index === 1) {
       return selected ? $r('app.media.ic_tab_discover_sel') : (dark ? $r('app.media.ic_tab_discover_d') : $r('app.media.ic_tab_discover'));
     }
-    if (index === 2) {
-      return selected ? $r('app.media.ic_tab_cloud_sel') : (dark ? $r('app.media.ic_tab_cloud_d') : $r('app.media.ic_tab_cloud'));
-    }
+    // s14 第 2 条起三签：第 2 名 = 更多 ⇒ 云收藏那一对 ic_tab_cloud_* 退出查表（PNG 原地保留）
     return selected ? $r('app.media.ic_tab_more_sel') : (dark ? $r('app.media.ic_tab_more_d') : $r('app.media.ic_tab_more'));
   }
 
@@ -294,8 +291,9 @@ export struct BreezeBottomTab {
     return style;
   }
 
-  /** 4 个 TabContent（各档组件共用同一 builder，避免整段复制）
-   *  顺序 = TabMeta.titles：0 书架 / 1 发现 / 2 云收藏 / 3 更多（s5g 去首页签）
+  /** 3 个 TabContent（各档组件共用同一 builder，避免整段复制）
+   *  顺序 = TabMeta.titles：0 书架 / 1 发现 / 2 更多（s5g 去首页签；s14 第 2 条去云收藏签）。
+   *  云收藏的 TabContent 整块删除，页面本体零改动搬到 router 页 pages/CloudSyncPage（入口在更多页）。
    */
   @Builder
   TabContents() {
@@ -318,22 +316,13 @@ export struct BreezeBottomTab {
     .tabBar(this.TabItem(1))
 
     TabContent() {
-      CloudPage({
-        onRequestTab: (index: number) => {
-          this.jumpTo(index);
-        }
-      })
-    }
-    .tabBar(this.TabItem(2))
-
-    TabContent() {
       MinePage({
         onRequestTab: (index: number) => {
           this.jumpTo(index);
         }
       })
     }
-    .tabBar(this.TabItem(3))
+    .tabBar(this.TabItem(2))
   }
 
   build() {

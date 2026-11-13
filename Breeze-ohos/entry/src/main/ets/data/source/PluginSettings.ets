@@ -463,7 +463,17 @@ export class PluginSettings {
         Logger.w('插件 setter ' + field.fnPath + ' 失败（仍继续落桶）：' + em(e as Object));
       }
     }
-    // 2) 落宿主桶（**平铺键**，与插件自己 save_plugin_config 写的完全同一位置）
+    // 2) 落宿主桶（**平铺键**）。s16 更正：这句原先写「与插件自己 save_plugin_config 写的
+    //    完全同一位置」= 错的，实测证伪（_tmp/s16/probe_bucket_key.cjs 逐字复刻两侧函数，
+    //    同一份 preferences 桩跑出 keys = breeze-ohos 与 local-JmComic-v0.0.7 两枚并存）。
+    //    真实情况 = preferences(plugin_config) 里并存两枚互不可见的桶键：插件自己
+    //    save_plugin_config 走 runtime 名桶（util/BreezeHost.ets:479 取 args[0]，runtime 名恒为
+    //    breeze_qjs_ohos/src/engine.rs:200 的 breeze-ohos，ENGINE 是 :82 OnceLock 单例），
+    //    而这里读写的是 uuid 桶 ⇒ 双向坏：插件写的值设置页永远显示回包 fallback
+    //    （mergeValues :316 读不到 runtime 桶），设置页改的值插件下次 load_plugin_config 也读不到
+    //    （只有 fnPath / onSettingChanged 在内存里生效，重启回旧值）。并桶修法与「runtime 名是否
+    //    拼 bundle 名」必须同批裁（后者破 .so 红线 + 存量登录态失效，待用户拍板）：
+    //    先并桶会把跨插件凭据残留放大到设置页。见 _tmp/s16/DEFERRED.md 第 3 项。
     if (field.persist) {
       try {
         const p: preferences.Preferences = await PluginSettings.prefs(context);
