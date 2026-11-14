@@ -313,10 +313,82 @@ export class ReaderDiag {
    * evictHeld 一档互为旁证）；修法生效后应恒为 0。
    */
   static pmDead: number = 0;
+  /**
+   * s25 纯探针批次（1）同页行高配对表：本轮新截图 shot4 推翻了旧主攻假设 —— 那条黑带宽高比
+   * 1851/1320 = 1.4023 与位图比 1807/1280 = 1.4117 只差 0.7%，且 1851px / 3.376 = 548.3vp 恰等于
+   * 实测 rowH，说明「黑段 = 一整行整幅」而不是「行盒比等比落高多出来的那 292vp 上下留边」。
+   * 而旧 rowH= 与 rowBox= 各是 last/max 两枚**独立**计数、很可能来自不同页，拿它们相减是跨页相减。
+   * 本表按页身份（pageSizeKey）把两侧存进同一格，只有同一页两侧都量到过才计 gap，并记 pairN 配对次数：
+   *   pairN = 0 = 一条都没配上（别读 gap=）；pairN > 0 且 gap= 持续为正且量级近一屏 = 行盒被撑高（e2 成立）；
+   *   pairN > 0 且 gap= 接近 0 = e2 排除，主攻转向位图内容侧（与 late= / edge= 联立）。
+   * gap= 只记正差（行盒理应 >= 组件高，负值不记）；取最大值幂等，抗 LazyForEach 重挂。
+   */
+  private static readonly rowPairH: Map<string, number> = new Map<string, number>();
+  private static readonly rowPairBox: Map<string, number> = new Map<string, number>();
+  /** 配对表的入表顺序（有界淘汰按它移最旧一批，口径同 sizeKeyOrder） */
+  private static readonly rowPairOrder: string[] = [];
+  /** 同页最大差（vp）与它所属页码。刻意只存 '#' 之后的页码：chapterId 里带用户浏览痕迹，不进诊断行。 */
+  static rowGapMax: number = 0;
+  static rowGapKey: string = '';
+  /**
+   * s27 判代 + 回归双用计数：本进程里 ReaderPageImage 自己的 TapLayer（下沉后的三列热区）收到过多少次点按。
+   * ① 判代：装机包没这个字段 = 包早于 s27，回传读数一律作废（既有判代铁律：看新字段在不在）。
+   * ② 回归：热区从行盒挪进图片容器后点按必须照样生效 —— 用户明确点过画面而 tap= 仍 0 = 新热区没接住事件。
+   */
+  static tapHits: number = 0;
+  /** 配对成功次数（同页两侧都量到才算一次）：gap= 的可信度分母，0 时 gap= 无意义 */
+  static rowPairCount: number = 0;
+  /** s25 纯探针批次（2）阅读区视口实测宽高（vp），来自页面根 Stack 的 onAreaChange */
+  static viewportW: number = 0;
+  static viewportH: number = 0;
+
+  /**
+   * 把一次实测高写进「这一页」的那一侧（isRow=true 组件侧 / false 行盒侧），两侧齐了就更新 gap。
+   * 空 pageKey 直接忽略（父组件没传 pageNo 的调用点属「没有这一页」，不是「高为 0」）。
+   * 有界纪律与 rememberPageRatio 同款：表是进程级的，必须有容量上限。
+   */
+  private static pairRow(pageKey: string, h: number, isRow: boolean): void {
+    if (pageKey.length === 0) {
+      return;
+    }
+    if (!ReaderDiag.rowPairH.has(pageKey) && !ReaderDiag.rowPairBox.has(pageKey)) {
+      while (ReaderDiag.rowPairOrder.length >= ReaderDiag.SIZE_KEY_MAX) {
+        for (let i = 0; i < ReaderDiag.SIZE_KEY_EVICT && ReaderDiag.rowPairOrder.length > 0; i++) {
+          const oldest: string = ReaderDiag.rowPairOrder.shift() ?? '';
+          if (oldest.length > 0) {
+            ReaderDiag.rowPairH.delete(oldest);
+            ReaderDiag.rowPairBox.delete(oldest);
+          }
+        }
+      }
+      ReaderDiag.rowPairOrder.push(pageKey);
+    }
+    if (isRow) {
+      ReaderDiag.rowPairH.set(pageKey, h);
+    } else {
+      ReaderDiag.rowPairBox.set(pageKey, h);
+    }
+    const hv: number | undefined = ReaderDiag.rowPairH.get(pageKey);
+    const bv: number | undefined = ReaderDiag.rowPairBox.get(pageKey);
+    if (hv === undefined || bv === undefined || !(hv > 0) || !(bv > 0)) {
+      return;
+    }
+    ReaderDiag.rowPairCount++;
+    const gap: number = bv - hv;
+    if (gap > ReaderDiag.rowGapMax) {
+      ReaderDiag.rowGapMax = gap;
+      const at: number = pageKey.lastIndexOf('#');
+      ReaderDiag.rowGapKey = at >= 0 ? pageKey.substring(at + 1) : '';
+    }
+  }
 
 
-  /** 记一笔行实测落高（h 非法或为 0 直接忽略：首帧 onAreaChange 可能给 0）。vertical=false 只更新 last。 */
-  static noteRowH(h: number, vertical: boolean): void {
+
+  /**
+   * 记一笔行实测落高（h 非法或为 0 直接忽略：首帧 onAreaChange 可能给 0）。vertical=false 只更新 last。
+   * s25 追加 pageKey 形参：last/max 是两枚独立计数，跨页相减不成立，同页比较走 pairRow（见 rowGapMax）。
+   */
+  static noteRowH(h: number, vertical: boolean, pageKey: string): void {
     if (!(h > 0)) {
       return;
     }
@@ -324,10 +396,11 @@ export class ReaderDiag {
     if (vertical && h > ReaderDiag.rowHMax) {
       ReaderDiag.rowHMax = h;
     }
+    ReaderDiag.pairRow(pageKey, h, true);
   }
 
-  /** 记一笔纵向行盒实测高（与 noteRowH 同口径：非正数丢弃、max 幂等） */
-  static noteRowBox(h: number): void {
+  /** 记一笔纵向行盒实测高（与 noteRowH 同口径：非正数丢弃、max 幂等；pageKey 同上新增） */
+  static noteRowBox(h: number, pageKey: string): void {
     if (!(h > 0)) {
       return;
     }
@@ -335,6 +408,7 @@ export class ReaderDiag {
     if (h > ReaderDiag.rowBoxMax) {
       ReaderDiag.rowBoxMax = h;
     }
+    ReaderDiag.pairRow(pageKey, h, false);
   }
 
   /** s16 第 2 条（乙，按 lead 追加 C-乙 改按页记）：尺寸表条目上限（满了一批淘汰，仿 ImageCache 的有界 LRU） */
@@ -503,7 +577,16 @@ export class ReaderDiag {
       ' rowBox=' + ReaderDiag.rowBoxLast.toFixed(0) + '/' + ReaderDiag.rowBoxMax.toFixed(0) +
       // s21 黑区修法 dead= 屏上位图被 release 的指纹次数（ImageCache 侧对应 pin= 的 evictHeld 一档）：
       // 期望恒 0；大于 0 = 有行在展示期间位图被释放（修不干净就靠这条继续定位）。
-      ' dead=' + ReaderDiag.pmDead;
+      ' dead=' + ReaderDiag.pmDead +
+      // s25 纯探针 gap=@p页码 = 同一页「行盒实测高 - 组件实测高」历史最大与所属页码，pairN = 同页配对成功次数。
+      // 旧 rowH=/rowBox= 是两枚独立 last/max，跨页相减不成立（shot4 复盘发现的判据缺陷），同页比较只看这两档：
+      // pairN=0 时 gap= 无意义；pairN>0 且 gap 持续近一屏 = 行盒被撑高（e2）；pairN>0 且 gap≈0 = e2 排除，转位图内容侧。
+      // vw=/vh= 阅读区视口实测宽高，用来把上面这些 vp 数与截图 px 数对上，不再靠反推 density 回代自证。
+      ' gap=' + ReaderDiag.rowGapMax.toFixed(0) + '@p' + ReaderDiag.rowGapKey +
+      ' pairN=' + ReaderDiag.rowPairCount +
+      ' vw=' + ReaderDiag.viewportW.toFixed(0) + ' vh=' + ReaderDiag.viewportH.toFixed(0) +
+      // s27 判代 + 回归两用：tap= 下沉后热区收到的点按总数（无此字段 = 包早于 s27；点过画面却恒 0 = 热区搬完没接住事件）。
+      ' tap=' + ReaderDiag.tapHits;
   }
 
   /** 诊断面板用的一行文本（章） */
@@ -666,11 +749,20 @@ struct ReaderPageImage {
    * 手动重试信号（s16 第 2 条丁）：屏中热区落在「最后一次取图失败」的当前页时，父组件 tapCenter
    * 把「本页尺寸键加 @ 加 自增序号」推进 READER_RETRY_KEY；本组件只在信号前缀是自己尺寸键时清态重取。
    * 尾巴带序号 = 同一个键连点两次也是两个新值，否则第二次推送值不变、@Watch 不触发（点了没反应）。
-   * 刻意不在本组件内挂 onClick：行内最上层是 TapZonesBody（三个透明热区占满整行），
-   * 子组件的点按会被它整个吃掉，所以可见文案「点按重试」画在本组件、事件入口在父组件的热区。
+   * s27 改造：热区已从父组件的行盒下沉进本组件容器（见下面三枚回调属性与 TapLayer），
+   * 本组件仍刻意不自己挂 onClick —— 可见文案画在这里，事件入口统一只留 TapLayer 一处。
    * 键名与模块级 READER_RETRY_KEY 同串（装饰器入参本仓只用字面量，探针有断言核这两处一致）。
    */
   @StorageProp('readerRetryKey') @Watch('onRetrySignal') retrySignal: string = '';
+  // s27 黑区修法 R1：点按热区从父组件的行盒 Stack 下沉进本组件容器。
+  // 原先挂在行盒上时，那三列 .height('100%') 的透明热区把**行盒**撑大了 —— 行盒只有
+  // .width('100%') 没有确定高，height('100%') 取到的是 List 给 ListItem 的高度约束 = 可视高
+  // （真机 vh=844），于是每行都被撑成一整屏，行内 Image 走 Contain 就在上下各留一截阅读区
+  // 底色（= 用户报的黑区；真机同页配对读数 gap=676@p2、rowBox=844/vh=844）。
+  // 点按语义一字未动：三列仍分别回调父组件的 tapSide(false) / tapCenter() / tapSide(true)。
+  onTapPrev: () => void = () => {};
+  onTapCenter: () => void = () => {};
+  onTapNext: () => void = () => {};
   @State pm: image.PixelMap | undefined = undefined;
   @State failed: boolean = false;
   /**
@@ -709,6 +801,23 @@ struct ReaderPageImage {
         this.probedPm = next;
         ImageCache.probeShown(next);
       }
+      // s25 纯探针批次（3）+（4）：延迟一次复检（late=）并采上下边缘（edge=）。
+      // 排期条件是「换了另一张位图」而不是「重新挂载」—— 同一张重复复检没有新信息，还会把计数灌虚。
+      if (this.lateProbedPm !== next) {
+        this.lateProbedPm = next;
+        if (this.lateTimer >= 0) {
+          clearTimeout(this.lateTimer);
+        }
+        this.lateTimer = setTimeout((): void => {
+          this.lateTimer = -1;
+          const pmNow: image.PixelMap | undefined = this.held;
+          if (pmNow === undefined) {
+            return;
+          }
+          ImageCache.probeShownLate(pmNow);
+          ImageCache.probeEdges(pmNow);
+        }, ReaderPageImage.LATE_PROBE_MS);
+      }
     } else {
       this.held = undefined;
     }
@@ -727,6 +836,11 @@ struct ReaderPageImage {
     if (this.retryTimer >= 0) {
       clearTimeout(this.retryTimer);
       this.retryTimer = -1;
+    }
+    // s25：延迟复检同理必须在节点销毁前取消（回调里读 this.held，销毁后再跑属未定义行为）
+    if (this.lateTimer >= 0) {
+      clearTimeout(this.lateTimer);
+      this.lateTimer = -1;
     }
     // s21 黑区修法：节点销毁 = 这一行不再上屏，归还持有（否则 pinLive 只涨不落）
     this.setShown(undefined);
@@ -790,7 +904,15 @@ struct ReaderPageImage {
   private autoRetried: boolean = false;
   /** 自动补发的延迟计时器；-1 = 空闲 */
   private retryTimer: number = -1;
-
+  /**
+   * s25 纯探针批次（3）：挂载后延迟复检的计时器与已复检过的那张位图（每实例每张一次）。
+   * 复检只走 ImageCache.probeShownLate / probeEdges，不改任何渲染输入。
+   */
+  private lateTimer: number = -1;
+  /** 已排过延迟复检的那张位图；换图才重新排一次（同图重挂不重复排期） */
+  private lateProbedPm: image.PixelMap | undefined = undefined;
+  /** 延迟复检的等待时长（ms）：短到能在「慢滑看到黑洞」之前拿到读数，长到越过解码与挂载那一帧 */
+  private static readonly LATE_PROBE_MS: number = 700;
   /**
    * 纵向档行高口径（s16 第 2 条改写；装机判据 = 屏上任何「没取到位图的格子」高度不超过 1/4 屏）。
    * 只有两种口径，没有第三种：
@@ -1098,12 +1220,14 @@ struct ReaderPageImage {
         Stack({ alignContent: Alignment.Center }) {
           this.Body()
           this.PageBadge()
+          // s27：热区在下沉后的本组件内，量的是本容器的确定高，不再是行盒
+          this.TapLayer()
         }
         .width('100%')
         .aspectRatio(this.aspect())
         .onAreaChange((_o: Area, n: Area) => {
           // s17 A1（纯度量，不参与布局）：把这一行的实测落高记进诊断
-          ReaderDiag.noteRowH(Number(n.height), true);
+          ReaderDiag.noteRowH(Number(n.height), true, this.sizeKey());
         })
       } else {
         // 甲 窄骨架行（尺寸未知 = 位图没到且这一页没登记过尺寸）：固定窄高，**不走 aspectRatio**。
@@ -1113,12 +1237,14 @@ struct ReaderPageImage {
         Stack({ alignContent: Alignment.Center }) {
           this.Body()
           this.PageBadge()
+          // s27：热区在下沉后的本组件内，量的是本容器的确定高，不再是行盒
+          this.TapLayer()
         }
         .width('100%')
         .height(this.skeletonHeight())
         .onAreaChange((_o: Area, n: Area) => {
           // s17 A1（纯度量，不参与布局）：把这一行的实测落高记进诊断
-          ReaderDiag.noteRowH(Number(n.height), true);
+          ReaderDiag.noteRowH(Number(n.height), true, this.sizeKey());
         })
       }
     } else {
@@ -1126,12 +1252,14 @@ struct ReaderPageImage {
       Stack({ alignContent: Alignment.Center }) {
         this.Body()
         this.PageBadge()
+        // s27：横向档同样进容器（外层 Stack 本就有 height('100%')，行为与画面均不变）
+        this.TapLayer()
       }
       .width('100%')
       .height('100%')
       .onAreaChange((_o: Area, n: Area) => {
         // s17 A1（纯度量，不参与布局）：把这一行的实测落高记进诊断
-        ReaderDiag.noteRowH(Number(n.height), false);
+        ReaderDiag.noteRowH(Number(n.height), false, this.sizeKey());
       })
     }
   }
@@ -1149,8 +1277,8 @@ struct ReaderPageImage {
         .draggable(false)
     } else {
       // 没位图：浅色骨架块（加载中）或骨架块加「点按重试」文案（失败）。
-      // 「点按重试」的可见文案画在这里，事件入口在父组件的屏中热区（tapCenter）——
-      // 行内最上层是 TapZonesBody（三个透明热区占满整行），本组件挂的 onClick 轮不到。
+      // 「点按重试」的可见文案画在这里，事件入口 = 本组件自己的屏中热区（s27 下沉后的 TapLayer
+      // 中列，行为仍回到父组件 tapCenter）—— 一个组件内只保留一处热区，不再叠第二层。
       this.Skeleton()
     }
   }
@@ -1208,6 +1336,47 @@ struct ReaderPageImage {
         .position({ x: 8, y: 8 })
     }
   }
+  /**
+   * s27 黑区修法 R1：三列点按热区（左/中/右），由父组件原先挂在行盒上的那两枚 @Builder 逐字
+   * 变换而来 —— 只把 tapSide(false) / tapCenter() / tapSide(true) 换成下面三枚回调属性，列结构、
+   * layoutWeight(1)、height('100%')、Transparent、onClick 全部原样。唯一区别是**挂载位置**：这里的
+   * 外层容器有 aspectRatio 或显式 height 定出的确定高，height('100%') 只解析成本行自己的尺寸，
+   * 不再把行盒撑大。仍排在 Body 与 PageBadge 之后 = 命中层级与旧版逐列一致。
+   */
+  @Builder
+  TapLayer() {
+    Row() {
+      Column()
+        .layoutWeight(1)
+        .height('100%')
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          ReaderDiag.tapHits += 1; // s27 判代 + 回归双用
+          this.onTapPrev();
+        })
+
+      Column()
+        .layoutWeight(1)
+        .height('100%')
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          ReaderDiag.tapHits += 1; // s27 判代 + 回归双用
+          this.onTapCenter();
+        })
+
+      Column()
+        .layoutWeight(1)
+        .height('100%')
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          ReaderDiag.tapHits += 1; // s27 判代 + 回归双用
+          this.onTapNext();
+        })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
 }
 
 @Component
@@ -1705,44 +1874,6 @@ export struct ReaderView {
     this.chromeVisible = !this.chromeVisible;
   }
 
-  /** 左/中/右点按热区（横向档：放在每一页内，避免遮挡 Swiper 的左右滑动手势） */
-  @Builder
-  TapZones() {
-    this.TapZonesBody();
-  }
-
-  /** 热区本体，两档共用：语义随档位变（见 tapSide），横向左翻右翻、纵向左右前后滚、屏中显隐顶栏 */
-  @Builder
-  TapZonesBody() {
-    Row() {
-      Column()
-        .layoutWeight(1)
-        .height('100%')
-        .backgroundColor(Color.Transparent)
-        .onClick(() => {
-          this.tapSide(false);
-        })
-
-      Column()
-        .layoutWeight(1)
-        .height('100%')
-        .backgroundColor(Color.Transparent)
-        .onClick(() => {
-          this.tapCenter();
-        })
-
-      Column()
-        .layoutWeight(1)
-        .height('100%')
-        .backgroundColor(Color.Transparent)
-        .onClick(() => {
-          this.tapSide(true);
-        })
-    }
-    .width('100%')
-    .height('100%')
-  }
-
   /**
    * 纵向档阅读区：单列 List 连续滚动，从上向下读。
    * 形态要点（每条都是刻意的，改动前先读注释）：
@@ -1767,9 +1898,14 @@ export struct ReaderView {
     List({ space: 0, scroller: this.webtoonScroller, initialIndex: this.webtoonStartIndex }) {
       LazyForEach(this.webtoonSource, (item: string, index: number) => {
         ListItem() {
-          // 热区必须挂在**行内**（与横向档同一套结构），不能整屏盖一层在 List 之上：
-          // ArkUI 的命中测试只沿「根到命中节点」这条链派发，List 是热区的兄弟而不是祖先时，
-          // 起于热区的拖动永远进不了 List 的滚动手势识别器 = 滚不动。
+          // 热区必须挂在**行内**，不能整屏盖一层在 List 之上：ArkUI 的命中测试只沿「根到命中节点」
+          // 这条链派发，List 是热区的兄弟而不是祖先时，起于热区的拖动永远进不了 List 的滚动手势
+          // 识别器 = 滚不动。s27 再往下一层（黑区真根因）：热区原先挂在这枚行盒 Stack 上，而它
+          // 只有 .width('100%') 没有确定高（ListItem 只约束宽）—— ArkUI 里 height('100%') 问的是
+          // 父级给的**高度约束**，List 给 ListItem 的高约束 = 列表可视高（真机 vh=844），于是热区把
+          // 每行撑成一整屏（真机 gap=676@p2、rowBox=844 与 vh=844 逐值相等），行内 Image 走 Contain
+          // 就在上下各留 (844 - 行高)/2 的阅读区底色 = 用户报的黑区。现在热区进 ReaderPageImage 内部：
+          // 那里的容器有 aspectRatio 或显式 height 定出的确定高，100% 只解析成本行自己的尺寸。
           Stack({ alignContent: Alignment.Center }) {
             ReaderPageImage({
               url: item,
@@ -1780,15 +1916,23 @@ export struct ReaderView {
               pageExt: this.extAt(index),
               viewportH: this.areaH,
               // s17：骨架铺满整行要用父宽复算行高（行高 = 宽 / 真比），与骨架高同源
-              viewportW: this.areaW
-            })
-            this.TapZonesBody()
-          }
+              viewportW: this.areaW,
+              // s27：热区下沉（原先这里是行内的行盒热区调用），三列行为照旧
+              onTapPrev: (): void => {
+                this.tapSide(false);
+              },
+              onTapCenter: (): void => {
+                this.tapCenter();
+              },
+              onTapNext: (): void => {
+                this.tapSide(true);
+              }
+            })          }
           .width('100%')
           // s17 A1（纯度量）：这枚 Stack 就是行盒本体（ListItem 只约束宽），它的高 = 这一行真占的高。
           // 与组件自报的 rowH 配对才能判 e2：单量组件会必然读到健康值。
           .onAreaChange((_o: Area, n: Area) => {
-            ReaderDiag.noteRowBox(Number(n.height));
+            ReaderDiag.noteRowBox(Number(n.height), pageSizeKey(this.currentChapterId, index + 1));
           })
         }
         .width('100%')
@@ -1926,10 +2070,18 @@ export struct ReaderView {
                   // 横向档高度语义不动（仍是 height 100% 一屏一页），这里只是把视口高透下去，
                   // 让「万一某页没到位图」时的骨架也按同一个 1/4 屏封顶，两档不会一个矮一个高
                   viewportH: this.areaH,
-                  viewportW: this.areaW
-                })
-                this.TapZones()
-              }
+                  viewportW: this.areaW,
+                  // s27：热区下沉（原先这里是屏级热区调用），三列行为照旧
+                  onTapPrev: (): void => {
+                    this.tapSide(false);
+                  },
+                  onTapCenter: (): void => {
+                    this.tapCenter();
+                  },
+                  onTapNext: (): void => {
+                    this.tapSide(true);
+                  }
+                })              }
               .width('100%')
               .height('100%')
             }, (item: string, index: number) => 'p' + index)
@@ -1964,6 +2116,9 @@ export struct ReaderView {
         if (w > 0 && h > 0 && (w !== this.areaW || h !== this.areaH)) {
           this.areaW = w;
           this.areaH = h;
+          // s25 纯探针批次（2）：诊断行直接给视口实测宽高，别再拿截图反推 density
+          ReaderDiag.viewportW = w;
+          ReaderDiag.viewportH = h;
           this.clampOffsets();
         }
       })

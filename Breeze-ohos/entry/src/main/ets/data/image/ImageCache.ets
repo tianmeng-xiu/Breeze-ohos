@@ -702,6 +702,26 @@ export class ImageCache {
   static pinLive: number = 0;
   static evictHeld: number = 0;
   static pmReleased: number = 0;
+  /**
+   * s25 纯探针批次（3）挂载后延迟复检 late= 四档（有/黑/取不到/已释放）：at= 只在 setShown 那一刻
+   * 探一次，而本批要分辨的两个候选形态恰好都在那一刻之后才发生 —— 「位图挂载后才被 release」与
+   * 「挂载时采样健康、渲染时已失效」。故消费侧延迟 LATE_PROBE_MS 再探一次，并先用 isReleased()
+   * 直读单独分一档（lateReleased 大于 0 = 复检时位图已释放，这是 at= 与 dead= 双双看不见的状态）。
+   * 期望：late 的第一档占绝对多数、lateReleased 恒 0；lateBlack 或 lateReleased 大于 0 = 位图生命周期方向。
+   */
+  static lateOk: number = 0;
+  static lateBlack: number = 0;
+  static lateUnknown: number = 0;
+  static lateReleased: number = 0;
+  /**
+   * s25 纯探针批次（4）上下边缘采样 edge= 四档（图内带黑边/仅上黑/仅下黑/取不到）：at= 只采中心区，
+   * 判不了「位图自带上下黑边」这一形态（shot4 那条黑带宽高比与位图比只差 0.7%，正是这一形态的指纹）。
+   * edgeFramed = 上下两条边带都近黑而中心有内容 = 黑来自图源/位图本身，与容器尺寸和布局无关。
+   */
+  static edgeFramed: number = 0;
+  static edgeTop: number = 0;
+  static edgeBottom: number = 0;
+  static edgeUnknown: number = 0;
   /** 中心区取样边长（像素）：16x16 足够判「整幅是不是黑的」。 */
   private static readonly BLACK_SAMPLE: number = 16;
 
@@ -711,12 +731,30 @@ export class ImageCache {
    * 阈值 8 而不是 0：真黑页解码成 RGBA 后常见 0~2 的底噪，而漫画页中心区必然有笔画或上色。
    */
   private static async probeBlack(pm: image.PixelMap): Promise<number> {
+    // s25：0.5 档 = 中心区，y 算式与旧实现逐字等价（floor(h/2) - floor(side/2)），blk= 与 at= 语义不变。
+    return ImageCache.probeBand(pm, 0.5);
+  }
+
+  /**
+   * 按「竖向相对位置」取一条 16x16 采样带判近黑（1 = 黑 / 0 = 有内容 / -1 = 取不到样本）。
+   * yRatio 0.5 = 中心区（旧 probeBlack 的唯一档位）；0.02 与 0.98 用来采上下边缘 ——
+   * 上下都黑而中心不黑（edgeFramed）= 黑边画在位图里，任何布局侧改动都治不了它。
+   */
+  private static async probeBand(pm: image.PixelMap, yRatio: number): Promise<number> {
     try {
       const info: image.ImageInfo = pm.getImageInfoSync();
       const side: number = ImageCache.BLACK_SAMPLE;
       if (info.size.width < side || info.size.height < side) {
         ImageCache.lastProbeErr = 'small ' + info.size.width + 'x' + info.size.height;
         return -1;
+      }
+      let y: number = Math.floor(info.size.height * yRatio) - Math.floor(side / 2);
+      if (y < 0) {
+        y = 0;
+      }
+      const yMax: number = info.size.height - side;
+      if (y > yMax) {
+        y = yMax;
       }
       const stride: number = side * 4;
       const area: image.PositionArea = {
@@ -726,7 +764,7 @@ export class ImageCache {
         region: {
           size: { width: side, height: side },
           x: Math.floor(info.size.width / 2) - Math.floor(side / 2),
-          y: Math.floor(info.size.height / 2) - Math.floor(side / 2)
+          y: y
         }
       };
       await pm.readPixelsToArea(area);
@@ -749,6 +787,36 @@ export class ImageCache {
       ImageCache.lastProbeErr = errBrief(err as Object);
       return -1;
     }
+  }
+
+  /**
+   * 上下边缘 + 中心三条带各采一次（串行 await，三条一起才有「上下黑而中心不黑」这个组合判据）。
+   * 任一条取不到样本就整次记 unknown 并放弃：缺一条边带的结论不足以定形态，宁可少一次计数。
+   */
+  private static async probeEdgesOnce(pm: image.PixelMap): Promise<void> {
+    const top: number = await ImageCache.probeBand(pm, 0.02);
+    const bottom: number = await ImageCache.probeBand(pm, 0.98);
+    const center: number = await ImageCache.probeBand(pm, 0.5);
+    if (top === -1 || bottom === -1 || center === -1) {
+      ImageCache.edgeUnknown++;
+      return;
+    }
+    if (top === 1) {
+      ImageCache.edgeTop++;
+    }
+    if (bottom === 1) {
+      ImageCache.edgeBottom++;
+    }
+    if (top === 1 && bottom === 1 && center === 0) {
+      ImageCache.edgeFramed++;
+    }
+  }
+
+  /** s25 边缘采样入口（只记账、吞异常，不参与任何渲染判定）；去重与排期由消费侧负责。 */
+  static probeEdges(pm: image.PixelMap): void {
+    ImageCache.probeEdgesOnce(pm).catch((): void => {
+      ImageCache.edgeUnknown++;
+    });
   }
 
   /**
@@ -791,6 +859,9 @@ export class ImageCache {
       // s21 黑区修法：pin= 当前持有 / 因持有跳过 release / 真 release 三档（同时充当包代次标记）
       + ' pin=' + ImageCache.pinLive + '/' + ImageCache.evictHeld + '/' + ImageCache.pmReleased
       + ' at=' + ImageCache.showOk + '/' + ImageCache.showBlack + '/' + ImageCache.showUnknown
+      // s25 纯探针：late= 延迟复检四档（有/黑/取不到/已释放）、edge= 上下边缘四档（带黑边/仅上/仅下/取不到）
+      + ' late=' + ImageCache.lateOk + '/' + ImageCache.lateBlack + '/' + ImageCache.lateUnknown + '/' + ImageCache.lateReleased
+      + ' edge=' + ImageCache.edgeFramed + '/' + ImageCache.edgeTop + '/' + ImageCache.edgeBottom + '/' + ImageCache.edgeUnknown
       + PluginSourceAdapter.externHint();
   }
 
@@ -1263,6 +1334,34 @@ export class ImageCache {
       }
     }).catch((): void => {
       ImageCache.showUnknown++;
+    });
+  }
+
+  /**
+   * s25 纯探针批次（3）：延迟复检入口。先 isReleased() 直读（抛或真都算「复检时已释放」单独记一档，
+   * 不混进 lateUnknown），再走同一枚 probeBand 分三档。这张位图此刻可能已经不在屏上（行被回收），
+   * 所以本字段是「生命周期」证据不是「画面」证据 —— 与 17 号行 gap= 配合才定得了性。
+   */
+  static probeShownLate(pm: image.PixelMap): void {
+    try {
+      if (pm.isReleased()) {
+        ImageCache.lateReleased++;
+        return;
+      }
+    } catch (err) {
+      ImageCache.lateReleased++;
+      return;
+    }
+    ImageCache.probeBand(pm, 0.5).then((v: number): void => {
+      if (v === 1) {
+        ImageCache.lateBlack++;
+      } else if (v === -1) {
+        ImageCache.lateUnknown++;
+      } else {
+        ImageCache.lateOk++;
+      }
+    }).catch((): void => {
+      ImageCache.lateUnknown++;
     });
   }
 
