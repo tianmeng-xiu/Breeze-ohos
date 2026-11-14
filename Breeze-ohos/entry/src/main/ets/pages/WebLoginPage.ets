@@ -37,6 +37,7 @@ import { router } from '@kit.ArkUI';
 import { webview } from '@kit.ArkWeb';
 import { BreezeTopBar } from '../view/common/BreezeTopBar';
 import { Theme, Dim } from '../view/common/Theme';
+import { GlassStyle } from '../view/common/GlassStyle';
 import { bundleCall } from '../util/PluginRuntime';
 import { jstr, jbool, jparse, jobj, jhas, jisEmpty } from '../util/JsonUtil';
 import { WebLoginParams, readWebLoginParams } from '../data/source/WebLogin';
@@ -84,6 +85,8 @@ class CookieEnvelope {
 @Component
 struct WebLoginPage {
   @StorageProp('isDark') isDark: boolean = false;
+  /** 底部导航条避让（s17 第 4 条）：窗口 layout-full-screen ⇒ 底部操作区自己加，口径同 BreezeBottomTab。 */
+  @StorageProp('bottomSafeHeight') bottomSafe: number = 0;
   /** 顶栏标题（动作返回的 payload.title，缺省「网页登录」）。 */
   @State title: string = '网页登录';
   /** 状态机：working / done / limit / failed。参与 UI 判定 ⇒ 必须 @State（s11 真机踩过：读私有字段不重渲染）。 */
@@ -465,84 +468,126 @@ struct WebLoginPage {
         }
       })
 
-      // 状态行：四档各一色 + 主文案 + 已取枚数。全部读状态 ⇒ status 一变就重渲染
-      Row({ space: 8 }) {
-        Circle({ width: 8, height: 8 })
-          .fill(this.dotColor())
-        Text(this.statusText())
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Theme.text1(this.isDark))
-        Blank()
-        if (this.cookieCount > 0) {
-          Text(String(this.cookieCount) + ' 项 cookie')
+      // ---- 状态卡（s17 第 4 条）：原来是一条通栏裸行 + 下面一段裸文案，与底部卡片风格不统一。
+      // 现在收进一张卡：卡壳与全站卡片同一个令牌（Theme.cardColor + Dim.radius + Dim.pagePadding），
+      // 状态点四档色沿用 dotColor()（Theme.brand/success/warning/error），本页零新硬编码色值。 ----
+      Column() {
+        Row({ space: 8 }) {
+          Circle({ width: 8, height: 8 })
+            .fill(this.dotColor())
+          Text(this.statusText())
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.text1(this.isDark))
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.cookieCount > 0) {
+            // 枚数胶囊：右侧状态位。fillColor 是既有填充令牌（深色 #1AFFFFFF / 浅色 #0D182431），
+            // 两档都在卡片色上有足够对比，不新造色。文案只有枚数，永不含 cookie 名与值。
+            Text(String(this.cookieCount) + ' 项 cookie')
+              .fontSize(12)
+              .fontColor(Theme.text2(this.isDark))
+              .backgroundColor(Theme.fillColor(this.isDark))
+              .borderRadius(Dim.coverRadius)
+              .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+              .flexShrink(0)
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        // 副文案：插件原话 / 还缺哪几个键名 / 失败原因（键名是协议常量，值永不进这里）。
+        // 放宽到三行：缺键名那条（「还缺 ipb_member_id、ipb_pass_hash」）压两行会截掉尾巴。
+        if (this.detail.length > 0) {
+          Text(this.detail)
             .fontSize(12)
-            .fontColor(Theme.text3(this.isDark))
+            .fontColor(Theme.text2(this.isDark))
+            .lineHeight(18)
+            .maxLines(3)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .textAlign(TextAlign.Start)
+            .margin({ top: 6 })
         }
       }
       .width('100%')
-      .height(Dim.toolbarH)
-      .padding({ left: Dim.pagePadding, right: Dim.pagePadding })
-
-      // 副文案：插件原话 / 还缺哪几个键名 / 失败原因（键名是协议常量，值永不进这里）
-      Text(this.detail)
-        .fontSize(12)
-        .fontColor(Theme.text2(this.isDark))
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-        .padding({ left: Dim.pagePadding, right: Dim.pagePadding })
+      .alignItems(HorizontalAlign.Start)
+      .padding(12)
+      .backgroundColor(Theme.cardColor(this.isDark))
+      .borderRadius(Dim.radius)
+      .margin({ left: Dim.pagePadding, right: Dim.pagePadding, top: 8 })
 
       if (this.webSrc.length > 0) {
-        Web({ src: this.webSrc, controller: this.ctrl })
-          .width('100%')
-          .layoutWeight(1)
-          .javaScriptAccess(true)
-          .domStorageAccess(true)
-          .fileAccess(false)
-          .zoomAccess(true)
-          .verticalScrollBarAccess(true)
-          .onControllerAttached((): void => {
-            // 控制器挂上才取得到 cookie；挂上即摘一次（通常早于首个 onPageEnd）
-            this.attached = true;
-            this.collect(SRC_EVENT);
-          })
-          .onPageEnd((): void => {
-            this.collect(SRC_EVENT);
-          })
-          .onLoadIntercept((ev: OnLoadInterceptEvent): boolean => {
-            // 只借它当探测时机，**一律返回 false 不拦**：拦下任何请求都可能把登录跳转打断。
-            // 只认主框架 —— 子资源请求几十上百条，逐条做同步取 cookie 没意义
-            if (ev.data !== undefined && ev.data.isMainFrame()) {
+        // ---- 网页卡（用户明确允许圆角）----
+        // Web 本体不裁子树：只给 Web 自己设 borderRadius 不生效（页面内容仍按矩形画到角上），
+        // 必须外层容器 borderRadius + clip(true) 配套（仓内同法先例 7 处，如 SearchPage 工具区）。
+        // 外层底色给成卡片色：加载/回弹时露出的那层不是系统白，深色下不再是一块白洞。
+        Column() {
+          Web({ src: this.webSrc, controller: this.ctrl })
+            .width('100%')
+            .height('100%')
+            .javaScriptAccess(true)
+            .domStorageAccess(true)
+            .fileAccess(false)
+            .zoomAccess(true)
+            .verticalScrollBarAccess(true)
+            .backgroundColor(Theme.cardColor(this.isDark))
+            .onControllerAttached((): void => {
+              // 控制器挂上才取得到 cookie；挂上即摘一次（通常早于首个 onPageEnd）
+              this.attached = true;
               this.collect(SRC_EVENT);
-            }
-            return false;
-          })
-          .onErrorReceive((ev: OnErrorReceiveEvent): void => {
-            // 只认**主框架**失败 = 页面根本打不开。子资源失败（人机校验时很常见）刻意不报：
-            // 报出来会把还能用的页面说得像坏了，反而误导用户去点手动按钮（那时确实还没 cookie）
-            if (this.finished || this.status === ST_DONE) {
-              return;
-            }
-            if (ev.request === undefined || !ev.request.isMainFrame()) {
-              return;
-            }
-            this.status = ST_LIMIT;
-            this.detail = '页面没能加载出来（可能被拦截或需要人机验证）。可以直接重试，或返回用设置页的手动填写项。';
-          })
+            })
+            .onPageEnd((): void => {
+              this.collect(SRC_EVENT);
+            })
+            .onLoadIntercept((ev: OnLoadInterceptEvent): boolean => {
+              // 只借它当探测时机，**一律返回 false 不拦**：拦下任何请求都可能把登录跳转打断。
+              // 只认主框架 —— 子资源请求几十上百条，逐条做同步取 cookie 没意义
+              if (ev.data !== undefined && ev.data.isMainFrame()) {
+                this.collect(SRC_EVENT);
+              }
+              return false;
+            })
+            .onErrorReceive((ev: OnErrorReceiveEvent): void => {
+              // 只认**主框架**失败 = 页面根本打不开。子资源失败（人机校验时很常见）刻意不报：
+              // 报出来会把还能用的页面说得像坏了，反而误导用户去点手动按钮（那时确实还没 cookie）
+              if (this.finished || this.status === ST_DONE) {
+                return;
+              }
+              if (ev.request === undefined || !ev.request.isMainFrame()) {
+                return;
+              }
+              this.status = ST_LIMIT;
+              this.detail = '页面没能加载出来（可能被拦截或需要人机验证）。可以直接重试，或返回用设置页的手动填写项。';
+            })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .clip(true)
+        .borderRadius(Dim.radius)
+        .backgroundColor(Theme.cardColor(this.isDark))
+        .borderWidth(GlassStyle.strokeWidth())
+        .borderColor(GlassStyle.stroke(this.isDark))
+        .margin({ left: Dim.pagePadding, right: Dim.pagePadding, top: 10 })
       } else {
         // 没拿到地址（插件没回 openUrl 或参数在跳转中丢了）也要有话说：不白屏，且指向手动填写项。
         // 措辞只说「本次没拿到」不说「插件没有给出」：参数丢失是宿主侧的事，别把锅甩给插件（s16 第 3 条）
         Column() {
-          Text('本次没拿到登录地址，无法开启网页登录。可以返回设置页重试一次，或改用手动填写项。')
+          Text('本次没拿到登录地址，无法开启网页登录。可以返回设置页重试一次，或改用设置页的手动填写项。')
             .fontSize(14)
             .fontColor(Theme.text2(this.isDark))
+            .lineHeight(21)
             .textAlign(TextAlign.Center)
         }
         .width('100%')
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
-        .padding({ left: Dim.pagePadding, right: Dim.pagePadding })
+        .alignItems(HorizontalAlign.Center)
+        .padding({ left: Dim.pagePadding + 8, right: Dim.pagePadding + 8 })
+        .backgroundColor(Theme.fillColor(this.isDark))
+        .borderRadius(Dim.radius)
+        .margin({ left: Dim.pagePadding, right: Dim.pagePadding, top: 10 })
       }
 
       // 底部操作区。手动按钮 = 事件/节拍都没等到时的出口（用户明确说「已经登录完了」的那一刻）
@@ -562,15 +607,21 @@ struct WebLoginPage {
             this.detail = '正在从这个页面摘取 cookie…';
             this.collect(SRC_MANUAL);
           })
-        // 常驻兜底指引：**不随状态消失**（CF 盾过不了是这条链路唯一真实风险，不能让页面走进死路）
+        // 常驻兜底指引：**不随状态消失**（CF 盾过不了是这条链路唯一真实风险，不能让页面走进死路）。
+        // s17 第 4 条观感修正：原先是无底无框的通栏居中文本，折两行后左右参差像没排完；
+        // 现在装进填充底卡片 + 左对齐 + lineHeight，折行有固定的左边缘。
         Text('页面打不开或验证不通过？返回后用设置页的手动填写项同样可以登录。')
           .fontSize(12)
-          .fontColor(Theme.text3(this.isDark))
-          .textAlign(TextAlign.Center)
+          .fontColor(Theme.text2(this.isDark))
+          .lineHeight(18)
+          .textAlign(TextAlign.Start)
           .width('100%')
+          .padding(10)
+          .backgroundColor(Theme.fillColor(this.isDark))
+          .borderRadius(Dim.coverRadius)
       }
       .width('100%')
-      .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: 10, bottom: 12 })
+      .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: 10, bottom: 12 + this.bottomSafe })
     }
     .width('100%')
     .height('100%')

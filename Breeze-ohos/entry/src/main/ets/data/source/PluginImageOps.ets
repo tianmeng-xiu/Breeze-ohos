@@ -69,12 +69,12 @@ export class PluginImageOps implements PluginImageChannel {
     return ad;
   }
 
-  async fetch(sourceId: string, url: string): Promise<ArrayBuffer | null> {
+  async fetch(sourceId: string, url: string, ext: string): Promise<ArrayBuffer | null> {
     const ad: PluginSourceAdapter | null = this.adapterFor(sourceId);
     if (ad === null) {
       return null;
     }
-    return ad.fetchImageBytes(url);
+    return ad.fetchImageBytes(url, ext);
   }
 
   /** 读模式（不抛，缺省 auto）。 */

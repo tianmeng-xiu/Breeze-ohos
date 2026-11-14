@@ -23,10 +23,23 @@ export interface ChapterInfo {
   index: number;
 }
 
-/** 单页图片：index 从 0 开始，与阅读器页码一一对应。 */
+/**
+ * 单页图片：index 从 0 开始，与阅读器页码一一对应。
+ * ext（s17 第 5 条）= 插件页表里那一页的 extern 原样序列化串，无则空串。
+ * 为什么必须有：e-hentai 0.1.6 这类插件把**每一页的 url 都写成同一个哨兵地址**
+ *   https://<host>/_breeze/read-image（源码 me() = new URL('/_breeze/read-image', origin)），
+ *   真正的图页地址只在该页的 extern.href 里；插件取图函数第一优先读 a.extern.href，
+ *   读不到就抛「missing deferred image page href」且 0 次网络请求 = 真机整章「图片加载失败」。
+ *   上游是页对象整体透传（picture.dart:628 externPayload = {...extern} -> :633 args["extern"]），
+ *   宿主只搬 url 就把插件的取图入参丢了。两个后果都要靠这一位解决：
+ *   ① 取图入参（把它塞回 fetchImageBytes 的 extern 键）；
+ *   ② 缓存与失败表的可分性（同章各页 url 逐字节相同，只按 url 定键 = 第 2 页命中第 1 页的图）。
+ */
 export interface PageImage {
   index: number;
   url: string;
+  /** 该页 extern 的 JSON 串；空串 = 插件没给或本来就是空对象（调用方按「非空才透传」处理）。 */
+  ext: string;
 }
 
 /**

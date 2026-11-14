@@ -30,7 +30,7 @@ import { Logger } from '../../util/Logger';
 import { HttpClient } from '../net/HttpClient';
 import { BytesChannels } from './BytesChannel';
 import { deobfuscatePixelMap, isGifBytes } from './JmDeobfuscate';
-import { PLUGIN_SOURCE_PREFIX } from '../source/PluginSourceAdapter';
+import { PLUGIN_SOURCE_PREFIX, PluginSourceAdapter } from '../source/PluginSourceAdapter';
 
 /** 内存缓存条目上限。 */
 const MAX_MEM: number = 64;
@@ -349,7 +349,9 @@ export class ImageCache {
    * 仅供参考展示，调用方不要 release（否则其它页面复用同一对象会白屏）。
    */
   async load(url: string): Promise<image.PixelMap> {
-    return this.loadPage(url, '', '');
+    // 封面/头像/缩略图这条路没有页表，也就没有 extern：空串 = 「本页没有页面上下文」，
+    // 与插件图源里 ext 为空是同一含义；缓存键按「非空才拼」的口径保持与改造前逐字节相同。
+    return this.loadPage(url, '', '', '');
   }
 
   /**
@@ -358,8 +360,14 @@ export class ImageCache {
    * 缓存口径（重要）：**磁盘存的永远是原始字节**，反混淆每次解码后重做（检测开销 ~1e5 次减法，
    * 相对解码可忽略），因此手动开关 auto/on/off 改完立即生效，不会被旧缓存钉住；
    * 内存/磁盘键都带意图后缀 ⇒ 同 URL 的「原图 / 已重排」不会互相污染。
+   *
+   * ext（s17 第 5 条）= 该页在插件页表里的 extern JSON 串（PageImage.ext），没有传空串。两个用途：
+   *   ① 原样透传给 fetchImageBytes —— e-hentai 这类插件整章每页 url 都是同一个哨兵地址
+   *     （https://<host>/_breeze/read-image），真图页地址只在 extern.href 里；丢了它插件必抛
+   *     「missing deferred image page href」且 0 次网络请求 = 真机整章「图片加载失败」。
+   *   ② 参与缓存键（见 pageKey）：这类图源整章 url 逐字节相同，不按页分开 = 第 2 页命中第 1 页的图。
    */
-  async loadPage(url: string, sourceId: string, chapterId: string): Promise<image.PixelMap> {
+  async loadPage(url: string, sourceId: string, chapterId: string, ext: string): Promise<image.PixelMap> {
     if (url === null || url === undefined || url.length === 0) {
       throw new Error('图片地址为空');
     }
@@ -395,7 +403,9 @@ export class ImageCache {
       // 「长度大于 0 而 deobf 两档都不涨」才是真问题（s14 回传 deobf=0/0 正卡在这两者之间）。
       ImageCache.lastPageIntentLen = intent.length;
     }
-    const key: string = isPlugin ? (url + '|p|' + intent) : url;
+    // 键式统一走 pageKey（与 loadSize 共用同一定义）：两把键必须逐字节相同，否则 sz= 那三档
+    // 预探命中与真取图命中永远对不上，第 2 条的判据就废了。
+    const key: string = this.pageKey(isPlugin, url, intent, ext);
 
     const hit: image.PixelMap | null = this.memGet(key, isPlugin);
     if (hit !== null) {
@@ -422,7 +432,7 @@ export class ImageCache {
       ImageCache.lastImageSource = sourceId;
       ImageCache.lastImageHost = hostOf(url);
       try {
-        const got: ArrayBuffer | null = await ch.fetch(sourceId, url);
+        const got: ArrayBuffer | null = await ch.fetch(sourceId, url, ext);
         if (got !== null) {
           buf = got;
           fromPlugin = true;
@@ -744,7 +754,10 @@ export class ImageCache {
       + (ImageCache.lastPageIntentLen > 0 ? ' pil=' + ImageCache.lastPageIntentLen : '')
       + (ImageCache.lastProbeErr.length > 0 ? ' pkb=' + ImageCache.lastProbeErr : '')
       // s16 第 2 条：sz= 命中/读到字节/调用 三档（只在 16 号行内读，别和 17 号行的 hit= 混义）
-      + ' sz=' + ImageCache.sizeProbeHits + '/' + ImageCache.sizeProbeDisk + '/' + ImageCache.sizeProbeCalls;
+      + ' sz=' + ImageCache.sizeProbeHits + '/' + ImageCache.sizeProbeDisk + '/' + ImageCache.sizeProbeCalls
+      // s17 第 5 条：extMiss = 地址是插件取图哨兵而手里没有 extern（页表那一位在链路上被丢了）；
+      // extBad = 页表带了 extern 但 JSON.parse 不动。两档都为 0 才是健康形态（无异常时返回空串）。
+      + PluginSourceAdapter.externHint();
   }
 
   /** 恒等式自查（离线桩与诊断面板都可用）：五档互斥出口相加必须等于调用总数。 */
@@ -784,7 +797,7 @@ export class ImageCache {
    * 代价（有意接受）：同一份磁盘字节会被读两次（本方法一次、随后 loadPage 一次）。页图几百 KB 的顺序
    * 读是毫秒级，换来首帧行高就正确；不做字节常驻 —— 缓存一页 ArrayBuffer 等于偷偷改大 LRU 内存口径。
    */
-  async loadSize(url: string, sourceId: string, chapterId: string): Promise<number> {
+  async loadSize(url: string, sourceId: string, chapterId: string, ext: string): Promise<number> {
     try {
       if (url === null || url === undefined || url.length === 0) {
         return 0;
@@ -803,7 +816,8 @@ export class ImageCache {
           intent = '';
         }
       }
-      const key: string = isPlugin ? (url + '|p|' + intent) : url;
+      // 与 loadPage 同一条 pageKey（见那边注释）：两把键不一致 = 预探永远探不到真取图要用的那份文件。
+      const key: string = this.pageKey(isPlugin, url, intent, ext);
       const name: string = await this.hashName(key);
       const path: string = this.cacheRoot + '/' + name + DISK_EXT;
       // readFile 自带 pathExists 闸门（accessSync 取返回值那条口径），目录被系统回收时返 null 而不抛。
@@ -1332,6 +1346,25 @@ export class ImageCache {
     } catch (err) {
       Logger.w('删除缓存文件失败：' + path);
     }
+  }
+
+  // ------------------------------------------------------------ 缓存键
+
+  /**
+   * 页图缓存键（loadPage 与 loadSize 共用，s17 第 5 条）。三条设计约束：
+   * ① **非插件支路与「插件但没 extern」支路的键式与改造前逐字节相同**（'|x|' 段只在 ext 非空时才拼）。
+   *    理由：这两类占本机九个插件载荷里的八个，无条件拼接会让它们真机上的存量磁盘缓存整批失配
+   *    = 白白重下一整章；而哨兵 url 图源只有 eh 一家，它本来就必须换键。
+   * ② ext 原样拼、不做 encodeURIComponent 之类转义：ext 可达数百字节（href + 分块信息），转义只会更长；
+   *    键最终进 sha256 定文件名（hashName），长度不影响磁盘侧，内存侧上限 MAX_PAGE_MEM=24 条。
+   * ③ 不在这把键上做「同章各页去重」：哨兵 url 下整章 url 相同，靠 ext 天然分开 = 就是要分开，
+   *    共用一把键会让第 2 页显示第 1 页的图（这是本次修复的另一半动机）。
+   */
+  private pageKey(isPlugin: boolean, url: string, intent: string, ext: string): string {
+    if (!isPlugin) {
+      return url;
+    }
+    return url + '|p|' + intent + (ext.length > 0 ? '|x|' + ext : '');
   }
 
   // ------------------------------------------------------------ 文件名

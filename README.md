@@ -83,7 +83,7 @@ node scripts/hap_list.cjs <hap>    # 逐 entry 列大小与 sha256
 - 或开启开发者模式后自行签名（SDK 自带 `hap-sign-tool`），或用 `hdc` 直接安装未签名包：
 
 ```sh
-hdc file send Breeze-3.0.37-s11-cache-cloud-shelf-search-flat-release-unsigned.hap /data/local/tmp/
+hdc file send ./Breeze-3.0.37-*.hap /data/local/tmp/   # bash / zsh 由 shell 展开；PowerShell 自动展开不稳定，请直接写下载到的实际包名
 hdc shell bm install -p /data/local/tmp/
 ```
 

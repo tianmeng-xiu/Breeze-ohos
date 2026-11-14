@@ -302,6 +302,35 @@ pub fn install_host_bindings(
             },
         )?,
     )?;
+    // s19 插件配置分桶：允许 JS 侧按 bundle 身份覆盖 runtime 名。
+    // 上游 Breeze 是「每插件一 runtime」，宿主路由 handler 的 args[0] 天然就是插件名；
+    // 本 crate 只有全局唯一 runtime ⇒ 由 bundle 装载器造 scoped bridge 把插件名补进来，
+    // 否则所有插件的 auth.account / auth.password 落进同一枚桶互相串。
+    // 第三参省略或为空 ⇒ 与 __host_call / __host_call_start 逐字同行为。
+    let runtime_name_for_scoped_call = runtime_name.clone();
+    globals.set(
+        "__host_call_scoped",
+        Function::new(
+            ctx.clone(),
+            move |name: String, args_json: Option<String>, runtime_override: Option<String>| {
+                let runtime =
+                    runtime_override.filter(|v| !v.trim().is_empty()).unwrap_or_else(|| runtime_name_for_scoped_call.clone());
+                host_call(runtime, name, args_json)
+            },
+        )?,
+    )?;
+    let runtime_name_for_scoped_call_start = runtime_name.clone();
+    globals.set(
+        "__host_call_start_scoped",
+        Function::new(
+            ctx.clone(),
+            move |name: String, args_json: Option<String>, runtime_override: Option<String>| {
+                let runtime =
+                    runtime_override.filter(|v| !v.trim().is_empty()).unwrap_or_else(|| runtime_name_for_scoped_call_start.clone());
+                host_call_start(runtime, name, args_json)
+            },
+        )?,
+    )?;
     globals.set(
         "__host_call_route_mode",
         Function::new(ctx.clone(), move |name: String| {

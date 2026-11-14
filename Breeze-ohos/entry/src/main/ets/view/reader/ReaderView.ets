@@ -22,6 +22,16 @@
  *      1) List 的 scroller 走对象参数（本仓 DiscoverPage.ets:380 同形），不是位置参数；
  *      2) 页码一律用 onScrollIndex 的 center（次选 start），绝不用 onDidScroll 的每帧增量；
  *      3) 回章定位是「尽力而为」：跳 index 会前移一页兜高图，误差一页以内，见 resumeOnOpen。
+ * s17 口径（同一条黑区的第二段成因，s16 修完之后剩下的那一半）：s16 让「尺寸已知」的行从首次布局
+ *      就按真实比排高，于是多出一种中间态 —— 行高已经是整页真高、位图却还没解码，而骨架只画一枚
+ *      居中 120vp 的浅色块，剩下的整页高度全是裸底色 = 用户看到的那条黑区，长度 = 页宽 / 真实比
+ *      - 120，纯粹随各源真实比变化（pic 与 jm 黑区长短不同正是这个式子）。s17 = 「尺寸已知而位图未
+ *      到」的行，骨架必须铺满整行（只留固定细缝），行高与骨架高同源同一次求值，裸底色恒 <= 12vp。
+ * s18 口径（第 5 条 e-hentai 取图修复的宿主侧）：ImageCache 三个取图入口都多了一枚页级 ext
+ *      （插件页对象 extern 的 JSON 串），本页必须把 ext 一路带到 loadPage/loadSize，所以
+ *      loadPages 除了 url 还要存 pages[i].ext（pageExts 与 urls 同下标）；同时失败表与在途表
+ *      的键从 url 改成 pageSizeKey —— e-hentai 整章各页 url 逐字节相同（哨兵地址），按 url 记
+ *      会让一页失败摊成整章失败、一页在途摊成整章预取全废。
  * s16 第 2 条口径（竖向滚动「两图之间大片黑区」真机成因 = 未解码行按估算占位比撑出约 1.33 屏的
  *      纯黑容器，里面只有一枚 32vp 转圈；各源真实比不同，所以黑区长短随源变化）：
  *      甲 尺寸未知的未就绪行一律窄骨架固定高 SKELETON_H（再按 1/4 屏封顶），浅色圆角块加转圈，
@@ -261,6 +271,64 @@ export class ReaderDiag {
    */
   static sizeProbeHits: number = 0;
 
+  /**
+   * s17：本进程见过的「尺寸已知/未知而位图未到」那一行里，**裸底色高度**的最大值（vp）。
+   * 这是黑区的直接量纲：修好之前 = 整页真高减 120（真机页宽 377vp、竖页比 0.62 到 0.71 时是
+   * 412 到 488vp，约半屏）；修好之后恒等于骨架细缝常量 SKELETON_FILL_INSET（12vp）。
+   * 初值 -1 = 本进程从未渲染过占位行（真机读到 bare=-1 说明占位分支一次没走，不是「黑区=−1」）。
+   * 刻意取最大值而不是计数：计数会被重复渲染灌大（同一次挂载里 @State 每变一次就重跑一遍 build），
+   * 而「最大裸底色」是幂等的，天然抗重复，单值就能当验收判据。
+   */
+  static bareVoidMax: number = -1;
+
+  /**
+   * s17 追加 A1（lead 派工）：行**实测落高**的最近值与竖向档历史最大值（vp，onAreaChange 直接量）。
+   * 为什么还要再量一遍：bare= 量的是「我以为的行高减骨架高」，它吃的是 pendingRowH 的口径 ——
+   * 首帧父宽没落地（viewportW<=0）时它按窄骨架自算，量不到真实落位；行内热区那枚 height 100% 的
+   * Stack 若真把行撑到一屏（嫌疑 e2），bare= 也看不见。只有 onAreaChange 是 ArkUI 落位后的真数。
+   * rowHLast：最近一次上报（两档都记，指当前渲染的那一档）。
+   * rowHMax：只记竖向档的历史最大值（取大不取小 = 幂等，抗 LazyForEach 重复重挂与 @State 重复渲染；
+   *  横向档行高恒 = 视口高，记进去会让「rowHMax >= 视口高」这条判据永久打红，所以刻意排除）。
+   * 判据：竖向档下 rowHLast 应约等于 宽/真比（真比档）或 skeletonHeight()（窄骨架档）；
+   * 持续 >= 阅读区视口高 = 嫌疑 e2 成立（行高被热区撑到一屏）。rowHMax=0 = 本进程没渲染过竖向档。
+   */
+  static rowHLast: number = 0;
+  static rowHMax: number = 0;
+  /**
+   * 与 rowH 配对的**行盒**实测高（vp）： ListItem 内那枚热区 Stack 的实测高 = 真机上这一行真正占掉的高。
+   * 为什么两枚都要量（这是 A1 的关键补刀）：行内 ReaderPageImage 的根容器自带 aspectRatio 或显式 height，
+   * 它自己报的高**永远等于它请求的高**，就算兄弟那枚热区 Row 用 height 100% 把行盒撑到一屏，它也照样报
+   * 宽/真比 —— 只量组件会**必然读到健康值**，把 e2 遮成假 PASS。所以真正的判据是两条之差：
+   *   rowBox - rowH 持续 > 0（且差值接近一屏）= 行盒比组件请求的高 = e2 成立（热区把行撑高）；
+   *   rowBox == rowH（差一两条 vp 的取整）= 行高就是组件给的 = e2 排除。
+   * 配套告警：e2 若成立，bare= 仍会读到 12.00（骨架铺满的是组件，不是行），所以 bare= 单条**不能**证伪 e2。
+   * 取最大值同理幂等；初值 0 = 本进程没量过纵向行盒。
+   */
+  static rowBoxLast: number = 0;
+  static rowBoxMax: number = 0;
+
+  /** 记一笔行实测落高（h 非法或为 0 直接忽略：首帧 onAreaChange 可能给 0）。vertical=false 只更新 last。 */
+  static noteRowH(h: number, vertical: boolean): void {
+    if (!(h > 0)) {
+      return;
+    }
+    ReaderDiag.rowHLast = h;
+    if (vertical && h > ReaderDiag.rowHMax) {
+      ReaderDiag.rowHMax = h;
+    }
+  }
+
+  /** 记一笔纵向行盒实测高（与 noteRowH 同口径：非正数丢弃、max 幂等） */
+  static noteRowBox(h: number): void {
+    if (!(h > 0)) {
+      return;
+    }
+    ReaderDiag.rowBoxLast = h;
+    if (h > ReaderDiag.rowBoxMax) {
+      ReaderDiag.rowBoxMax = h;
+    }
+  }
+
   /** s16 第 2 条（乙，按 lead 追加 C-乙 改按页记）：尺寸表条目上限（满了一批淘汰，仿 ImageCache 的有界 LRU） */
   private static readonly SIZE_KEY_MAX: number = 1024;
   /** 一批淘汰的条数：按入表顺序移前 1/4，摊薄淘汰开销 */
@@ -311,67 +379,78 @@ export class ReaderDiag {
   /** 失败地址表容量上限：只用于「这一按该不该当重试」的判定，到量就不再新增，永不参与拦截 */
   private static readonly FAILED_MAX: number = 512;
   /**
-   * 最后一次取图失败的地址（s16 第 2 条丁）。刻意做成「提示表」而不是负缓存：
-   * 屏中热区要靠它区分「这一按是重试还是显隐顶栏」，某页成功一次就从表里摘掉，
+   * 最后一次取图**失败的那一页**（s16 第 2 条丁；s18 改按页定键）。刻意做成「提示表」
+   * 而不是负缓存：屏中热区要靠它区分「这一按是重试还是显隐顶栏」，某页成功一次就从表里摘掉，
    * 所以它不会拦住任何一次真实请求 —— 自动重试与手动重试都是直接再调 ImageCache.loadPage。
    * （ImageCache 侧的失败负缓存不属本文件写域；本文件也不自建，否则重试就发不出去了。）
+   *
+   * 键为什么从 url 换成 pageSizeKey（章节id 加 # 加 页码）：e-hentai 这类图源整章各页 url
+   * 逐字节相同（哨兵地址，真机实测），按 url 记会让「第 1 页失败」把整章一起判死 ——
+   * 用户看到的就是整章同时挂上「加载失败」且点哪一格都在重试第 1 页。页身份本来就带章节，
+   * 不会跨章串，也不依赖 extern 的具体内容（extern 换了同一页仍是同一格）。
+   * 表名沿用 failedUrls 不改名是刻意的：改名的收益只有可读性，代价是本文件与探针多处连锁，
+   * 语义已经由这段注释与三个形参名 pageKey 锁死。
    */
   private static readonly failedUrls: Set<string> = new Set<string>();
 
-  /** 记一笔取图失败（空串不记：那是「没有地址」，不是「取回失败」） */
-  static noteFailed(url: string): void {
-    if (url.length === 0 || ReaderDiag.failedUrls.has(url)) {
+  /** 记一笔取图失败（pageKey = pageSizeKey(章节id, 页码)；空串不记 = 「没有这一页」，不是「取回失败」） */
+  static noteFailed(pageKey: string): void {
+    if (pageKey.length === 0 || ReaderDiag.failedUrls.has(pageKey)) {
       return;
     }
     if (ReaderDiag.failedUrls.size >= ReaderDiag.FAILED_MAX) {
       return;
     }
-    ReaderDiag.failedUrls.add(url);
+    ReaderDiag.failedUrls.add(pageKey);
   }
 
   /** 该页成功过就摘掉：判据必须只反映「最后一次结果」，否则修好的页会被一直当成失败页 */
-  static noteOk(url: string): void {
-    if (url.length > 0) {
-      ReaderDiag.failedUrls.delete(url);
+  static noteOk(pageKey: string): void {
+    if (pageKey.length > 0) {
+      ReaderDiag.failedUrls.delete(pageKey);
     }
   }
 
-  /** 该地址最后一次取图是不是失败（父组件的屏中热区判定用） */
-  static isFailed(url: string): boolean {
-    return url.length > 0 && ReaderDiag.failedUrls.has(url);
+  /** 该页最后一次取图是不是失败（父组件的屏中热区判定用） */
+  static isFailed(pageKey: string): boolean {
+    return pageKey.length > 0 && ReaderDiag.failedUrls.has(pageKey);
   }
 
   /** 在途表容量上限：只当「这一条别再重复发」的判重器，到量就不再登记（宁可多发的退化，不是错） */
   private static readonly IN_FLIGHT_MAX: number = 256;
   /**
-   * 正在取（load 已发起、还没出结果）的地址。两个用途：
+   * 正在取（load 已发起、还没出结果）的**页**。两个用途：
    * ① 预取跳过它 —— 否则「行组件正在取 + 预取又取同一条」会真的发两遍，把 16 号行的 pageCalls
    *   打成对不上账的数（ImageCache 侧的在途去重是 cache-fix 那条并行改的事，这里不越界改它）；
    * ② 只在 load() 的 try 前后一登一摘，摘在成功/失败/空 url 三条出口之前，不会漏（见 load 的 finally）。
+   *
+   * 键与失败表同源改成 pageSizeKey（s18）：按 url 记在哨兵地址图源上是**反向**的坏 ——
+   * 整章共用一个 url，第 1 页在途会让预取把整章全部当成「已在取」而全部跳过，
+   * 于是那类图源永远预取不到任何一页（比判重失效更糟，是静默的预取全废）。
    */
   private static readonly inFlight: Set<string> = new Set<string>();
 
   /** 登记在途（超上限就不登记：判重器退化成「少判几次」，绝不因此漏发请求） */
-  static noteInFlight(url: string): void {
-    if (url.length === 0 || ReaderDiag.inFlight.has(url)) {
+  static noteInFlight(pageKey: string): void {
+    if (pageKey.length === 0 || ReaderDiag.inFlight.has(pageKey)) {
       return;
     }
     if (ReaderDiag.inFlight.size >= ReaderDiag.IN_FLIGHT_MAX) {
       return;
     }
-    ReaderDiag.inFlight.add(url);
+    ReaderDiag.inFlight.add(pageKey);
   }
 
   /** 摘掉在途标记（load 的 finally 必调） */
-  static noteNotInFlight(url: string): void {
-    if (url.length > 0) {
-      ReaderDiag.inFlight.delete(url);
+  static noteNotInFlight(pageKey: string): void {
+    if (pageKey.length > 0) {
+      ReaderDiag.inFlight.delete(pageKey);
     }
   }
 
-  /** 该地址此刻是否在途（预取判重用） */
-  static isInFlight(url: string): boolean {
-    return url.length > 0 && ReaderDiag.inFlight.has(url);
+  /** 该页此刻是否在途（预取判重用） */
+  static isInFlight(pageKey: string): boolean {
+    return pageKey.length > 0 && ReaderDiag.inFlight.has(pageKey);
   }
 
   /** 重试信号的自增尾巴：保证同一个键连点两次也是两个新值（同值不会触发 @Watch） */
@@ -401,7 +480,19 @@ export class ReaderDiag {
       // probe = 解码前就量到真比的行数（分母在 16 号行 sz= 里，这里只给分子，见字段注释）。
       ' peak=' + ReaderDiag.pendingPeak + ' retry=' + ReaderDiag.retryTotal +
       ' hit=' + ReaderDiag.sizeHits + ' pre=' + ReaderDiag.prefetchTotal +
-      ' probe=' + ReaderDiag.sizeProbeHits;
+      ' probe=' + ReaderDiag.sizeProbeHits +
+      // s17 新增 bare = 本进程见过的「占位行裸底色高度」最大值（vp）：黑区的直接量纲，
+      // 行高按各档真实口径取（纵向 = 宽/真比或窄骨架，横向 = 阅读区高）。
+      // 期望恒 = 2 x SKELETON_FILL_INSET = 12；-1 = 本进程没渲染过占位行；大于 12 = 黑区回归。
+      ' bare=' + fixed2(ReaderDiag.bareVoidMax) +
+      // s17 A1（度量）rowH = 最近一行实测落高 / 竖向档历史最大（vp）。bare= 两条盲区里的第一条由它补：
+      // 首帧父宽未落地时 bare= 用的是「它以为的行高」，rowH 是 ArkUI 落位后的真数；左右横向露底两者都量不到。
+      // 判据：竖向档应约 = 宽/真比（真比档）或 skeletonHeight()（窄骨架档）；持续 >= 阅读区视口高 = 嫌疑 e2 成立。
+      // max 只统计竖向档（横向档行高恒 = 视口高，记进去会永久打红）；0 = 本进程没渲染过竖向档。
+      ' rowH=' + ReaderDiag.rowHLast.toFixed(0) + '/' + ReaderDiag.rowHMax.toFixed(0) +
+      // s17 A1 配对位 rowBox = 纵向**行盒**实测高（rowH 是组件自报高）：两者之差才是 e2（热区撑高行）的判据，
+      // 因为组件自带 aspectRatio，它自报的高永远 == 它请求的高，单量它会把 e2 遮成假 PASS。e2 成立时 bare= 仍 12.00。
+      ' rowBox=' + ReaderDiag.rowBoxLast.toFixed(0) + '/' + ReaderDiag.rowBoxMax.toFixed(0);
   }
 
   /** 诊断面板用的一行文本（章） */
@@ -534,6 +625,13 @@ struct ReaderPageImage {
   /** 章节 id（JM 分块数按章节号推导，必须传）。 */
   @Prop chapterId: string = '';
   /**
+   * 本页的取图入参（s18 第 5 条 e-hentai 修复的下游）：插件页对象 extern 的 JSON 串，
+   * 无 extern 的插件与全部内置图源恒空串。必须由**页**带下来：e-hentai 这类图源整章
+   * 各页 url 逐字节相同（哨兵地址），真正区分一页的是这份 extern，丢了它 = 第 2 页命中
+   * 第 1 页的图。透传口径与 ImageCache.pageKey(:1363) 一致（空串就不参与键）。
+   */
+  @Prop pageExt: string = '';
+  /**
    * 页码（1 起，调用方传 index+1；<=0 = 不传则不渲染角标）。s15 第 4 条（甲）：占位态与失败态
    * 在左上角显示 P+页码，用户回传截图时我们能直接从图上读出「第几页、什么状态」，
    * 不必再靠猜。成功态不显示（图满了没处放，也没必要）。
@@ -545,6 +643,14 @@ struct ReaderPageImage {
    * 与 BUG6 那条「实测尺寸反哺自身布局」无冲突：这是父容器高喂子行高，行高变不回灌父高。
    */
   @Prop viewportH: number = 0;
+  /**
+   * 阅读区可视宽度（vp）：与 viewportH 同一处 onAreaChange 实测后传下来。s17 专用 ——
+   * 「尺寸已知而位图未到」的行要把骨架铺满整行，而那一行的高是 aspectRatio 从**父容器给的宽度**
+   * 推出来的，组件内部拿不到这个宽度（Stack 自身高度由 aspectRatio 反推，属被定义方）。
+   * 所以骨架高 = viewportW / 真实比，与 aspectRatio 落出的行高是同一个式子、同一次求值，
+   * 差值只剩下面那条固定细缝 —— 不需要组件自己量自己（BUG6 那条「实测反哺自身布局」的坑）。
+   */
+  @Prop viewportW: number = 0;
   /**
    * 手动重试信号（s16 第 2 条丁）：屏中热区落在「最后一次取图失败」的当前页时，父组件 tapCenter
    * 把「本页尺寸键加 @ 加 自增序号」推进 READER_RETRY_KEY；本组件只在信号前缀是自己尺寸键时清态重取。
@@ -619,8 +725,14 @@ struct ReaderPageImage {
    * 再按 viewportH/4 封顶，保证「未取到位图的格子」不超过 1/4 屏。
    */
   static readonly SKELETON_H: number = 168;
-  /** 骨架条本身的高（vp）：横向档一屏一行、纵向档已知真比的行都可能很高，骨架只画一条居中的浅色块 */
-  static readonly SKELETON_BLOCK_H: number = 120;
+  /**
+   * s17：骨架铺满整行时上下各留的细缝（vp，合计 = 本常量）。留缝的两个理由：
+   * ① 骨架带 1vp 描边，紧贴邻居时两条描边并成一条看不出页界；② 位图到达换成图片时
+   * 边界有一次极小的位移（6vp），不至于让人眼看到「块在动」。这条缝就是 bareVoidMax 的期望上限。
+   */
+  static readonly SKELETON_FILL_INSET: number = 6;
+  /** 骨架块的地板高（vp）：行高被算得极小（父宽未量到 + 极矮视口）时兜住可见性，不至于缩成一枚点 */
+  static readonly SKELETON_MIN_BLOCK_H: number = 56;
   /** 首次失败后自动补一次的基础延迟（ms） */
   private static readonly RETRY_DELAY_MS: number = 1200;
   /** 进程级最小间隔（ms）：整章同时失败时（真机 pfail=27 那种）别在同一帧打一轮重试请求 */
@@ -648,21 +760,21 @@ struct ReaderPageImage {
    */
   private aspect(): number {
     if (this.pm === undefined) {
-      // 第一优先 = 解码探针量到的真比（load() 里 probeSize() 写进来的）。
-      // 它的意义是「位图还没解码、行高已经是对的」：磁盘已命中的页首次布局就是真高，
-      // 不再从 168 长到真实比 = lead 追加 D2 要治的那个「行高从窄骨架猛涨到 1.4 屏」的跳动。
-      // 刻意不计 sizeHits：那枚统计的是「重挂时命中此前登记过的尺寸」，与探针命中是两件事，
-      // 混在一起会让 17 号行 hit= 失去意义（探针命中另有 probe=命中/发起 一档）。
-      if (this.preRatio > 0) {
-        ReaderDiag.lastShownRatio = 'probe ' + fixed2(this.preRatio);
-        return this.preRatio;
-      }
-      const known: number = ReaderDiag.pageRatio(this.sizeKey());
-      if (known > 0) {
-        // 乙 命中：这一页以前解出来或量到过（LazyForEach 回收重挂、切档重建、翻回上一页），按真比排行
-        ReaderDiag.sizeHits += 1;
-        ReaderDiag.lastShownRatio = 'size-key ' + fixed2(known);
-        return known;
+      // 真比来源只有 knownRatio() 这一处定义（s17 收口）：探针优先、尺寸表其次。
+      // 行高（本方法）与骨架高（pendingRowH 走同一枚）因此**结构上不可能**各拿一套来源 ——
+      // 两处各自枚举来源迟早会因一次改动错位一次，错位的现场正是 s17 那条黑区。
+      // 档位标签仍分两档打：探针命中刻意不计 sizeHits（那枚统计的是「重挂时命中此前登记过的尺寸」，
+      // 与探针命中混在一起会让 17 号行 hit= 失去意义，探针命中另有 probe= 一档）。
+      const r: number = this.knownRatio();
+      if (r > 0) {
+        if (this.preRatio > 0) {
+          ReaderDiag.lastShownRatio = 'probe ' + fixed2(r);
+        } else {
+          // 乙 命中：这一页以前解出来或量到过（LazyForEach 回收重挂、切档重建、翻回上一页），按真比排行
+          ReaderDiag.sizeHits += 1;
+          ReaderDiag.lastShownRatio = 'size-key ' + fixed2(r);
+        }
+        return r;
       }
       ReaderDiag.lastShownRatio = 'skeleton';
       return 0;
@@ -714,10 +826,72 @@ struct ReaderPageImage {
     if (this.failed) {
       return false;
     }
+    return this.knownRatio() > 0;
+  }
+
+  /**
+   * 本行**位图未到手时**能用的真实宽高比（s17 收口：行高与骨架高唯一共用的来源）。
+   * 两条来源按优先级：① 解码探针量到的 preRatio（本行本次挂载量到的）；② 进程级尺寸表里
+   * 这一页（尺寸键 = 章节id 加 # 加 页码）以前量到过的值。都没有则返回 0 = 尺寸未知。
+   * 刻意纯读、不计数、不改状态：aspect()（排行高）、ratioKnown()（选分支）、
+   * pendingRowH()（排骨架高）三处都要问它，任何一处计数就会把 hit= 打成渲染次数。
+   */
+  private knownRatio(): number {
     if (this.preRatio > 0) {
-      return true;
+      return this.preRatio;
     }
-    return ReaderDiag.pageRatio(this.sizeKey()) > 0;
+    return ReaderDiag.pageRatio(this.sizeKey());
+  }
+
+  /**
+   * 占位态（位图未到）这一行的行高（s17）：必须与 build 的两个分支逐一对齐，
+   * 因为骨架高要从它减出来 —— 两者不同源就必然留出裸底色，那正是黑区。
+   * 真比档 = 容器宽 / 真实比（build 走 .width('100%') 加 .aspectRatio(真比)，
+   * 而 aspectRatio 的落高 = 父给的宽 / 比例，父宽就是父组件 onAreaChange 实测的 areaW，
+   * 所以这里用 viewportW / 真比 复算同一个数；父宽还没量到（viewportW<=0）时退回窄骨架，
+   * 宁可得矮一点也不会留出裸底色（骨架高随后取小，不会超过行高）。
+   * 失败行永远窄骨架高（丁 的「失败行不得占一屏」判据优先于本条）。
+   * 调用面（探针有一条静态断言核它，注释与代码背离正是 s16 那轮抓出的缺陷形态）：本方法只在
+   * pm 未到手时被 skeletonBlockH 调用 —— 位图在手那一支画的是图片本身、没有骨架，
+   * 所以不必为 pm 情形定义「占位行高」。
+   */
+  private pendingRowH(): number {
+    if (!this.fitHeight) {
+      // 横向档 build 走 height('100%')，行高恒 = 阅读区高；量不到就退回窄骨架口径
+      return this.viewportH > 0 ? this.viewportH : this.skeletonHeight();
+    }
+    if (this.failed) {
+      return this.skeletonHeight();
+    }
+    const r: number = this.knownRatio();
+    if (r > 0 && this.viewportW > 0) {
+      return this.viewportW / r;
+    }
+    return this.skeletonHeight();
+  }
+
+  /**
+   * 骨架块的高（s17 核心）：铺满占位行的行高、只留上下各一条固定细缝。
+   * 旧口径恒 120vp 居中，于是「尺寸已知而位图未到」的行上下各留 (行高-120)/2 的裸底色 ——
+   * 真机竖页比 0.62 到 0.71 时那一整段是 412 到 488vp（约半屏）纯黑，且**长度只随各源真实比变**，
+   * 用户实测 pic 与 jm 黑区长短不同正是这个式子。位图到达换成图片时几何零变化 = 不跳。
+   * 顺带把 bareVoidMax 记进诊断（取最大值，幂等抗重复渲染）：真机读 bare= 就直接量到残余黑边，
+   * 期望恒等于 2 x SKELETON_FILL_INSET = 12vp，任何大于它的值 = 骨架没铺满 = 黑区回归。
+   */
+  private skeletonBlockH(): number {
+    const row: number = this.pendingRowH();
+    const want: number = row - ReaderPageImage.SKELETON_FILL_INSET * 2;
+    let h: number = want;
+    if (h < ReaderPageImage.SKELETON_MIN_BLOCK_H) {
+      // 地板也不能超过行高本身：横屏/分屏下窄骨架只有 viewportH/4（视口 400vp 时是 100vp），
+      // 盲目抬到地板会让骨架高出这一行、画到邻居身上。Stack 不裁子节点，越界就是叠字。
+      h = ReaderPageImage.SKELETON_MIN_BLOCK_H > row ? row : ReaderPageImage.SKELETON_MIN_BLOCK_H;
+    }
+    const bare: number = row > h ? row - h : 0;
+    if (bare > ReaderDiag.bareVoidMax) {
+      ReaderDiag.bareVoidMax = bare;
+    }
+    return h;
   }
 
   /** 窄骨架高：常量与「1/4 屏」取小；viewportH 还没量到时用常量本身（168vp 已小于真机 1/4 屏 203vp） */
@@ -793,7 +967,7 @@ struct ReaderPageImage {
     }
     const probeUrl: string = this.url;
     try {
-      const r: number = await ImageCache.getInstance().loadSize(probeUrl, this.sourceId, this.chapterId);
+      const r: number = await ImageCache.getInstance().loadSize(probeUrl, this.sourceId, this.chapterId, this.pageExt);
       if (!(r > 0)) {
         return;
       }
@@ -802,7 +976,9 @@ struct ReaderPageImage {
       // 于是本页之后任何一次重挂（回收、切档、翻回来）都能不走解码就按真比排行。
       // 登记走 rememberPageRatio 的首次为准语义，解码后 pm 再量一次同值也不会打架。
       ReaderDiag.rememberPageRatio(key, r);
-      if (this.url === probeUrl) {
+      // 晚到的探针只允许写回「同一页」：哨兵地址图源上整章 url 逐字节相同，光比 url 已经证明不了
+      // 这一行还是发探针时那一页（复用节点会 url 不变而 pageNo 变），所以页键也要一起核。
+      if (this.url === probeUrl && this.sizeKey() === key) {
         this.preRatio = r;
       }
     } catch (err) {
@@ -822,21 +998,24 @@ struct ReaderPageImage {
     // 若照旧在探针之后才登记，这段空隙里 prefetchAround 的 isInFlight 判重会看不见这一条，
     // 于是同一次翻页里预取会再发一条同样的 loadPage —— 正是预取注释里承诺要避免的重复请求。
     // 摘除仍在下面的 finally，三条出口（成功/失败/探针后早退）都不会漏。
-    ReaderDiag.noteInFlight(this.url);
+    // 两张表都按页身份定键（s18，理由见 failedUrls / inFlight 各自的注释块）：哨兵地址图源上
+    // 按 url 记会把一页的失败/在途摊到整章，是静默的连锁错。键就是尺寸键同一处定义。
+    const pk: string = this.sizeKey();
+    ReaderDiag.noteInFlight(pk);
     try {
       // 先量尺寸再取位图（顺序不能倒：倒了就是「首次布局按估高、解码完才跳」的旧链路）。
       // 探针自身把异常全吞了（见 probeSize 第 ④ 条闸门），放不进 catch 也不会把行判成取图失败。
       await this.probeSize();
       const map: image.PixelMap = await ImageCache.getInstance()
-        .loadPage(this.url, this.sourceId, this.chapterId);
+        .loadPage(this.url, this.sourceId, this.chapterId, this.pageExt);
       this.pm = map;
-      ReaderDiag.noteOk(this.url);
+      ReaderDiag.noteOk(pk);
       this.mark(ReaderDiag.K_SHOWN);
     } catch (err) {
       const e = err as BusinessError;
       console.error(`[Reader] decode failed: code=${e.code} msg=${e.message}`);
       this.failed = true;
-      ReaderDiag.noteFailed(this.url);
+      ReaderDiag.noteFailed(pk);
       this.mark(ReaderDiag.K_FAILED);
       // 丁 首次失败自动补一次（限频见 scheduleAutoRetry）：真机 pfail=27 里相当一部分是单帧并发把
       // 图源打爆的瞬时失败，用户什么都没做也只是慢，不该让他一格一格点
@@ -844,7 +1023,7 @@ struct ReaderPageImage {
     } finally {
       // 登记点在上面（探针之前），摘点放 finally：探针、取图、解码任一环节抛出都照样摘掉，
       // 不会留下永挂在途的地址把后续预取永久挡掉。空 url 那条早退在登记之前，本来就没登记过。
-      ReaderDiag.noteNotInFlight(this.url);
+      ReaderDiag.noteNotInFlight(pk);
     }
   }
 
@@ -872,6 +1051,10 @@ struct ReaderPageImage {
         }
         .width('100%')
         .aspectRatio(this.aspect())
+        .onAreaChange((_o: Area, n: Area) => {
+          // s17 A1（纯度量，不参与布局）：把这一行的实测落高记进诊断
+          ReaderDiag.noteRowH(Number(n.height), true);
+        })
       } else {
         // 甲 窄骨架行（尺寸未知 = 位图没到且这一页没登记过尺寸）：固定窄高，**不走 aspectRatio**。
         // 旧口径在这里也走 aspectRatio，值取「同章中位数或 0.75」，于是未解码行按约 1.33 屏排高，
@@ -883,6 +1066,10 @@ struct ReaderPageImage {
         }
         .width('100%')
         .height(this.skeletonHeight())
+        .onAreaChange((_o: Area, n: Area) => {
+          // s17 A1（纯度量，不参与布局）：把这一行的实测落高记进诊断
+          ReaderDiag.noteRowH(Number(n.height), true);
+        })
       }
     } else {
       // 横向档（现役语义不动）：一页一屏，图在屏内 Contain 居中；高度语义保持 height('100%')。
@@ -892,6 +1079,10 @@ struct ReaderPageImage {
       }
       .width('100%')
       .height('100%')
+      .onAreaChange((_o: Area, n: Area) => {
+        // s17 A1（纯度量，不参与布局）：把这一行的实测落高记进诊断
+        ReaderDiag.noteRowH(Number(n.height), false);
+      })
     }
   }
 
@@ -941,7 +1132,7 @@ struct ReaderPageImage {
       }
     }
     .width('92%')
-    .height(ReaderPageImage.SKELETON_BLOCK_H)
+    .height(this.skeletonBlockH())
     .borderRadius(Dim.radius)
     .backgroundColor(Theme.dCard)
     .border({ width: 1, color: Theme.dDivider, radius: Dim.radius })
@@ -983,6 +1174,13 @@ export struct ReaderView {
    */
   @StorageProp('readerScrollMode') @Watch('onScrollModeStorage') scrollMode: string = ReadScrollMode.PAGER;
   @State urls: string[] = [];
+  /**
+   * 与 urls **同下标**的取图入参表（s18 第 5 条）。刻意不做 @State：它不参与任何渲染判定，
+   * 只在 loadPage/loadSize 的调用点按下标取用（口径同那条「参与 UI 判定的忙闲态必须是 @State」——
+   * 反过来不参与渲染就不必挂装饰器）。与 urls 的唯一写入点是 loadPages 里那一次成对赋值，
+   * 换章节 = 两个数组一起换，不存在「urls 新、exts 旧」的中间态。
+   */
+  private pageExts: string[] = [];
   @State pageIndex: number = 0;
   @State chapterName: string = '';
   /** 实际打开的章节 id（用于落库进度；入参 chapterId 为空时取首章） */
@@ -1202,9 +1400,17 @@ export struct ReaderView {
    * ③ 结果整个吞掉：预取的产物只有「缓存里多了一条」这一个作用，成功不必提，失败也不许冒泡
    *   到界面（行自己的 load 会给出唯一的失败口径，两处上屏 = 用户看到两次报错）；
    * ④ 记 prefetchTotal（诊断 17 号行的 pre= 字段）：ImageCache 没有「只预取不计数」的入口，
-   *   loadPage 每次进来都在 :368 自增 pageCalls，所以 pre= 是把 16 号行 pageCalls 与真实
+   *   loadPage 每次进来都在入口自增 pageCalls，所以 pre= 是把 16 号行 pageCalls 与真实
    *   用户可见取图量对回去的唯一换算项。
    */
+  /** 第 index 页（0 起）的取图入参；越界或该图源没给 = 空串（ImageCache 空串不参与键） */
+  private extAt(index: number): string {
+    if (index < 0 || index >= this.pageExts.length) {
+      return '';
+    }
+    return this.pageExts[index];
+  }
+
   private prefetchAround(index: number): void {
     const n: number = this.urls.length;
     if (n === 0 || !ImageCache.getInstance().isReady()) {
@@ -1220,11 +1426,14 @@ export struct ReaderView {
     }
     for (let i = from; i <= to; i++) {
       const u: string = this.urls[i];
-      if (u.length === 0 || ReaderDiag.isInFlight(u)) {
+      // 判重按页身份（与行内 load 同一个键）：按 url 判在哨兵地址图源上会把整章当成一条在途，
+      // 预取整章静默全废。i + 1 = 页码（1 起），与行内 sizeKey() 的口径逐字一致。
+      const pk: string = pageSizeKey(this.currentChapterId, i + 1);
+      if (u.length === 0 || ReaderDiag.isInFlight(pk)) {
         continue;
       }
       ReaderDiag.prefetchTotal += 1;
-      ImageCache.getInstance().loadPage(u, this.sourceId, this.currentChapterId)
+      ImageCache.getInstance().loadPage(u, this.sourceId, this.currentChapterId, this.extAt(i))
         .then((): void => {})
         .catch((): void => {});
     }
@@ -1292,10 +1501,15 @@ export struct ReaderView {
       this.currentChapterId = target.id;
       const pages: PageImage[] = await src.fetchPages(target.id);
       const list: string[] = [];
+      // s18：extern 必须和 url 一起搬过来。上游插件把每页真正的取图入参放在页对象 extern 里
+      // （e-hentai 整章 url 相同，只有这份 extern 区分页），宿主原先只 push url = 第二处丢失点。
+      const exts: string[] = [];
       for (let i = 0; i < pages.length; i++) {
         list.push(pages[i].url);
+        exts.push(pages[i].ext);
       }
       this.urls = list;
+      this.pageExts = exts;
       // 换章节 = 换整个数据源实例（LazyForEach 不认「同实例换内容」，靠 @State urls 变化
       // 重跑 build，LazyForEach 重新按 key 取数）。页码同步归零，再按存档续读。
       this.webtoonSource = new WebtoonPageSource(list);
@@ -1422,8 +1636,16 @@ export struct ReaderView {
    */
   private tapCenter(): void {
     const idx: number = this.pageIndex;
-    if (idx >= 0 && idx < this.urls.length && ReaderDiag.isFailed(this.urls[idx])) {
-      ReaderDiag.pushRetry(pageSizeKey(this.currentChapterId, idx + 1));
+    // 与行内同一枚页键（失败表现在按页记，这里也按页问，两侧不会再因哨兵地址错开）。
+    // 顺序刻意是先判下标合法再问表：越界页码可能凑出一枚「历史失败过」的键，
+    // 那样一次无意义点按就会去推重试信号（虽然没人响应，但会把 retry 计数与顶栏语义带偏）。
+    if (idx < 0 || idx >= this.urls.length) {
+      this.chromeVisible = !this.chromeVisible;
+      return;
+    }
+    const pk: string = pageSizeKey(this.currentChapterId, idx + 1);
+    if (ReaderDiag.isFailed(pk)) {
+      ReaderDiag.pushRetry(pk);
       return;
     }
     this.chromeVisible = !this.chromeVisible;
@@ -1501,11 +1723,19 @@ export struct ReaderView {
               chapterId: this.currentChapterId,
               fitHeight: true,
               pageNo: index + 1,
-              viewportH: this.areaH
+              pageExt: this.extAt(index),
+              viewportH: this.areaH,
+              // s17：骨架铺满整行要用父宽复算行高（行高 = 宽 / 真比），与骨架高同源
+              viewportW: this.areaW
             })
             this.TapZonesBody()
           }
           .width('100%')
+          // s17 A1（纯度量）：这枚 Stack 就是行盒本体（ListItem 只约束宽），它的高 = 这一行真占的高。
+          // 与组件自报的 rowH 配对才能判 e2：单量组件会必然读到健康值。
+          .onAreaChange((_o: Area, n: Area) => {
+            ReaderDiag.noteRowBox(Number(n.height));
+          })
         }
         .width('100%')
       }, (item: string, index: number) => 'p' + index)
@@ -1638,9 +1868,11 @@ export struct ReaderView {
                   sourceId: this.sourceId,
                   chapterId: this.currentChapterId,
                   pageNo: index + 1,
+                  pageExt: this.extAt(index),
                   // 横向档高度语义不动（仍是 height 100% 一屏一页），这里只是把视口高透下去，
                   // 让「万一某页没到位图」时的骨架也按同一个 1/4 屏封顶，两档不会一个矮一个高
-                  viewportH: this.areaH
+                  viewportH: this.areaH,
+                  viewportW: this.areaW
                 })
                 this.TapZones()
               }

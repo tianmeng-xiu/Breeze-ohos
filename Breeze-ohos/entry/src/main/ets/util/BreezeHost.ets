@@ -32,6 +32,8 @@ export interface HostRegistrar {
 
 /** preferences 存储名（ABI §4-5：跨重启持久化用 preferences）。 */
 const PREF_NAME: string = 'plugin_config';
+/** s19 之前的历史共享桶名：scoped 通道上线前所有插件共用它（只读，供设置页一次性搬设置项）。 */
+const LEGACY_RUNTIME: string = 'breeze-ohos';
 /** bundleManager 取不到版本号时的兜底（与 AppScope/app.json5 一致）。 */
 const FALLBACK_VERSION: string = '3.0.37';
 /** ABI §2 的 5 个路由名（逐字对齐上游，一个都不能差）。 */
@@ -399,8 +401,11 @@ export class BreezeHost {
   /**
    * 诊断面板用短串：cfg=存/读次数 + runtimes=本进程见过的 runtime 桶名集合(次数) + keys=最近一次读到的桶内键数
    *            + 最近一次失败原因。能一眼区分「插件没调」与「宿主存失败」。
-   * s16 第 4 条取证：runtimes 只有 breeze-ohos 一枚 = 全部插件共用一个桶（跨插件账号互串的根因，
-   * 根治要改 Rust 把 bundle 名拼进 runtime 名 = 破 .so 红线，已报用户拍板）；出现多枚（形如 plugin_xxx）= 分桶已生效。
+   * s19 分桶已生效：runtime 名由 bundle 装载器按 bundle 名带下来（bundle 名 = 插件 uuid，形如
+   * local-JmComic-v0.0.7；见 breeze_qjs_ohos/vendored/playground/js/62_bridge.js 的 makeScoped 与
+   * src/host_runtime.rs 的 createBundleRuntimeView）。所以 runtimes= 出现多枚 local-* = 正常且正确；
+   * 只剩 breeze-ohos 一枚 = scoped 通道没接上，等于全部插件又共用一桶 = 真回归。
+   * breeze-ohos 仍是老用户存量桶（LEGACY_RUNTIME）：设置页只从它一次性搬非凭据设置项，凭据不搬。
    * 桶名本身非敏感（字面量 breeze-ohos），可上屏。
    */
   static configHint(): string {
@@ -411,7 +416,40 @@ export class BreezeHost {
     const tail: string = BreezeHost.cfgLastError.length > 0 ? (' err=' + BreezeHost.cfgLastError) : '';
     return 'cfg=' + BreezeHost.cfgSaveCalls + '/' + BreezeHost.cfgLoadCalls
       + ' runtimes=' + (names.length === 0 ? '-' : names.join(','))
-      + BreezeHost.cfgBucketInfo + tail;
+      + BreezeHost.cfgBucketInfo
+      // scoped= 一眼判分桶是否生效：on = 见过非 LEGACY_RUNTIME 的桶名（每插件一桶）
+      + ' scoped=' + (BreezeHost.scopedState() ? 'on' : 'off')
+      + tail;
+  }
+
+  /** s19 诊断：本进程是否见过 scoped 桶名（非 breeze-ohos）。 */
+  private static scopedState(): boolean {
+    let on = false;
+    BreezeHost.cfgRuntimes.forEach((v: number, k: string): void => {
+      if (k !== LEGACY_RUNTIME) {
+        on = true;
+      }
+    });
+    return on;
+  }
+
+  /**
+   * s19 一次性搬运用：读 scoped 之前的历史共享桶（LEGACY_RUNTIME）。同步取（设置页在 UI 线程
+   * 已经 await 过 prefs），桶缺失或形态非法一律返回空对象，不抛。
+   */
+  static legacyConfigBucket(context: common.Context): ESObject {
+    try {
+      const opt: preferences.Options = { name: PREF_NAME };
+      const p: preferences.Preferences = preferences.getPreferencesSync(context, opt);
+      const raw: string = String(p.getSync(LEGACY_RUNTIME, '{}'));
+      const obj: ESObject = JSON.parse(raw);
+      if (obj !== null && obj !== undefined && typeof obj === 'object' && !Array.isArray(obj)) {
+        return obj;
+      }
+    } catch (e) {
+      Logger.w('plugin_config 旧桶读取失败，按空桶处理');
+    }
+    return JSON.parse('{}');
   }
 
   /** preferences(plugin_config) 单例：getPreferences 只跑一次，并发共享 Promise。 */

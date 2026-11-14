@@ -16,8 +16,13 @@
  * 2) choice 用 TextPickerDialog（本 SDK 无 promptAction.showTextInput，实测零命中）；
  *    text/password 用页内自绘浮层输入（AlertDialog/showDialog 都不带输入框）。
  * 3) 删除插件必须先 bundleUnload 再删文件（否则删掉的是文件、内存里还能调用，下次启动才消失）。
- */
-import { promptAction, router } from '@kit.ArkUI';
+ *
+ * s17 第 2 条（用户原话「eh 插件网页登录后未显示账户，账号登录选项仍可以点进去」）：
+ *      登录卡那一行加「已登录」回显。判据只有一条 = 插件登录方案里**已保存的凭据条数**
+ *      （probeLoginState 的注释里写了为什么只有这一条可靠，以及为什么不能用 getSettingsBundle 的 values）。
+ *      硬口径：屏上只写形态（「已登录」「已保存 N 项登录凭据」），**绝不回显账号名 / 口令 / cookie 值**，
+ *      连字段键名都不上屏（键名是插件内部协议）。入口永不禁用：已登录也要能点进去换账号。 */
+import { PromptAction, promptAction, router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { BreezeTopBar } from '../view/common/BreezeTopBar';
 import { Theme, Dim } from '../view/common/Theme';
@@ -33,7 +38,13 @@ import {
   LogoutResult,
   LOGOUT_FN
 } from '../data/source/PluginSettings';
-import { PluginLoginParams } from '../data/source/PluginLogin';
+import {
+  PluginLogin,
+  PluginLoginParams,
+  LoginScheme,
+  LoginField,
+  LoginResult
+} from '../data/source/PluginLogin';
 import { WebLoginParams } from '../data/source/WebLogin';
 import { PluginStore, PluginRecord } from '../util/PluginStore';
 import { PluginSourceRegistry } from '../data/source/PluginSourceRegistry';
@@ -290,6 +301,109 @@ struct PluginUserInfoRow {
   }
 }
 
+/**
+ * s17 第 2 条：一次登录态探测的结果（只有三个数，任何键名与值都不经这里）。
+ *
+ * 为什么不拿「非空键数」直接当登录判据：eh 的装载函数 mY 会从 cookie 串里反解回填三键，
+ * 且 igneous 是插件跑动中自己会写进去的（取证 _tmp/s16/bundles/ehentai-v0.1.6.bundle.cjs
+ * @77450 的 h && (k.ipb_member_id = ...) 与 @1417581 的 fields），只拿到过一枚 igneous 的
+ * 设备会被判成「已登录」= 反向假阳性。所以另数一份**插件自己标了 required 的字段**：
+ * eh 只有 ipb_member_id / ipb_pass_hash 是 required:!0，igneous 没标 ⇒ 判据自动收紧到
+ * 「主凭据至少有一项」。个别插件一枚 required 都没标（实测 bf99008d-0.1.0 的
+ * fields:[{key:account,label:用户名},{key:password,label:密码}] 全无 required），
+ * 这种退回按 total 判，否则它永远显示不出登录态。
+ */
+class LoginProbeResult {
+  /** 非空且非核验类的字段数（只喂副文案的「已保存 N 项登录凭据」，不参与登录判定） */
+  total: number = 0;
+  /** 其中插件标了 required 的非空字段数（登录判据） */
+  required: number = 0;
+  /** 方案里 required 字段的总数；0 = 该插件没标过 required ⇒ 判据退回 total */
+  requiredDeclared: number = 0;
+}
+
+/**
+ * s17 第 2 条：登录卡那一行的独立 @Component（此前是 this.ManageRow(...)，形参按值快照 ⇒
+ * 登录态变了样不重绘，本项目已三处实证；同文件的 PluginVersionRow / PluginUserInfoRow 就是先例）。
+ *
+ * 两态显示（verified / savedCount 由外层 @State 经 @Prop 传进来）：
+ *  verified=false ⇒ 与改前一字不差（插件自报 loginTitle/loginSubtitle，缺省「账号登录 / 点击登录插件账号」）。
+ *       这一档覆盖 未保存 / 只漂着插件自写的可选键 / 探测失败 / 插件不支持 四种情形 ⇒
+ *       **不宣称未登录**，只退回原文案（探测挂了不等于用户掉线）。
+ *  verified=true  ⇒ 副文案换成「已保存 N 项登录凭据」，右侧加状态点 +「已登录」。N 只报数，
+ *       不写「完整 / 齐了 / 已全部保存」这类语义：eh 的可选键会随插件跑动漂移，N 会 2 变 3（_tmp/s17/ACCEPT.md 第三节）。
+ *
+ * 硬口径：这里只可能渲染 count 这个数与固定中文，没有任何一路把账号名 / 口令 / cookie 值
+ * 或字段键名带到屏上（值的去向只在登录页与插件存储之间，见 pages/PluginLoginPage.ets 文件头）。
+ * 整行始终可点（onOpen）：已登录也要能进去换账号，不为了显示状态把入口禁掉。
+ */
+@Component
+struct PluginLoginRow {
+  @StorageProp('isDark') isDark: boolean = false;
+  /** 主文案：插件自报 loginTitle，空则调用方给「账号登录」 */
+  @Prop title: string = '';
+  /** savedCount 为 0 时的副文案（插件自报 loginSubtitle，空则「点击登录插件账号」） */
+  @Prop baseSub: string = '';
+  /** 已保存且非空的凭据条数（只报数） */
+  @Prop savedCount: number = 0;
+  /** 是否够格说「已登录」（判据 = required 那一份账，见 LoginProbeResult）；false = 原样退回 */
+  @Prop verified: boolean = false;
+  onOpen: () => void = () => {};
+
+  build() {
+    Row() {
+      Column() {
+        Text(this.title)
+          .fontSize(15)
+          .fontColor(Theme.text1(this.isDark))
+          .width('100%')
+          .textAlign(TextAlign.Start)
+        Text(this.verified ? ('已保存 ' + String(this.savedCount) + ' 项登录凭据') : this.baseSub)
+          .fontSize(12)
+          .fontColor(this.verified ? Theme.text2(this.isDark) : Theme.text3(this.isDark))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ top: 3 })
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      // 已登录标记：状态点沿用全站同一套 dot + 文案形态，色取 Theme.success（不新造色值）。
+      // 与右侧箭头之间留 6vp，两条不会挤在一起；整组不可压缩，长主文案让位（flexShrink 口径）。
+      if (this.verified) {
+        Row({ space: 5 }) {
+          Circle({ width: 6, height: 6 })
+            .fill(Theme.success)
+          Text('已登录')
+            .fontSize(12)
+            .fontColor(Theme.text2(this.isDark))
+        }
+        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+        .backgroundColor(Theme.fillColor(this.isDark))
+        .borderRadius(Dim.coverRadius)
+        .alignItems(VerticalAlign.Center)
+        .flexShrink(0)
+        .margin({ right: 6 })
+      }
+
+      SymbolGlyph($r('sys.symbol.chevron_right'))
+        .fontSize(Dim.iconSm)
+        .fontColor([Theme.text3(this.isDark)])
+        .flexShrink(0)
+    }
+    .width('100%')
+    .constraintSize({ minHeight: Dim.menuItemH })
+    .padding({ top: 10, bottom: 10 })
+    .alignItems(VerticalAlign.Center)
+    .clickEffect({ level: ClickEffectLevel.LIGHT })
+    .onClick((): void => {
+      this.onOpen();
+    })
+  }
+}
+
 /** 文本输入浮层的模式（password 只是遮罩显示，存的都是原文）。 */
 class EditTarget {
   field: SettingField = new SettingField();
@@ -351,6 +465,23 @@ struct PluginSettingsPage {
   @State viewSections: SettingSection[] = [];
   /** 反混淆模式的展示文案（进页读一次、用户改完再刷一次；不直接读 pref 以免 build 里做异步）。 */
   @State jmLabel: string = '自动（推荐）';
+  /**
+   * s17 第 2 条：插件登录方案里**已保存且非空**的凭据条数（只进 UI 的是这个数，值不上屏）。
+   * 参与 UI 判定 ⇒ 必须 @State（s11 真机踩过：读私有字段不重渲染）。
+   */
+  @State loginSavedCount: number = 0;
+  /**
+   * s17 第 2 条：这次探测够不够格说「已登录」。判据 = 插件标了 required 的字段里至少一项非空
+   * （没标 required 的插件退回「任一非空」）。参与 UI 判定 ⇒ 必须 @State（s11 真机踩过）。
+   */
+  @State loginVerified: boolean = false;
+  /** 登录态探测的代次号：只有最新一代的回包允许落值，迟到的旧回包直接丢。 */
+  private loginProbeSeq: number = 0;
+  /** 上一次真正发出探测的时刻（Date.now 毫秒），只给 onPageShow 那一档节流用；0 = 还没探过。 */
+  private loginProbeAt: number = 0;
+  /** 灰条代次闸门与当前 id（0 = 屏上没有自己开的灰条），只被 openBusyToast/closeBusyToast 读写 */
+  private busySeq: number = 0;
+  private busyToastId: number = 0;
 
   /** 本插件对应的图源 id（ImageCache 与取图通道都以它为准）。 */
   private sourceId(): string {
@@ -505,12 +636,181 @@ struct PluginSettingsPage {
     return this.ctx().filesDir + '/plugins/' + this.localFile;
   }
 
+  /**
+   * s17 第 2 条：探一次「这个插件自己存了几条登录凭据」。
+   *
+   * ★ 为什么只有这一条信号可靠（取证见 _tmp/s16/bundles/ehentai-v0.1.6.bundle.cjs）：
+   *   1) 设置页原来的判据是 getSettingsBundle ⇒ canShowUserInfo，而 eh 恒回 canShowUserInfo:!1、
+   *      整个 bundle 里 0 处 getUserInfoBundle ⇒ topCardMode() 永远落第二档 'login'，
+   *      那一行的主/副文案就是硬编码兜底，登录与否它一个字都不变（= 用户报的现场）。
+   *   2) 想退一步读 getSettingsBundle.values 里的 cookie 键也不行：eh 把那几个键闸在
+   *      legacyHost（宿主版本 < 3.0.34）后面，我们 3.0.37 ⇒ 那里连键都不带。
+   *   3) getLoginBundle 的初值是唯一一条「插件自己承认存了凭据」的通道：四枚实现该方法的插件
+   *      （eh / bika / jjmhw / jm）都把已存值放进 scheme.values 或 data 顶层，
+   *      而 data/source/PluginLogin.ets 的 fetchScheme(:353-376) 把清洗后为空的值一律不写进 initial
+   *      ⇒ 「fields 里有多少项在 initial 上有非空值」严格等价于「插件存了几条凭据」。
+   *
+   * 只数 fields ∩ initial 的非空项，不数 initial 的全部键：初值是 {...data, ...data.values} 合并来的，
+   * 里面可能混有线路、站点这类普通设置项，拿键数当登录凭据数会虚报。
+   * 验证码图与滑块两项刻意跳过（kind 决定）：那是核验题的临时值，不是存下来的凭据。
+   *
+   * 失败语义：任何异常 / 不支持 ⇒ 计数归 0，UI 退回改前那句原文案。⇒ 这一条**只会在确有把握时
+   * 说「已登录」，永远不会反过来宣称「未登录」**（探测挂了不等于用户掉线，s11 三原则第 3 条同口径）。
+   *
+   * 只在四个「登录态可能变了」的点调用（reload / onPageShow / 能力动作后的静默重读 / 登出后的静默重读），
+   * 刻意不挂 onBundleChanged：commit() 改一个设置项也会换 bundle 引用，挂上去等于每改一项
+   * 多打一次 getLoginBundle（个别插件那一句会发网络请求，不能这么浪费）。
+   */
+  /**
+   * @param throttleMs 距上次发出探测不足这个毫秒数就整次跳过（0 = 不节流）。
+   * 只有 onPageShow 那一档传非 0：eh 的 getLoginBundle 走 mY，含七次 storage 读，且 directConnect
+   * 为真时 mQ(l) 是无条件跑的一次网络（bundle @77530 的短路里 skipExProbe 只跳 mM/mP 两档），
+   * 来回切页时这一档最频繁 ⇒ 800ms 内重复进页不重探（已显示的结果继续用，不会闪回原文案）。
+   */
+  private probeLoginState(throttleMs: number): void {
+    if (this.uuid.length === 0 || !this.bundle.canLogin) {
+      this.loginSavedCount = 0;
+      this.loginVerified = false;
+      return;
+    }
+    const now: number = Date.now();
+    if (throttleMs > 0 && this.loginProbeAt > 0 && now - this.loginProbeAt < throttleMs) {
+      return;
+    }
+    this.loginProbeAt = now;
+    const seq: number = this.loginProbeSeq + 1;
+    this.loginProbeSeq = seq;
+    PluginLogin.fetchScheme(this.uuid).then((r: LoginResult<LoginScheme>): void => {
+      // 代次闸门： onPageShow 与静默重读可能并行发出两探，慢的那一回包不能盖掉新的结果
+      if (seq !== this.loginProbeSeq) {
+        return;
+      }
+      if (!r.ok || r.data === null) {
+        this.loginSavedCount = 0;
+        this.loginVerified = false;
+        return;
+      }
+      const p: LoginProbeResult = this.countSaved(r.data);
+      this.loginSavedCount = p.total;
+      this.loginVerified = p.requiredDeclared > 0 ? p.required > 0 : p.total > 0;
+    }).catch((e: Object): void => {
+      if (seq !== this.loginProbeSeq) {
+        return;
+      }
+      this.loginSavedCount = 0;
+      this.loginVerified = false;
+      Logger.w('登录态探测失败（不影响设置项读写）：' + (e as Error).message);
+    });
+  }
+
+  /**
+   * 数方案字段的两份账（键名与值都不上屏，只回计数）：
+   *  total = 非空且非核验类的字段数（副文案报数用）；
+   *  required / requiredDeclared = 插件标了 required 的那部分（登录判据，见 LoginProbeResult）。
+   * 验证码图与滑块刻意跳过：那是核验题的临时值，不是存下来的凭据；password 也跳过
+   * （值最敏感且跨插件共享桶里它最可能是别人的，见 _tmp/s17/ACCEPT.md 第六节）。
+   */
+  private countSaved(s: LoginScheme): LoginProbeResult {
+    const out: LoginProbeResult = new LoginProbeResult();
+    for (let i = 0; i < s.fields.length; i++) {
+      const f: LoginField = s.fields[i];
+      if (f.key.length === 0 || f.isPassword() || f.isCaptchaImage() || f.isSlider()) {
+        continue;
+      }
+      if (f.required) {
+        out.requiredDeclared++;
+      }
+      const v: string | undefined = s.initial.get(f.key);
+      if (v === undefined || v.length === 0) {
+        continue;
+      }
+      out.total++;
+      if (f.required) {
+        out.required++;
+      }
+    }
+    return out;
+  }
+
   private toast(msg: string): void {
     try {
       promptAction.showToast({ message: msg, duration: 2200 });
     } catch (e) {
       Logger.i('toast 失败：' + msg);
     }
+  }
+
+  /**
+   * s17 第 2 条附带：能力动作「进行中」灰条的生命周期（只服务 execAction，别处仍用 toast）。
+   *
+   * 改前这里只有 this.toast('正在执行：' + 标题)，而 showToast 发出去就撤不回来
+   * （@ohos.promptAction.d.ts:1798-1831 那条 showToast 没有任何取消口），动作再快也要挂满 2200ms：
+   * 点「前往网页登录」时页面早就跳走了，灰条还压在网页登录页上；慢动作则是结果 toast 被旧灰条盖住。
+   * 现在换成 openToast（同文件 :1860，@since 18，回 id）+ 动作一落定就 closeToast（:1884）。
+   * compileSdkVersion 与 compatibleSdkVersion 都是 26.0.0（Breeze-ohos/build-profile.json5）⇒ API18 可用。
+   *
+   * 三条兜底，最坏情况就是退回改前行为，不会更差：
+   *  1) 拿不到 UIContext 档的 PromptAction ⇒ 直接退回 this.toast（本仓先例 = pages/SearchPage.ets 里
+   *     getUIContext 外面包 try/catch，注释写明「过早可能拿不到实例」）。
+   *     走 UIContext 档而不是全局 promptAction 是 SDK NOTE 的明确要求（:1842-1845 全局口有
+   *     ambiguous UI context 问题），全局 showToast 已在 18 废弃也是同一原因。
+   *  2) openToast 回 id 是异步的，动作可能比 id 先结束 ⇒ busySeq 代次闸门：过期的 id 一到就地关掉，
+   *     连点两个动作时上一条灰条也不会留下孤儿。
+   *  3) closeToast 对已过期/已被顶掉的 id 抛 103401（SDK 原话 Cannot find the toast）⇒ try/catch 吞掉只留日志。
+   * duration 取满上限 10000（ShowToastOptions.duration 注释 :170-173：>10000 按 10000 截），
+   * 只是防「动作本身悬挂时灰条永不消失」，正常路径一律由 closeBusyToast 提前撤。
+   */
+  private openBusyToast(msg: string): void {
+    this.closeBusyToast();
+    this.busySeq = this.busySeq + 1;
+    const seq: number = this.busySeq;
+    let pa: PromptAction | null = null;
+    try {
+      pa = this.getUIContext().getPromptAction();
+    } catch (e) {
+      pa = null;
+    }
+    if (pa === null) {
+      this.toast(msg);
+      return;
+    }
+    const opts: promptAction.ShowToastOptions = { message: msg, duration: 10000 };
+    try {
+      pa.openToast(opts).then((id: number): void => {
+        if (seq !== this.busySeq) {
+          this.safeCloseToast(id);
+          return;
+        }
+        this.busyToastId = id;
+      }).catch((e: Object): void => {
+        Logger.i('openToast 未生效，退回普通提示：' + (e as Error).message);
+        this.toast(msg);
+      });
+    } catch (e) {
+      this.toast(msg);
+    }
+  }
+
+  /** 撤掉自己开的灰条；同时让在飞的 openToast 回包作废（回来就地关，不留孤儿）。 */
+  private closeBusyToast(): void {
+    this.busySeq = this.busySeq + 1;
+    if (this.busyToastId !== 0) {
+      this.safeCloseToast(this.busyToastId);
+      this.busyToastId = 0;
+    }
+  }
+
+  private safeCloseToast(id: number): void {
+    try {
+      this.getUIContext().getPromptAction().closeToast(id);
+    } catch (e) {
+      Logger.i('closeToast 忽略（多半已过期）：' + (e as Error).message);
+    }
+  }
+
+  /** 离页时兜一层：动作在飞时用户直接返回，灰条不该跟着带到下一页（toast 是窗口级，不随页面销毁）。 */
+  aboutToDisappear(): void {
+    this.closeBusyToast();
   }
 
   async reload(): Promise<void> {
@@ -531,6 +831,9 @@ struct PluginSettingsPage {
     // 2. 全量载入设置
     const b: PluginSettingsBundle = await PluginSettings.load(this.ctx(), this.uuid);
     this.bundle = b;
+    // s17 第 2 条：登录态回显的探测点之一（另三处见 probeLoginState 注释）。不 await：
+    // 它是给登录卡补状态的第二条腿，不能挡首屏，也不能把 loading 拖着。
+    this.probeLoginState(0);
     if (b.error.length > 0) {
       this.loadError = b.error;
     }
@@ -787,16 +1090,21 @@ struct PluginSettingsPage {
    *   不能因为「eh 这条恰好无副作用」就把分发器写成可以重复调用的形状。
    */
   private execAction(action: CapabilityAction): void {
-    this.toast('正在执行：' + action.title);
+    // s17 附带：改成可撤销的灰条，动作落定即撤（见 openBusyToast 注释）
+    this.openBusyToast('正在执行：' + action.title);
     this.rawAction(action).then((r: RawActionResult): void => {
       if (!r.ok) {
         // 失败仍只 toast：与改前的 catch 分支同文案、同样不刷 bundle（没成功就没必要重读）
+        this.closeBusyToast();
         this.toast(r.msg);
         return;
       }
       if (this.tryOpenWeb(r.root)) {
+        // 已经跳网页登录页：灰条必须在这里撤，否则它会盖在登录页上到超时
+        this.closeBusyToast();
         return;
       }
+      this.closeBusyToast();
       this.toast(r.msg);
       if (action.fnPath === RELOGIN_FN) {
         this.openLogin();
@@ -805,6 +1113,8 @@ struct PluginSettingsPage {
       if (this.bundle.hasSettings) {
         PluginSettings.load(this.ctx(), this.uuid).then((b: PluginSettingsBundle): void => {
           this.bundle = b;
+          // s17 第 2 条：能力动作里「清会话」这类会直接改登录态 ⇒ 跟着补一次登录态探测
+          this.probeLoginState(0);
         }).catch((_e: Object): void => {});
       }
     });
@@ -959,6 +1269,8 @@ struct PluginSettingsPage {
         // 换 bundle 引用 ⇒ onBundleChanged 重算 ⇒ 顶卡自动回 'login'。
         PluginSettings.load(this.ctx(), this.uuid).then((b: PluginSettingsBundle): void => {
           this.bundle = b;
+          // s17 第 2 条：登出成功 ⇒ 插件把凭据键写成空值 ⇒ 探测应回 0，登录卡副文案自动回原文案
+          this.probeLoginState(0);
         }).catch((_e: Object): void => {});
       }).catch((e: Object): void => {
         this.logoutBusy = false;
@@ -982,6 +1294,13 @@ struct PluginSettingsPage {
     }
     PluginSettings.load(this.ctx(), this.uuid).then((b: PluginSettingsBundle): void => {
       this.bundle = b;
+      // s17 第 2 条（本条的主路径）：从插件登录页或网页登录页 router.back 回来就走这里。
+      // 本页是 @Entry ⇒ onPageShow 会跑（TabContent 子组件才不跑，别把那条结论套过来），
+      // 所以**不需要新开一套 AppStorage 版本号 push + @StorageProp + @Watch**：
+      // 那三例（readHistoryCount / searchHistoryCount / shelfRevision）都是「Tab 页之间」的跨页刷新，
+      // 本页的返回本来就有生命周期可用，再加一个全局键 = 第二个权威源 + 多一处要维护的时序。
+      // 800ms 节流：见 probeLoginState 的 throttleMs 注释（来回切页不重探）
+      this.probeLoginState(800);
     }).catch((_e: Object): void => {});
   }
 
@@ -1562,13 +1881,17 @@ struct PluginSettingsPage {
               if (this.topCardMode() === 'login') {
                 this.SectionCard('登录')
                 Column() {
-                  this.ManageRow(
-                    this.bundle.loginTitle.length > 0 ? this.bundle.loginTitle : '账号登录',
-                    this.bundle.loginSubtitle.length > 0 ? this.bundle.loginSubtitle : '点击登录插件账号',
-                    false,
-                    (): void => {
+                  // s17 第 2 条：独立 @Component 而不是 this.ManageRow —— 后者的形参是按值快照的，
+                  // 登录态变了这一行的样不会刷（本项目三处实证）。savedCount 走 @Prop 随 @State 刷新。
+                  PluginLoginRow({
+                    title: this.bundle.loginTitle.length > 0 ? this.bundle.loginTitle : '账号登录',
+                    baseSub: this.bundle.loginSubtitle.length > 0 ? this.bundle.loginSubtitle : '点击登录插件账号',
+                    savedCount: this.loginSavedCount,
+                    verified: this.loginVerified,
+                    onOpen: (): void => {
                       this.openLogin();
-                    })
+                    }
+                  })
                 }
                 .padding({ left: Dim.pagePadding, right: Dim.pagePadding })
                 .backgroundColor(Theme.cardColor(this.isDark))

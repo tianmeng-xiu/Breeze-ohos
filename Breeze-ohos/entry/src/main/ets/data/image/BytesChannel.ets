@@ -15,8 +15,11 @@ export interface PluginImageChannel {
    * 取页图字节。
    * 返回 null = 不是插件图源 / 通道未就绪（调用方走宿主 HTTP）；
    * 抛错 = 插件取图失败（调用方回落宿主 HTTP，再失败才报错）。
+   * ext（s17 第 5 条）= 该页在插件页表里的 extern JSON 串，空串 = 没有；必须原样递到
+   *   fetchImageBytes —— e-hentai 这类图源每页 url 都是同一个哨兵地址，真图页地址只在
+   *   extern.href 里（权威口径见 data/model/Models.ets 的 PageImage.ext 注释）。
    */
-  fetch(sourceId: string, url: string): Promise<ArrayBuffer | null>;
+  fetch(sourceId: string, url: string, ext: string): Promise<ArrayBuffer | null>;
 
   /**
    * 反混淆意图（每个 URL 问一次，结果参与缓存键，故必须对同一入参稳定）：

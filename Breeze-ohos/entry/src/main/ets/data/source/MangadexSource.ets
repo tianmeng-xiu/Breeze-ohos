@@ -252,7 +252,9 @@ export class MangadexSource implements MangaSource {
         }
         const page: PageImage = {
           index: pages.length,
-          url: baseUrl + '/' + mode + '/' + hash + '/' + encodeURIComponent(fileName)
+          url: baseUrl + '/' + mode + '/' + hash + '/' + encodeURIComponent(fileName),
+          // 非插件图源没有页表 extern：空串 = 没有页面上下文，取图走宿主 HTTP。
+          ext: ''
         };
         pages.push(page);
       }

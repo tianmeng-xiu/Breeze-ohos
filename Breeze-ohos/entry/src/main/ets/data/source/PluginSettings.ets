@@ -33,6 +33,7 @@ import { bundleCall, bundleLoadFromPath, bundleList } from '../../util/PluginRun
 import { jparse, jstr, jobj, jarr, jisEmpty, jhas } from '../../util/JsonUtil';
 import { PluginStore } from '../../util/PluginStore';
 import { Logger } from '../../util/Logger';
+import { BreezeHost } from '../../util/BreezeHost';
 
 /**
  * 调用形态分三类，别一把梭（都有上游实证）：
@@ -230,6 +231,65 @@ async function readBucket(prefs: preferences.Preferences, runtime: string): Prom
   return JSON.parse('{}');
 }
 
+/** s19 分桶：本进程内已尝试过旧桶搬运的 uuid（搬运本身是幂等的，只补缺失键）。 */
+const LEGACY_MIGRATED: Set<string> = new Set<string>();
+
+/**
+ * s19 一次性搬运：scoped 分桶（插件身份进 runtime 名 = bundle 名 = uuid）上线后，插件自己
+ * save/load_plugin_config 读写的是 uuid 桶，与本文件同一个桶 —— 双向坏那条从此根治。
+ * 但老用户的全部配置都在共享旧桶 breeze-ohos 里，所以第一次用到该插件时把**非凭据设置项**
+ * 从旧桶搬进 uuid 桶（缺失才搬 ⇒ 幂等，重启再来一次也无副作用）。
+ * 凭据类键一律不搬：旧桶是多插件共写的，账号/口令/jwt 到底属于哪一枚插件无从判定，
+ * 搬过去等于把跨插件串号从登录页放大到设置页。代价 = 老用户升级后需重新登录一次，
+ * 这条写进装机验收与 Release 说明。
+ */
+function isCredentialKey(key: string): boolean {
+  const k: string = key.toLowerCase();
+  if (k.indexOf('auth.') === 0) {
+    return true;
+  }
+  if (k === 'ipb_member_id' || k === 'ipb_pass_hash' || k === 'igneous') {
+    return true;
+  }
+  for (let i = 0; i < CRED_HINTS.length; i++) {
+    if (k.indexOf(CRED_HINTS[i]) >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const CRED_HINTS: string[] = ['token', 'cookie', 'password', 'passwd', 'jwt', 'session', 'apikey', 'api_key'];
+
+/** 从旧共享桶搬非凭据项进 uuid 桶；只在目标缺失时写。返回搬运动了多少键（诊断/日志用）。 */
+async function migrateLegacyKeys(context: common.Context, prefs: preferences.Preferences, uuid: string): Promise<number> {
+  if (uuid.length === 0 || LEGACY_MIGRATED.has(uuid)) {
+    return 0;
+  }
+  LEGACY_MIGRATED.add(uuid);
+  const legacy: ESObject = BreezeHost.legacyConfigBucket(context);
+  const keys: string[] = Object.keys(legacy);
+  if (keys.length === 0) {
+    return 0;
+  }
+  const bucket: ESObject = await readBucket(prefs, uuid);
+  let moved: number = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const k: string = keys[i];
+    if (isCredentialKey(k) || jhas(bucket, k)) {
+      continue;
+    }
+    bucket[k] = legacy[k];
+    moved++;
+  }
+  if (moved > 0) {
+    await prefs.put(uuid, JSON.stringify(bucket));
+    await prefs.flush();
+    Logger.i('插件 ' + uuid + ' 从旧共享桶搬运 ' + String(moved) + ' 项设置（凭据不搬）');
+  }
+  return moved;
+}
+
 export class PluginSettings {
   private static prefsInstance: preferences.Preferences | null = null;
   private static prefsPromise: Promise<preferences.Preferences> | null = null;
@@ -313,6 +373,8 @@ export class PluginSettings {
     }
     try {
       const p: preferences.Preferences = await PluginSettings.prefs(context);
+      // s19：第一次用到该插件时把旧共享桶的非凭据设置项搬进来（幂等、只补缺）
+      await migrateLegacyKeys(context, p, uuid);
       const bucket: ESObject = await readBucket(p, uuid);
       const bk: string[] = Object.keys(bucket);
       for (let i = 0; i < bk.length; i++) {
@@ -466,6 +528,8 @@ export class PluginSettings {
     // 2) 落宿主桶（**平铺键**）。s16 更正：这句原先写「与插件自己 save_plugin_config 写的
     //    完全同一位置」= 错的，实测证伪（_tmp/s16/probe_bucket_key.cjs 逐字复刻两侧函数，
     //    同一份 preferences 桩跑出 keys = breeze-ohos 与 local-JmComic-v0.0.7 两枚并存）。
+    //    s19 已把两侧对齐到 uuid 桶（见本文件 migrateLegacyKeys 注释）：插件侧 runtime 名现在带
+    //    bundle 身份，下面那段「双向坏」的现象不再是现行行为，仅对未升级的旧包成立。
     //    真实情况 = preferences(plugin_config) 里并存两枚互不可见的桶键：插件自己
     //    save_plugin_config 走 runtime 名桶（util/BreezeHost.ets:479 取 args[0]，runtime 名恒为
     //    breeze_qjs_ohos/src/engine.rs:200 的 breeze-ohos，ENGINE 是 :82 OnceLock 单例），
@@ -477,6 +541,7 @@ export class PluginSettings {
     if (field.persist) {
       try {
         const p: preferences.Preferences = await PluginSettings.prefs(context);
+        await migrateLegacyKeys(context, p, uuid);
         const bucket: ESObject = await readBucket(p, uuid);
         bucket[field.key] = value;
         await p.put(uuid, JSON.stringify(bucket));

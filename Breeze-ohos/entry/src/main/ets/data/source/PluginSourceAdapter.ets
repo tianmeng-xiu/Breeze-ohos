@@ -22,6 +22,26 @@ import { Logger } from '../../util/Logger';
 export const PLUGIN_SOURCE_PREFIX: string = 'plugin:';
 
 /**
+ * 取图哨兵地址的路径尾段（s17 第 5 条）。e-hentai 0.1.6 的常量 j/v 就是这两串：
+ *   j = '/_breeze/read-image'、v = '/_breeze/preview-image'，页对象的 url 字段被写成
+ *   new URL(j, origin) ⇒ 整章每页 url 逐字节相同。判定只按路径尾段（不看 host、不看查询串），
+ *   因为宿主手里能看到的只有这个地址本身。命中它且手里没 extern = 必挂，提前给出中文真因。
+ */
+const DEFERRED_IMAGE_PATHS: string[] = ['/_breeze/read-image', '/_breeze/preview-image'];
+
+function isDeferredImageUrl(url: string): boolean {
+  if (url.length === 0) {
+    return false;
+  }
+  for (let i = 0; i < DEFERRED_IMAGE_PATHS.length; i++) {
+    if (url.endsWith(DEFERRED_IMAGE_PATHS[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * ★ 上游 unified_comic_plugin.dart:28 `payload = {...core, 'extern': extern ?? const {}}`
  *   ⇒ **每个 fnPath 的入参对象里必定有 extern 键**（缺省空对象）。插件普遍写
  *   `async function (args = {})` 后直接读 `args.extern`，缺键不会报错但拿不到东西；
@@ -54,10 +74,27 @@ class ChapterArg {
   extern: ESObject = JSON.parse('{}');
 }
 
-/** fetchImageBytes 入参。 */
+/**
+ * fetchImageBytes 入参（无 extern 版）。**刻意保留两类**而不是给 ImageArg 加一个可选字段：
+ * ArkTS 里给类加字段 = 所有实例的 JSON 都会多一个键，而无 needs-extern 的插件（JM / 哔咖 /
+ * 包子 ... 本机九个载荷实测 _breeze/ 与 imagePageHref 全 0 命中）收到的字节就会变,
+ * 回归面铺满全部图源。分成两类后「没有 extern」这条最常见的路逐字节不变。
+ */
 class ImageArg {
   url: string = '';
   timeoutMs: number = 30000;
+}
+
+/**
+ * fetchImageBytes 入参（带 extern 版，s17 第 5 条）。对齐上游 picture.dart:628-634：
+ *   final externPayload = <String,dynamic>{...extern}; ... if (externPayload.isNotEmpty) args["extern"] = externPayload;
+ * 即**非空才写**这个键，空对象不写 —— 与插件侧 a.extern 缺省 {} 的读法一致。
+ * 键序 url / timeoutMs / extern 与上游 args 的构造顺序相同。
+ */
+class ImageExternArg {
+  url: string = '';
+  timeoutMs: number = 30000;
+  extern: ESObject = JSON.parse('{}');
 }
 
 /** 从 unknown 异常提取 message 原文（同 Index.ets:86 已验证写法）。 */
@@ -100,6 +137,24 @@ export class PluginSourceAdapter implements MangaSource {
    *    在猫漢无 requestId ⇒ 这张表对它们根本是空的，发出的字符串逐字节不变，不存在回归面。
    */
   private chapterOutKey: Map<string, string> = new Map<string, string>();
+
+  /**
+   * s17 第 5 条诊断计数（进程累计，与 ImageCache 那批计数同样口径，没有复位路径）：
+   * extMissing = 地址是取图哨兵而手里没有 extern（= 页表 ext 没能传到取图点，链路断在中间）；
+   * extBad = 页表带了 extern 但 JSON.parse 不动；lastExtErr 只记形态不记内容。
+   */
+  static extMissing: number = 0;
+  static extBad: number = 0;
+  static lastExtErr: string = '';
+
+  /** 诊断串（面板 16 号行 imageChain 末尾追加）：无异常时返回空串，不占屏宽。 */
+  static externHint(): string {
+    if (PluginSourceAdapter.extMissing === 0 && PluginSourceAdapter.extBad === 0) {
+      return '';
+    }
+    return ' extMiss=' + PluginSourceAdapter.extMissing + ' extBad=' + PluginSourceAdapter.extBad
+      + (PluginSourceAdapter.lastExtErr.length > 0 ? ' extErr=' + PluginSourceAdapter.lastExtErr : '');
+  }
 
   constructor(uuid: string, displayName: string, localFile: string, filesDir: string) {
     this.uuid = uuid;
@@ -416,7 +471,18 @@ export class PluginSourceAdapter implements MangaSource {
       if (url.length > 0) {
         usable++;
       }
-      const p: PageImage = { index: i, url: url };
+      // s17 第 5 条：把这一页的 extern 原样带上（空对象记空串，与「非空才透传」的出口对齐）。
+      // 这是 e-hentai 这类哨兵 url 图源唯一的取图入参，也是同章各页唯一可分标识。
+      const extObj: ESObject = jobj(pg, 'extern');
+      let ext: string = '';
+      if (!jisEmpty(extObj)) {
+        try {
+          ext = JSON.stringify(extObj);
+        } catch (e) {
+          ext = '';
+        }
+      }
+      const p: PageImage = { index: i, url: url, ext: ext };
       out.push(p);
     }
     if (usable === 0) {
@@ -455,14 +521,39 @@ export class PluginSourceAdapter implements MangaSource {
    * 二进制取图（bytes 通道）：阅读器经 ImageCache.loadViaPlugin 调用（带插件 Referer/风控头）。
    * kind=json 视为失败。
    */
-  async fetchImageBytes(url: string): Promise<ArrayBuffer> {
+  async fetchImageBytes(url: string, ext: string): Promise<ArrayBuffer> {
     await this.ensureLoaded('取图失败');
-    const a: ImageArg = new ImageArg();
-    a.url = url;
-    a.timeoutMs = 30000;
+    // s17 第 5 条：ext 非空才写 extern 键（上游 picture.dart:632 同构）。上游之所以必须写，
+    // 是因为 e-hentai 这类插件每页 url 都是同一个哨兵地址，真图页地址只在该页 extern.href 里。
+    let payload: string = '';
+    if (ext.length > 0) {
+      const ea: ImageExternArg = new ImageExternArg();
+      ea.url = url;
+      ea.timeoutMs = 30000;
+      try {
+        ea.extern = JSON.parse(ext);
+      } catch (e) {
+        // ext 解析不动就退回不带 extern（等价于修复前的行为），并在诊断里钉一笔：
+        // 「页表给了 extern 但形态不是 JSON」和「压根没传到 extern」是两种要分开修的缺陷。
+        PluginSourceAdapter.extBad++;
+        PluginSourceAdapter.lastExtErr = 'parse ' + errText(e as Object);
+      }
+      payload = JSON.stringify([ea]);
+    } else {
+      if (isDeferredImageUrl(url)) {
+        // 地址是插件的取图哨兵（/_breeze/read-image 之类）而手里没有 extern ⇒ 这一张必然失败，
+        // 且失败点在插件内部、0 次网络请求。钉计数 + 把真因写成中文，别让屏上只剩一句英文。
+        PluginSourceAdapter.extMissing++;
+        throw new Error('取图失败：该图源每页共用同一个取图地址，需要页面上下文才能取图（本次没能传达到插件）');
+      }
+      const a: ImageArg = new ImageArg();
+      a.url = url;
+      a.timeoutMs = 30000;
+      payload = JSON.stringify([a]);
+    }
     let r: BytesResult;
     try {
-      r = await bundleCallBytes(this.uuid, 'fetchImageBytes', JSON.stringify([a]));
+      r = await bundleCallBytes(this.uuid, 'fetchImageBytes', payload);
     } catch (e) {
       throw new Error('取图失败（fetchImageBytes）：' + errText(e as Object));
     }

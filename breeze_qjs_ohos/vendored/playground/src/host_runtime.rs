@@ -131,14 +131,67 @@ const BUNDLE_DISPATCHER_JS: &str = r#"(async () => {
       return { owner, fn };
     };
 
+    // s19 插件配置分桶：按 bundle 造 bridge 与 globalThis 视图，把插件身份带进宿主路由的 args[0]。
+    // 上游 Breeze 每插件一 runtime，宿主侧 args[0] 天然就是插件名；本 crate 只有全局唯一 runtime，
+    // 不带身份 ⇒ 所有插件的 auth.account / auth.password 落进同一枚桶互相串（真机缺陷）。
+    const makeBundleBridge = (bundleName) => {
+      const web = globalThis.__web;
+      const base = web && web.bridge;
+      if (base && typeof base.makeScoped === "function") {
+        try {
+          const scoped = base.makeScoped(String(bundleName || ""));
+          if (scoped && typeof scoped.call === "function") return scoped;
+        } catch (_err) {}
+      }
+      // 兜底：polyfill 未带 makeScoped（异常装配）⇒ 原样返回，行为与改动前一致
+      return base;
+    };
+
+    // 视图只替换 bridge 与 __web.bridge 两个键，其余属性一律透传真全局：
+    // 插件里 ts("bridge") = globalThis["bridge"] 这种查表取法也拿得到 scoped 版，
+    // 而 fs / fetch / crypto / setTimeout 等仍走真全局，语义零变化。
+    const createBundleRuntimeView = (bundleBridge) => {
+      if (typeof Proxy !== "function") return globalThis;
+      const web = globalThis.__web;
+      let webView = web;
+      if (web && typeof web === "object") {
+        webView = new Proxy(web, {
+          get(t2, k, r2) { return k === "bridge" ? bundleBridge : Reflect.get(t2, k, r2); },
+        });
+      }
+      return new Proxy(globalThis, {
+        get(target, key, receiver) {
+          if (key === "bridge") return bundleBridge;
+          if (key === "__web" && webView) return webView;
+          return Reflect.get(target, key, receiver);
+        },
+        set(target, key, value, receiver) { return Reflect.set(target, key, value, receiver); },
+        has(target, key) { return Reflect.has(target, key); },
+        getOwnPropertyDescriptor(target, key) { return Reflect.getOwnPropertyDescriptor(target, key); },
+        ownKeys(target) { return Reflect.ownKeys(target); },
+        deleteProperty(target, key) { return Reflect.deleteProperty(target, key); },
+        defineProperty(target, key, desc) { return Reflect.defineProperty(target, key, desc); },
+      });
+    };
     globalThis.__host_bundle_runtime = {
       loadBundle(name, source) {
         const registry = ensureRegistry();
         const module = { exports: {} };
         const exports = module.exports;
         const requireFn = typeof require === "function" ? require.bind(globalThis) : undefined;
-        const runner = new Function("module", "exports", "require", appendSourceUrl(source, name));
-        runner(module, exports, requireFn);
+        // s19：多给两个形参做词法遮蔽 —— 裸标识符 bridge 与 globalThis["bridge"] 两条取法都覆盖；
+        // 真全局本身不写不改，卸载 bundle 后不留痕。形参遮蔽优先，视图兜底。
+        const bundleBridge = makeBundleBridge(name);
+        const bundleView = createBundleRuntimeView(bundleBridge);
+        const runner = new Function(
+          "module",
+          "exports",
+          "require",
+          "bridge",
+          "globalThis",
+          appendSourceUrl(source, name),
+        );
+        runner(module, exports, requireFn, bundleBridge, bundleView);
         registry.set(String(name), normalizeApi(module.exports));
       },
       async invoke(payload) {

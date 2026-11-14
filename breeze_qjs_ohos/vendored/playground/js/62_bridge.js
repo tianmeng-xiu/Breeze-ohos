@@ -140,7 +140,24 @@
     return input;
   }
 
-  async function call(name, ...args) {
+  // s19 分桶根治：runtime 名可由调用方覆盖（bundle 身份）。拿不到覆盖值时行为与旧版逐字一致。
+  // 上游 Breeze 每插件一 runtime ⇒ 宿主侧 args[0] 天然就是插件名；我方引擎全局只有唯一 runtime，
+  // 由 bundle 装载器按 bundle 名造 scoped bridge 把插件名补进 args[0]，跨插件凭据才不再互串。
+  function pickHostCall(runtime) {
+    if (runtime && typeof globalThis.__host_call_scoped === "function") {
+      return (routeName, argsJson) => globalThis.__host_call_scoped(routeName, argsJson, runtime);
+    }
+    return (routeName, argsJson) => globalThis.__host_call(routeName, argsJson);
+  }
+
+  function pickHostCallStart(runtime) {
+    if (runtime && typeof globalThis.__host_call_start_scoped === "function") {
+      return (routeName, argsJson) => globalThis.__host_call_start_scoped(routeName, argsJson, runtime);
+    }
+    return (routeName, argsJson) => globalThis.__host_call_start(routeName, argsJson);
+  }
+
+  async function callWithRuntime(runtime, name, ...args) {
     const normalizedArgs = args.map((arg) => normalizeArg(arg));
     const routeName = String(name);
 
@@ -148,7 +165,7 @@
       try {
         const mode = globalThis.__host_call_route_mode(routeName);
         if (mode === "sync") {
-          const raw = globalThis.__host_call(routeName, JSON.stringify(normalizedArgs));
+          const raw = pickHostCall(runtime)(routeName, JSON.stringify(normalizedArgs));
           return parseHost(raw);
         }
       } catch (_) {
@@ -160,7 +177,7 @@
       && typeof globalThis.__host_call_try_take === "function"
     ) {
       const started = await parseHost(
-        globalThis.__host_call_start(routeName, JSON.stringify(normalizedArgs)),
+        pickHostCallStart(runtime)(routeName, JSON.stringify(normalizedArgs)),
       );
       const id = Number(started && started.id);
       if (!Number.isFinite(id) || id <= 0) {
@@ -189,30 +206,58 @@
       }
     }
 
-    const raw = globalThis.__host_call(routeName, JSON.stringify(normalizedArgs));
+    const raw = pickHostCall(runtime)(routeName, JSON.stringify(normalizedArgs));
     return parseHost(raw);
   }
 
-  function callSync(name, ...args) {
+  function callSyncWithRuntime(runtime, name, ...args) {
     const normalizedArgs = args.map((arg) => normalizeArg(arg));
-    const raw = globalThis.__host_call(String(name), JSON.stringify(normalizedArgs));
+    const raw = pickHostCall(runtime)(String(name), JSON.stringify(normalizedArgs));
     return parseHostSync(raw);
   }
 
-  async function gzipDecompress(input) {
-    const out = await call("compression.gzip_decompress", input);
+  async function call(name, ...args) {
+    return callWithRuntime(null, name, ...args);
+  }
+
+  function callSync(name, ...args) {
+    return callSyncWithRuntime(null, name, ...args);
+  }
+
+  async function gzipDecompressWith(callImpl, input) {
+    const out = await callImpl("compression.gzip_decompress", input);
     if (out instanceof Uint8Array) return out;
     if (ArrayBuffer.isView(out)) return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
     if (out instanceof ArrayBuffer) return new Uint8Array(out);
     return Uint8Array.from(Array.isArray(out) ? out : []);
   }
 
-  async function gzipCompress(input) {
-    const out = await call("compression.gzip_compress", input);
+  async function gzipCompressWith(callImpl, input) {
+    const out = await callImpl("compression.gzip_compress", input);
     if (out instanceof Uint8Array) return out;
     if (ArrayBuffer.isView(out)) return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
     if (out instanceof ArrayBuffer) return new Uint8Array(out);
     return Uint8Array.from(Array.isArray(out) ? out : []);
+  }
+
+  async function gzipDecompress(input) {
+    return gzipDecompressWith(call, input);
+  }
+
+  async function gzipCompress(input) {
+    return gzipCompressWith(call, input);
+  }
+  function makeScoped(bundleRuntime) {
+    const runtime = String(bundleRuntime || "");
+    if (!runtime) return { call, callSync, gzipDecompress, gzipCompress };
+    const scopedCall = (name, ...rest) => callWithRuntime(runtime, name, ...rest);
+    return {
+      call: scopedCall,
+      callSync: (name, ...rest) => callSyncWithRuntime(runtime, name, ...rest),
+      gzipDecompress: (input) => gzipDecompressWith(scopedCall, input),
+      gzipCompress: (input) => gzipCompressWith(scopedCall, input),
+      bundleRuntime: runtime,
+    };
   }
 
   globalThis.__web.bridge = {
@@ -220,5 +265,6 @@
     callSync,
     gzipDecompress,
     gzipCompress,
+    makeScoped,
   };
 })();
