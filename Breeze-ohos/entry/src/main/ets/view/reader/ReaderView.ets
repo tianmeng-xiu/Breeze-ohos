@@ -306,6 +306,14 @@ export class ReaderDiag {
    */
   static rowBoxLast: number = 0;
   static rowBoxMax: number = 0;
+  /**
+   * s21 黑区修法：**挂在屏上的位图被 release 之后**再读一次它的尺寸必然抛（Image 那边则画整幅纯黑，
+   * 不抛给 UI 线程）。aspect() 里 getImageInfoSync 的 catch 是这条链路唯一的可观测指纹，命中就 +1。
+   * 判读：dead= 持续大于 0 = 确实有「位图挂在一行上却被缓存释放掉」发生（与 16 号行 pin= 的
+   * evictHeld 一档互为旁证）；修法生效后应恒为 0。
+   */
+  static pmDead: number = 0;
+
 
   /** 记一笔行实测落高（h 非法或为 0 直接忽略：首帧 onAreaChange 可能给 0）。vertical=false 只更新 last。 */
   static noteRowH(h: number, vertical: boolean): void {
@@ -492,7 +500,10 @@ export class ReaderDiag {
       ' rowH=' + ReaderDiag.rowHLast.toFixed(0) + '/' + ReaderDiag.rowHMax.toFixed(0) +
       // s17 A1 配对位 rowBox = 纵向**行盒**实测高（rowH 是组件自报高）：两者之差才是 e2（热区撑高行）的判据，
       // 因为组件自带 aspectRatio，它自报的高永远 == 它请求的高，单量它会把 e2 遮成假 PASS。e2 成立时 bare= 仍 12.00。
-      ' rowBox=' + ReaderDiag.rowBoxLast.toFixed(0) + '/' + ReaderDiag.rowBoxMax.toFixed(0);
+      ' rowBox=' + ReaderDiag.rowBoxLast.toFixed(0) + '/' + ReaderDiag.rowBoxMax.toFixed(0) +
+      // s21 黑区修法 dead= 屏上位图被 release 的指纹次数（ImageCache 侧对应 pin= 的 evictHeld 一档）：
+      // 期望恒 0；大于 0 = 有行在展示期间位图被释放（修不干净就靠这条继续定位）。
+      ' dead=' + ReaderDiag.pmDead;
   }
 
   /** 诊断面板用的一行文本（章） */
@@ -669,9 +680,43 @@ struct ReaderPageImage {
    * 换 url 与重试信号两处复位（否则 Swiper/LazyForEach 复用节点会把上一页的比例带到下一页）。
    */
   @State preRatio: number = 0;
+  /**
+   * s21 黑区修法：本行**当前真正持有**（已 retain、还没 unpin）的位图，与 @State pm 分开存：
+   * pm 是给 build 用的渲染输入，held 是配对账本 —— 只有经 setShown 走一遍才能保证
+   * retain/unpin 严格一次对一次（直接赋 pm 的旧写法没有任何记账点）。
+   */
+  private held: image.PixelMap | undefined = undefined;
+  /** at= 探针的去重位：同一个位图实例只补一次挂载态探针。 */
+  private probedPm: image.PixelMap | undefined = undefined;
   /** 页计数的本组件台账：记的是哪个 url、当前算在哪一档（见 mark） */
   private tallyUrl: string = '';
   private tallyKind: number = ReaderDiag.K_NONE;
+
+  /**
+   * s21 黑区修法：位图挂载/摘除的唯一入口。先 retain 新的再 unpin 旧的，再把新值喂给 @State，
+   * 保证「Image 正在画的这一张」在画期间 ImageCache 绝不 release 它。
+   * 旧缺陷：LRU 淘汰与「清理图片缓存」都会对屏上位图 release，Image 于是画整幅纯黑 ——
+   * 不抛异常、无日志，且 probeBlack 早在解码阶段跑完，blk= 永远查不出（同批修法见 ImageCache.ets）。
+   * 顺序要点：retain 新值在前、unpin 旧值在后，同实例重挂（命中缓存翻回本页）时计数不会瞬间归零。
+   */
+  private setShown(next: image.PixelMap | undefined): void {
+    const prev: image.PixelMap | undefined = this.held;
+    if (next !== undefined) {
+      ImageCache.getInstance().retain(next);
+      this.held = next;
+      // s21：挂载态补一次黑图探针（每实例一次），与 blk= 的「只探首次解码」互补
+      if (this.probedPm !== next) {
+        this.probedPm = next;
+        ImageCache.probeShown(next);
+      }
+    } else {
+      this.held = undefined;
+    }
+    this.pm = next;
+    if (prev !== undefined && prev !== next) {
+      ImageCache.getInstance().unpin(prev);
+    }
+  }
 
   aboutToAppear(): void {
     this.load();
@@ -683,13 +728,15 @@ struct ReaderPageImage {
       clearTimeout(this.retryTimer);
       this.retryTimer = -1;
     }
+    // s21 黑区修法：节点销毁 = 这一行不再上屏，归还持有（否则 pinLive 只涨不落）
+    this.setShown(undefined);
   }
 
   /** Swiper 会复用节点，url 变更必须重新解码，否则翻页出现上一张图（串图） */
   onUrlChanged(): void {
     this.clearRetryTimer();
     this.autoRetried = false;
-    this.pm = undefined;
+    this.setShown(undefined);
     this.failed = false;
     this.preRatio = 0;
     this.load();
@@ -706,7 +753,7 @@ struct ReaderPageImage {
       return;
     }
     this.clearRetryTimer();
-    this.pm = undefined;
+    this.setShown(undefined);
     this.failed = false;
     this.preRatio = 0;
     this.load();
@@ -794,6 +841,9 @@ struct ReaderPageImage {
     } catch (err) {
       const e = err as BusinessError;
       console.warn(`[Reader] getImageInfoSync failed: code=${e.code} msg=${e.message}`);
+      // s21 黑区修法：位图在手却量不到尺寸，最主要成因就是它已被缓存 release ——
+      // 这是「屏上位图被释放」唯一的可观测指纹（Image 侧只画纯黑不抛给 UI 线程）。
+      ReaderDiag.pmDead += 1;
     }
     // 位图在手但量不到尺寸（极罕见）：同章中位数优先，没样本才用 1/1.2 —— 两者都比旧的 0.75 矮
     const med: number = ReaderDiag.medianRatio(this.chapterId);
@@ -1008,7 +1058,7 @@ struct ReaderPageImage {
       await this.probeSize();
       const map: image.PixelMap = await ImageCache.getInstance()
         .loadPage(this.url, this.sourceId, this.chapterId, this.pageExt);
-      this.pm = map;
+      this.setShown(map);
       ReaderDiag.noteOk(pk);
       this.mark(ReaderDiag.K_SHOWN);
     } catch (err) {
@@ -1106,10 +1156,17 @@ struct ReaderPageImage {
   }
 
   /**
-   * 未就绪/失败行的可见骨架（s16 第 2 条甲与丁）：圆角浅色块 + 居中内容，不再是一整块纯黑。
-   * 底色口径：阅读区根容器恒 Theme.black（见 ReaderView.build 的 backgroundColor，不随深浅色档变），
-   * 所以这里固定取深色档令牌 Theme.dCard 铺底 + Theme.dDivider 描边 —— 两块令牌在纯黑上都能看出边界，
-   * 「必须在深色下也看得见」这条判据因此与系统深浅色无关，恒成立。
+   * 未就绪/失败行的占位内容（s16 第 2 条甲与丁）。
+   * **s21 第 3 条（用户拍板）：只留转圈，去掉下面的卡片** —— 原来这枚 Column 带 Theme.dCard 铺底 +
+   * Theme.dDivider 描边 + 圆角 + 92% 宽，本意是「别露一整块纯黑」，真机上反而变成第二个视觉缺陷：
+   * 卡片永远比行矮，上下各露出一截阅读区底色（bare= 量的就是这个），且浅灰卡片压在纯黑上像图片
+   * 被切了一刀。现在只留居中的 LoadingProgress / 失败文案，卡片本体不再画。
+   * 行高链（pendingRowH -> skeletonBlockH）**原样保留**：占位行仍按「宽/真比或窄骨架」占位，
+   * 位图到达时几何零变化，不会因为去掉卡片而重新引入跳动。
+   * 判读连带更新（务必同步 _tmp/s17/ACCEPT.md 第七段）：去掉铺底后 bare=（裸底色最大值）
+   * 不再是「恒 12」这条安全判据，而退化成占位行高与块高之差的观测值；
+   * 黑区是否修好改看 17 号行新增的 dead= 与 16 号行的 pin=（屏上位图被 release 的指纹），
+   * 以及 17 号行 rowH= / rowBox= 之差（行盒被撑高那条嫌疑）。
    */
   @Builder
   Skeleton() {
@@ -1133,9 +1190,6 @@ struct ReaderPageImage {
     }
     .width('92%')
     .height(this.skeletonBlockH())
-    .borderRadius(Dim.radius)
-    .backgroundColor(Theme.dCard)
-    .border({ width: 1, color: Theme.dDivider, radius: Dim.radius })
     .justifyContent(FlexAlign.Center)
   }
 

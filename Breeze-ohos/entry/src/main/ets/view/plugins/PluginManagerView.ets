@@ -447,14 +447,39 @@ struct PluginIcon {
   @Prop @Watch('onIconChanged') iconUrl: string = '';
   @StorageProp('isDark') isDark: boolean = false;
   @State pm: image.PixelMap | undefined = undefined;
+  /**
+   * s21 黑区修法：与 @State pm 分开的**持有账本**（同 view/reader/ReaderView.ets 的 held/setShown 口径）。
+   * 「清理图片缓存」与 LRU 淘汰都不该 release 仍在显示的那一张：被 release 后 Image 画整幅纯黑，
+   * 不抛异常也不留日志（阅读器上的同款缺陷就是那条黑区）。
+   */
+  private held: image.PixelMap | undefined = undefined;
 
   aboutToAppear(): void {
     this.load();
   }
 
+  aboutToDisappear(): void {
+    this.setShown(undefined);
+  }
+
+  /** 挂载/摘除唯一入口：retain 在前、unpin 在后，再把值喂给 @State。 */
+  private setShown(next: image.PixelMap | undefined): void {
+    const prev: image.PixelMap | undefined = this.held;
+    if (next !== undefined) {
+      ImageCache.getInstance().retain(next);
+      this.held = next;
+    } else {
+      this.held = undefined;
+    }
+    this.pm = next;
+    if (prev !== undefined && prev !== next) {
+      ImageCache.getInstance().unpin(prev);
+    }
+  }
+
   /** List 可能复用节点：地址变了必须清旧图重取，否则串图标（同 MangaGridCard.onCoverChanged）。 */
   onIconChanged(): void {
-    this.pm = undefined;
+    this.setShown(undefined);
     this.load();
   }
 
@@ -462,14 +487,14 @@ struct PluginIcon {
     // s15 第 3 条③：本进程内已经全档落空过的地址不再重试（List 复用节点会反复重取，见 iconDeadUrls）
     if (iconKnownDead(this.iconUrl)) {
       PluginIconDiag.skipped++;
-      this.pm = undefined;
+      this.setShown(undefined);
       return;
     }
     // s15 第 3 条③：先过诊断入口 —— 空地址（noUrl）与非 URL（badUrl）都不发请求，
     // 返回空 host 就等于这一张不进 calls 口径，直接占位。
     const host: string = PluginIconDiag.begin(this.iconUrl);
     if (host.length === 0) {
-      this.pm = undefined;
+      this.setShown(undefined);
       return;
     }
     // s14 第 4 条 R1（search-fix 报的残留，lead 认可后补）：ImageCache.init 只排在 DataBootstrap 里，
@@ -484,7 +509,8 @@ struct PluginIcon {
     let lastTag: string = '';
     try {
       // PixelMap 由 ImageCache 持有，调用方不得 release（同 MangaGridCard 口径）
-      this.pm = await ImageCache.getInstance().load(this.iconUrl);
+      const direct: image.PixelMap = await ImageCache.getInstance().load(this.iconUrl);
+      this.setShown(direct);
       PluginIconDiag.ok(host, false);
       return;
     } catch (e) {
@@ -499,7 +525,8 @@ struct PluginIcon {
       PluginIconDiag.noteMirrorTried();
       for (let i = 0; i < alts.length; i++) {
         try {
-          this.pm = await ImageCache.getInstance().load(alts[i]);
+          const via: image.PixelMap = await ImageCache.getInstance().load(alts[i]);
+          this.setShown(via);
           PluginIconDiag.ok(host, true);
           Logger.i('[PluginManager] 图标经镜像档取回: ' + iconHostOf(alts[i]));
           return;
@@ -512,7 +539,7 @@ struct PluginIcon {
     // 并记进本进程的失败档 ⇒ 同一地址滚动重进不再重复烧请求
     PluginIconDiag.failTry(host, lastTag);
     iconMarkDead(this.iconUrl);
-    this.pm = undefined;
+    this.setShown(undefined);
   }
 
   private errOf(e: Object): string {

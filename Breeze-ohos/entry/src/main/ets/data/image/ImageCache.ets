@@ -270,6 +270,15 @@ export class ImageCache {
   /** 页图单独一条 LRU（体积大、生命周期短，与封面/头像分桶才不会互相挤掉）。 */
   private pageMem: Map<string, image.PixelMap> = new Map();
   private pageOrder: string[] = [];
+  /**
+   * s21 黑区修法：消费侧正在挂载展示的位图计数（键 = 位图实例本身）。
+   * 缓存淘汰与 clear() 遇到计数非零的位图一律不 release —— 屏上位图被 release 后
+   * Image 组件画出来是整幅纯黑，不抛异常、不留日志，且 probeBlack 早在解码阶段就跑完
+   * （字节侧确实是一张好图），所以旧现场才表现为「全宽纯黑、无页码角标、blk 查不出黑图」。
+   */
+  private pinned: Map<image.PixelMap, number> = new Map<image.PixelMap, number>();
+  /** 已被逐出缓存但当时仍被持有的位图：等持有归零再真 release。 */
+  private pendingRelease: Map<image.PixelMap, boolean> = new Map<image.PixelMap, boolean>();
   private cacheRoot: string = '';
   private ready: boolean = false;
   private initPromise: Promise<void> | null = null;
@@ -671,6 +680,28 @@ export class ImageCache {
   static probeUnknown: number = 0;
   /** 最后一次取样失败的原因（small WxH 或 readPixelsToArea 抛出的 code+message） */
   static lastProbeErr: string = '';
+  /**
+   * s21 黑区修法三个计数器（拼在诊断 16 号行末尾 pin= 三档）：
+   *   pinLive    = 当前仍被消费侧（阅读器行的 @State pm）挂着的位图张数
+   *   evictHeld  = 淘汰或清理时因为「还在屏上」而跳过 release 的次数
+   *   pmReleased = 真调用 release 的次数
+   * 判读：evictHeld 长期大于 0 = 确实存在「淘汰打到屏上位图」这种时序（黑区的直接证据）；
+   * 修法生效后 pmReleased 只在持有归零时增长；pinLive 单调上升不回落 = 消费侧漏 unpin。
+   */
+  /**
+   * s21 黑区修法第二组计数器（诊断 16 号行 at= 三档 = 有/黑/取不到样本）：
+   * 与 blk= 的区别 = 探针时机。blk= 只在**首次解码**那次跑（memGet 命中直接返回、重挂也不再探），
+   * 所以「位图本身是黑的」在「命中缓存后重新挂上屏」这条路上永远看不见。at= 挂在消费侧挂载那一刻，
+   * 每张位图每次挂载只补一次（消费侧按实例去重），用来把两种黑分开：
+   *   at 的第二档（黑）大于 0 = 图源交来的位图本身就是纯黑（与布局/尺寸无关，走图源侧）；
+   *   at 的第三档（取不到样本）大于 0 且 dead= 也在涨 = 挂载后位图被 release（走持有链那条）。
+   */
+  static showOk: number = 0;
+  static showBlack: number = 0;
+  static showUnknown: number = 0;
+  static pinLive: number = 0;
+  static evictHeld: number = 0;
+  static pmReleased: number = 0;
   /** 中心区取样边长（像素）：16x16 足够判「整幅是不是黑的」。 */
   private static readonly BLACK_SAMPLE: number = 16;
 
@@ -757,6 +788,9 @@ export class ImageCache {
       + ' sz=' + ImageCache.sizeProbeHits + '/' + ImageCache.sizeProbeDisk + '/' + ImageCache.sizeProbeCalls
       // s17 第 5 条：extMiss = 地址是插件取图哨兵而手里没有 extern（页表那一位在链路上被丢了）；
       // extBad = 页表带了 extern 但 JSON.parse 不动。两档都为 0 才是健康形态（无异常时返回空串）。
+      // s21 黑区修法：pin= 当前持有 / 因持有跳过 release / 真 release 三档（同时充当包代次标记）
+      + ' pin=' + ImageCache.pinLive + '/' + ImageCache.evictHeld + '/' + ImageCache.pmReleased
+      + ' at=' + ImageCache.showOk + '/' + ImageCache.showBlack + '/' + ImageCache.showUnknown
       + PluginSourceAdapter.externHint();
   }
 
@@ -853,21 +887,15 @@ export class ImageCache {
     // 先取消在途统计：目录马上就要删空，旧 walk 再数下去既浪费 I/O，结果也是错的；
     // 同时放开单飞闸门，保证清理后 measureCache 跑的是全新一条（不会回吐清理前的数字）。
     this.cancelUsage('清理图片缓存');
+    // s21 黑区修法：清理同样不得 release 仍挂在屏上的位图（阅读器就在上一层页面时，
+    // 旧写法点一次「清理图片缓存」就把正在看的那几张释放掉 = 整行纯黑）。仍被持有的挂待释放表。
     this.mem.forEach((pm: image.PixelMap) => {
-      try {
-        pm.release();
-      } catch (err) {
-        Logger.w('释放 PixelMap 失败');
-      }
+      this.releaseMaybe(pm);
     });
     this.mem.clear();
     this.memOrder = [];
     this.pageMem.forEach((pm: image.PixelMap) => {
-      try {
-        pm.release();
-      } catch (err) {
-        Logger.w('释放页图 PixelMap 失败');
-      }
+      this.releaseMaybe(pm);
     });
     this.pageMem.clear();
     this.pageOrder = [];
@@ -1159,11 +1187,17 @@ export class ImageCache {
     const store: Map<string, image.PixelMap> = page ? this.pageMem : this.mem;
     const order: string[] = page ? this.pageOrder : this.memOrder;
     const cap: number = page ? MAX_PAGE_MEM : MAX_MEM;
+    const prev: image.PixelMap | undefined = store.get(key);
     if (store.has(key)) {
       const idx: number = order.indexOf(key);
       if (idx >= 0) {
         order.splice(idx, 1);
       }
+    }
+    // 同键换实例（并发 loadPage 同址、或手动重试重新解码）：旧实例也可能还挂在屏上，
+    // 走同一条出口，不再静默覆盖后不管（旧写法这条路径既漏 release 也不计数）
+    if (prev !== undefined && prev !== pm) {
+      this.releaseMaybe(prev);
     }
     store.set(key, pm);
     order.push(key);
@@ -1172,17 +1206,94 @@ export class ImageCache {
       order.splice(0, 1);
       const evicted: image.PixelMap | undefined = store.get(oldest);
       store.delete(oldest);
-      // 被淘汰项是「最久未用」的图像，通常已不在屏上；释放其 native 内存，避免 RLIMIT 累积
-      // s14：isReleased 是**方法**（@ohos.multimedia.image.d.ts:5970，@since 22）。旧写法 !evicted.isReleased
-      // 取的是方法引用（恒真值）⇒ 取反恒 false ⇒ LRU 淘汰其实从来没释放过，页图 native 内存一直堆着，
-      // 阅读器翻十几页就顶到 RLIMIT。改成真调用。
-      if (evicted !== undefined && !evicted.isReleased()) {
-        evicted.release().catch((err: BusinessError) => {
-          Logger.ex('PixelMap release 失败', err as Object);
-        });
+      // s21 黑区修法：被淘汰项「最久未用」不等于「不在屏上」—— 阅读器行的 pm 只有 memGet
+      // 命中才 bump LRU，屏上静止阅读的那几行从不 bump，快翻时正是它们被判成最久未用。
+      // 对仍被持有的位图 release = Image 画整幅纯黑（无异常无日志），所以一律走 releaseMaybe。
+      if (evicted !== undefined) {
+        this.releaseMaybe(evicted);
       }
     }
   }
+  // ---------------------------------------------------------- 持有登记（s21 黑区修法）
+
+  /**
+   * 消费侧挂载期间持有：把 loadPage 返回的位图写进组件状态之前调用，与 unpin 严格配对
+   * （阅读器侧由 setShown 一步做完，见 view/reader/ReaderView.ets）。
+   */
+  retain(pm: image.PixelMap): void {
+    const c: number = this.pinned.get(pm) ?? 0;
+    this.pinned.set(pm, c + 1);
+    ImageCache.pinLive++;
+    // 曾被逐出、又被同一实例重新挂载（翻回上一页命中缓存）：撤回待释放标记
+    this.pendingRelease.delete(pm);
+  }
+
+  /** 与 retain 配对的归还：计数归零且已不在缓存里（挂在待释放表上）才真 release。 */
+  unpin(pm: image.PixelMap | undefined): void {
+    if (pm === undefined) {
+      return;
+    }
+    const c: number = this.pinned.get(pm) ?? 0;
+    if (c <= 1) {
+      this.pinned.delete(pm);
+    } else {
+      this.pinned.set(pm, c - 1);
+    }
+    if (ImageCache.pinLive > 0) {
+      ImageCache.pinLive--;
+    }
+    if (this.pinned.get(pm) === undefined && this.pendingRelease.get(pm) === true) {
+      this.pendingRelease.delete(pm);
+      this.releaseNow(pm, 'unpin');
+    }
+  }
+
+  /**
+   * 消费侧挂载那一刻补一次纯黑探针（异步、只记账、不参与任何渲染判定）。
+   * 调用方负责按实例去重（同一次挂载只报一次），见 view/reader/ReaderView.ets 的 setShown。
+   */
+  static probeShown(pm: image.PixelMap): void {
+    ImageCache.probeBlack(pm).then((v: number): void => {
+      if (v === 1) {
+        ImageCache.showBlack++;
+      } else if (v === -1) {
+        ImageCache.showUnknown++;
+      } else {
+        ImageCache.showOk++;
+      }
+    }).catch((): void => {
+      ImageCache.showUnknown++;
+    });
+  }
+
+  /** 淘汰与清理的统一出口：仍被持有的只挂进待释放表，绝不 release（黑区修法核心）。 */
+  private releaseMaybe(pm: image.PixelMap): void {
+    if (this.pinned.get(pm) !== undefined) {
+      this.pendingRelease.set(pm, true);
+      ImageCache.evictHeld++;
+      return;
+    }
+    this.releaseNow(pm, 'evict');
+  }
+
+  /** 真 release（异步、吞异常）并计数，供诊断行核对「到底释放了几张」。 */
+  private releaseNow(pm: image.PixelMap, why: string): void {
+    try {
+      // isReleased 是方法（@ohos.multimedia.image.d.ts:5970，@since 22）；旧写法取方法引用恒真，
+      // 见 memPut 里 s14 那段历史注释。这里必须真调用。
+      if (pm.isReleased()) {
+        return;
+      }
+    } catch (err) {
+      // 已释放对象上调 isReleased 可能直接抛：按「无需再释放」处理，不冒泡
+      return;
+    }
+    ImageCache.pmReleased++;
+    pm.release().catch((err: BusinessError) => {
+      Logger.ex('PixelMap release 失败(' + why + ')', err as Object);
+    });
+  }
+
 
   // ------------------------------------------------------------ 解码
 

@@ -46,14 +46,39 @@ const CHAPTER_PREVIEW: number = 20;
 struct DetailCover {
   @Prop @Watch('onUrlChanged') url: string = '';
   @State pm: image.PixelMap | undefined = undefined;
+  /**
+   * s21 黑区修法：与 @State pm 分开的**持有账本**（同 view/reader/ReaderView.ets 的 held/setShown 口径）。
+   * 「清理图片缓存」与 LRU 淘汰都不该 release 仍在显示的那一张：被 release 后 Image 画整幅纯黑，
+   * 不抛异常也不留日志（阅读器上的同款缺陷就是那条黑区）。
+   */
+  private held: image.PixelMap | undefined = undefined;
 
   aboutToAppear(): void {
     this.load();
   }
 
+  aboutToDisappear(): void {
+    this.setShown(undefined);
+  }
+
   onUrlChanged(): void {
-    this.pm = undefined;
+    this.setShown(undefined);
     this.load();
+  }
+
+  /** 挂载/摘除唯一入口：retain 在前、unpin 在后，再把值喂给 @State。 */
+  private setShown(next: image.PixelMap | undefined): void {
+    const prev: image.PixelMap | undefined = this.held;
+    if (next !== undefined) {
+      ImageCache.getInstance().retain(next);
+      this.held = next;
+    } else {
+      this.held = undefined;
+    }
+    this.pm = next;
+    if (prev !== undefined && prev !== next) {
+      ImageCache.getInstance().unpin(prev);
+    }
   }
 
   async load(): Promise<void> {
@@ -61,9 +86,10 @@ struct DetailCover {
       return;
     }
     try {
-      this.pm = await ImageCache.getInstance().load(this.url);
+      const map: image.PixelMap = await ImageCache.getInstance().load(this.url);
+      this.setShown(map);
     } catch (e) {
-      this.pm = undefined;
+      this.setShown(undefined);
     }
   }
 
@@ -167,6 +193,8 @@ struct DetailPage {
   @State progress: ReadProgress | null = null;
   @State inShelf: boolean = false;
   @State coverPm: image.PixelMap | undefined = undefined;
+  /** s21 黑区修法：封面持有账本（同 DetailCover.held 口径）。 */
+  private heldCover: image.PixelMap | undefined = undefined;
 
   /** 简介是否展开 */
   @State descExpanded: boolean = false;
@@ -182,6 +210,26 @@ struct DetailPage {
   @State chapterView: ChapterInfo[] = [];
   /** 动作进行中标记（防连点重复提交） */
   @State busy: string = '';
+
+  aboutToDisappear(): void {
+    // s21 黑区修法：离开页面归还封面持有，否则 pinLive 只涨不落
+    this.setCover(undefined);
+  }
+
+  /** 封面挂载/摘除唯一入口（同 setShown 口径，本类字段叫 coverPm）。 */
+  private setCover(next: image.PixelMap | undefined): void {
+    const prev: image.PixelMap | undefined = this.heldCover;
+    if (next !== undefined) {
+      ImageCache.getInstance().retain(next);
+      this.heldCover = next;
+    } else {
+      this.heldCover = undefined;
+    }
+    this.coverPm = next;
+    if (prev !== undefined && prev !== next) {
+      ImageCache.getInstance().unpin(prev);
+    }
+  }
 
   aboutToAppear(): void {
     try {
@@ -301,15 +349,15 @@ struct DetailPage {
   private loadCover(): void {
     const m: MangaSummary | null = this.manga;
     if (m === null || m.coverUrl.length === 0) {
-      this.coverPm = undefined;
+      this.setCover(undefined);
       return;
     }
     ImageCache.getInstance().load(m.coverUrl)
       .then((pm: image.PixelMap): void => {
-        this.coverPm = pm;
+        this.setCover(pm);
       })
       .catch((_e: Object): void => {
-        this.coverPm = undefined;
+        this.setCover(undefined);
       });
   }
 

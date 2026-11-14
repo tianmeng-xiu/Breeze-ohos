@@ -20,14 +20,39 @@ export struct MangaGridCard {
   @StorageProp('isDark') isDark: boolean = false;
   @State pm: image.PixelMap | undefined = undefined;
   @State failed: boolean = false;
+  /**
+   * s21 黑区修法：与 @State pm 分开的**持有账本**（同 view/reader/ReaderView.ets 的 held/setShown 口径）。
+   * 「清理图片缓存」与 LRU 淘汰都不该 release 仍在显示的那一张：被 release 后 Image 画整幅纯黑，
+   * 不抛异常也不留日志（阅读器上的同款缺陷就是那条黑区）。
+   */
+  private held: image.PixelMap | undefined = undefined;
 
   aboutToAppear(): void {
     this.load();
   }
 
+  aboutToDisappear(): void {
+    this.setShown(undefined);
+  }
+
+  /** 挂载/摘除唯一入口：retain 在前、unpin 在后，再把值喂给 @State。 */
+  private setShown(next: image.PixelMap | undefined): void {
+    const prev: image.PixelMap | undefined = this.held;
+    if (next !== undefined) {
+      ImageCache.getInstance().retain(next);
+      this.held = next;
+    } else {
+      this.held = undefined;
+    }
+    this.pm = next;
+    if (prev !== undefined && prev !== next) {
+      ImageCache.getInstance().unpin(prev);
+    }
+  }
+
   /** Grid 虚拟滚动可能复用节点：地址变了必须清掉旧图重取，否则串封面 */
   onCoverChanged(): void {
-    this.pm = undefined;
+    this.setShown(undefined);
     this.failed = false;
     this.load();
   }
@@ -39,7 +64,7 @@ export struct MangaGridCard {
     }
     try {
       const map: image.PixelMap = await ImageCache.getInstance().load(this.coverUrl);
-      this.pm = map;
+      this.setShown(map);
     } catch (err) {
       const e = err as BusinessError;
       console.error('[SearchCard] cover failed: code=' + e.code + ' msg=' + e.message);
