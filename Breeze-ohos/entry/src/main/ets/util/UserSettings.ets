@@ -68,6 +68,13 @@ export class UserSettings {
    * 后续整理时可原样搬进 PrefKeys 并改成引用，值不得改（改值 = 作废老用户已存的档位）。
    */
   private static readonly KEY_SCROLL_MODE: string = 'reader_scroll_mode';
+  /**
+   * 自动阅读三项（五项轮新增，口径照抄上游 ReadSettingState：竖向间隔 / 横向间隔 / 竖向距离%）。
+   * 存实际值不存档位下标 ⇒ 以后调界不作废老数据。非法值（0/负数）一律返 0 由消费方回落默认。
+   */
+  private static readonly KEY_AUTO_COL_MS: string = 'reader_auto_col_ms';
+  private static readonly KEY_AUTO_PAGE_MS: string = 'reader_auto_page_ms';
+  private static readonly KEY_AUTO_DIST_PCT: string = 'reader_auto_dist_pct';
   /** 阅读方向；非法值（老数据或手改库）一律回落默认 */
   static readDirection(): string {
     const v: string = PreferenceStore.getInstance().getString(PrefKeys.READ_DIRECTION, ReadDirection.LTR);
@@ -78,9 +85,22 @@ export class UserSettings {
     return UserSettings.readDirection() === ReadDirection.RTL;
   }
 
+  /**
+   * 方向的响应式副本键（AppStorage）：五项轮起阅读器内设置面板可直接改向，
+   * 口径与 STORAGE_SCROLL_MODE 完全一致（键名与写入口只在本类一处，消费方别各自 setOrCreate）。
+   */
+  static readonly STORAGE_DIRECTION: string = 'readerDirection';
+
+  /** 同步推方向副本（不落库） */
+  static pushDirection(value: string): string {
+    const v: string = value === ReadDirection.RTL ? ReadDirection.RTL : ReadDirection.LTR;
+    AppStorage.setOrCreate<string>(UserSettings.STORAGE_DIRECTION, v);
+    return v;
+  }
+
   static async setReadDirection(value: string): Promise<void> {
-    await PreferenceStore.getInstance().putString(PrefKeys.READ_DIRECTION,
-      value === ReadDirection.RTL ? ReadDirection.RTL : ReadDirection.LTR);
+    const v: string = UserSettings.pushDirection(value);
+    await PreferenceStore.getInstance().putString(PrefKeys.READ_DIRECTION, v);
   }
 
   /**
@@ -127,8 +147,64 @@ export class UserSettings {
     return PreferenceStore.getInstance().getBool(PrefKeys.READER_TAP_TO_SCROLL, false);
   }
 
+  /** 放大后点按平移的响应式副本键（五项轮，口径同 STORAGE_SCROLL_MODE / STORAGE_DIRECTION） */
+  static readonly STORAGE_TAP_PAN: string = 'readerTapPan';
+
+  /** 同步推平移档副本（不落库） */
+  static pushTapPan(value: boolean): boolean {
+    AppStorage.setOrCreate<boolean>(UserSettings.STORAGE_TAP_PAN, value);
+    return value;
+  }
+
   static async setTapToScroll(value: boolean): Promise<void> {
-    await PreferenceStore.getInstance().putBool(PrefKeys.READER_TAP_TO_SCROLL, value);
+    const v: boolean = UserSettings.pushTapPan(value);
+    await PreferenceStore.getInstance().putBool(PrefKeys.READER_TAP_TO_SCROLL, v);
+  }
+
+  /** 自动阅读：竖向滚动间隔 ms；0 = 未设置，消费方回落默认（上游默认 1600，界 300–5000） */
+  static autoColIntervalMs(): number {
+    const v: number = PreferenceStore.getInstance().getInt(UserSettings.KEY_AUTO_COL_MS, 0);
+    return v > 0 ? v : 0;
+  }
+
+  /** 自动阅读：横向翻页间隔 ms；0 = 未设置（上游默认 3000，界 800–10000） */
+  static autoPageIntervalMs(): number {
+    const v: number = PreferenceStore.getInstance().getInt(UserSettings.KEY_AUTO_PAGE_MS, 0);
+    return v > 0 ? v : 0;
+  }
+
+  /** 自动阅读：竖向每次滚动距离（视口高百分比）；0 = 未设置（上游默认 72，界 10–100） */
+  static autoDistancePct(): number {
+    const v: number = PreferenceStore.getInstance().getInt(UserSettings.KEY_AUTO_DIST_PCT, 0);
+    return v > 0 ? v : 0;
+  }
+
+  static async setAutoColIntervalMs(ms: number): Promise<void> {
+    await PreferenceStore.getInstance().putInt(UserSettings.KEY_AUTO_COL_MS, ms);
+  }
+
+  static async setAutoPageIntervalMs(ms: number): Promise<void> {
+    await PreferenceStore.getInstance().putInt(UserSettings.KEY_AUTO_PAGE_MS, ms);
+  }
+
+  static async setAutoDistancePct(pct: number): Promise<void> {
+    await PreferenceStore.getInstance().putInt(UserSettings.KEY_AUTO_DIST_PCT, pct);
+  }
+
+  /**
+   * 数值偏好的通用钳位（五项轮）：脏数据（手改库 / 老版本越界值 / NaN）一律回落 def，
+   * 落在界内才放行。消费方是阅读器读自动阅读三项的地方 —— 间隔被打成 0 会让自动阅读
+   * 变成死循环，所以宁可用默认值也不能原样放行。
+   */
+  static clampInt(value: number, min: number, max: number, def: number): number {
+    if (!Number.isFinite(value)) {
+      return def;
+    }
+    const v: number = Math.round(value);
+    if (v < min || v > max) {
+      return def;
+    }
+    return v;
   }
 
   /** 已存的 UA 原文；空串 = 从未设置过，走 HttpClient 内置默认 */

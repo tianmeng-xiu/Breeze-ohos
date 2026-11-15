@@ -45,6 +45,12 @@ const CHAPTER_PREVIEW: number = 20;
 @Component
 struct DetailCover {
   @Prop @Watch('onUrlChanged') url: string = '';
+  /**
+   * s30 第 7 条：共享元素转场 id。**默认空串 = 不参与转场**（SDK 原文：id 为空串则不施加共享转场），
+   * 只有详情页头图那一处会传值；「相关推荐」那批不传 = 一页里同一本书的 id 至多两枚组件（列表页封面 +
+   * 本页头图），不撞「一 id 两枚」上限。
+   */
+  @Prop heroId: string = '';
   @State pm: image.PixelMap | undefined = undefined;
   /**
    * s21 黑区修法：与 @State pm 分开的**持有账本**（同 view/reader/ReaderView.ets 的 held/setShown 口径）。
@@ -118,6 +124,18 @@ struct DetailCover {
     .backgroundColor(Theme.coverColor(this.isDark))
     .borderRadius(Dim.coverRadius)
     .clip(true)
+    // s30 第 7 条：转场挂在**容器根**上而不是 Image(this.pm) 上 —— 详情封面是异步解码的 PixelMap，
+    // 挂 Image 上时若那一帧还没解出来，飞过去的就是那格「无封面」占位（真机观感 = 灰块飞一下）。
+    // 容器从进场起尺寸就稳定（外面 Column 定了 104×139），共享的是这块矩形而不是像素。
+    // s31 第 6 条：与 view/bookshelf/BookshelfPage.ets 的 CoverCell 逐字同参（同 duration + 同 curve）。
+    // type=Exchange 是 SDK 默认值（common.d.ts:3809 原文 Default = SharedTransitionEffectType.Exchange），
+    // 这里显式写出来是因为第 7 条的「向四周展开」正是 Exchange 的语义：只插值几何（位置 + 尺寸），
+    // 不做淡入淡出 ⇒ 飞过去的始终是这块不透明矩形，中途不会透出底色。写清默认值也防以后被人改动默认档。
+    .sharedTransition(this.heroId, {
+      duration: Anim.pageHero,
+      curve: Anim.curveEaseOut(),
+      type: SharedTransitionEffectType.Exchange
+    })
   }
 
   @StorageProp('isDark') isDark: boolean = false;
@@ -392,6 +410,22 @@ struct DetailPage {
   }
 
   private openReader(c: ChapterInfo): void {
+    // s31 第 7 条（用户原话「从详情到阅读器的动画不够顺畅，整体会发生黑色闪烁，可以改为封面飞向中间，
+    // 向四周展开形成阅读页的形式」）：共享元素要两端各一枚同 id 组件，落地页 = pages/ReaderPage.ets。
+    // ★ 为什么走 AppStorage 而不是加进 ReaderParams：路由参数类在 view/reader/ReaderParams.ets（本批写域外），
+    //   且它的字段语义已被 README/阅读记录钉住；AppStorage 是仓内既有的跨页第二通道（isDark、
+    //   shelfRevision、topBarProgress 同款），一次性消费完就清空，不留脏值。
+    // ★ 必须在 pushUrl **之前**写：阅读器只在 aboutToAppear 里读一次（那时才建浮层节点，
+    //   晚一帧就没有共享元素的落点 = 飞行直接不出现）。
+    // ★ 无封面时两个键都写空串 ⇒ 阅读器整块浮层不进组件树，只剩页级淡入（不做半截动画）。
+    // 键名就近写死：全站键名真源是 view/common/Theme.ets 的 AppKeys，但那份文件不在本批写域内，
+    // 已在交卷正文登记给 lead 择机上收（两处字符串必须与 pages/ReaderPage.ets 的常量逐字一致）。
+    const hid: string = 'cover_' + this.sourceId + '_' + this.mangaId;
+    const m: MangaSummary | null = this.manga;
+    const url: string = m !== null ? m.coverUrl : '';
+    const heroOk: boolean = url.length > 0;
+    AppStorage.setOrCreate<string>('heroCoverId', heroOk ? hid : '');
+    AppStorage.setOrCreate<string>('heroCoverUrl', heroOk ? url : '');
     const p: ReaderParams = new ReaderParams(this.mangaId, this.sourceId, this.title, c.id);
     router.pushUrl({ url: 'pages/ReaderPage', params: p })
       .catch((e: Object): void => {
@@ -642,6 +676,35 @@ struct DetailPage {
       })
   }
 
+  /**
+   * s31 第 6 条（用户原话「从书架点开书本和关闭书本的时候动画应当统一，若是采用飞出则同时应该采用飞入
+   * 并适当放缓动画速度，若采用右滑进入，则应统一为滑动退出」）：页级转场由「右侧推拉」改成
+   * **同参数交叉淡入淡出**，并选用户给的第一个分支：飞出 = 封面从书架格子飞向头部（进入），
+   * 飞入 = 同一条线倒放（返回），两边同 duration 同 curve，时长 220 → 360（「适当放缓」）。
+   *
+   * 为什么把页级位移一起换成淡入淡出（这是本批最需要交代的一次取舍）：
+   *  ① 书架是 TabContent 的子组件、不是 router 页，**结构上无法**定义自己的 pageTransition
+   *     （router 只驱动页面实例的转场，见 pages/Index.ets 里 BookshelfPage 挂在 Tabs 内）。
+   *     推拉档下必然出现「进来的那层在滑、底下那层不动」= 用户描述的「一层滑走一层不动」，
+   *     而这一半在写域内无解。淡入淡出**根本没有位移层**：底下那层原地不动正是交叉溶解应有的样子，
+   *     缺陷形态从源头上不再存在，也不依赖上一级页面配合。
+   *  ② 第 7 条要求详情页 → 阅读器不再是推拉（阅读器根底在深色下是纯黑，推拉 = 一整块黑色带硬边
+   *     横扫 = 「整体黑色闪烁」）。如果详情页只对阅读器特殊处理，pageTransition 是页级、不区分去向,
+   *     就得再加一个「我这次是去哪」的状态位并在合适的时机复位（时序不可证）⇒ 改成全平台一条规则
+   *     比加状态位更小、更不容易错，也让五个入口（书架/发现/搜索/阅读记录/详情自跳）观感一致。
+   *  ③ 进出用**同一个构造**（同 duration 同 curve 只换 opacity 端点）⇒ 方向对称是可证的：
+   *     Enter 起点 0 → 1，Exit 1 → 0（SDK 原文 page_transition.d.ts:198-208「Sets the starting opacity
+   *     value for entrance or the ending opacity value for exit」）。
+   * 代价（真机要盯）：从书架/发现/搜索进详情页由「推」变「溶」，全站方向感改由封面共享元素承担；
+   * 手势返回仍是同一档淡出，不会与侧滑手势抢位移。
+   */
+  pageTransition() {
+    PageTransitionEnter({ duration: Anim.pageHero, curve: Anim.curveEaseOut() })
+      .opacity(0);
+    PageTransitionExit({ duration: Anim.pageHero, curve: Anim.curveEaseOut() })
+      .opacity(0);
+  }
+
   build() {
     Column() {
       BreezeTopBar({
@@ -667,7 +730,11 @@ struct DetailPage {
             // ---- 头图 + 元信息 ----
             Row() {
               Column() {
-                DetailCover({ url: this.manga !== null ? this.manga.coverUrl : '' })
+                // s30 第 7 条：头图传 heroId（与书架 CoverCell 的 id 规则逐字符一致）
+                DetailCover({
+                  url: this.manga !== null ? this.manga.coverUrl : '',
+                  heroId: 'cover_' + this.sourceId + '_' + this.mangaId
+                })
               }
               .width(104)
               .height(139)

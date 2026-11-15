@@ -219,6 +219,20 @@ export struct BookshelfPage {
           .borderRadius(Dim.coverRadius)
           .backgroundColor(Theme.coverColor(this.isDark))
           .draggable(false)
+          // s30 第 7 条「从哪来、到哪去」：这枚封面与详情页头图共享同一条转场线（id 规则 =
+          // 'cover_' + sourceId + '_' + 作品 id，两边必须逐字符一致；带 sourceId 是因为不同源的
+          // 作品 id 会撞号）。API = sharedTransition（common.d.ts:20241，@since 7，classic router 兼容）。
+          // ★ id 只能配在两页各一枚组件上：详情页「相关推荐」那批 DetailCover 刻意**不带** id，
+          //   否则一页内同 id 超两枚 = 撞 SDK 上限，转场会挑错目标。
+          // s31 第 6 条（用户原话「从书架点开书本和关闭书本的时候动画应当统一……适当放缓动画速度」）：
+          // 时长从 contentIn(220) 换 pageHero(360)，与 pages/DetailPage.ets 头图那一枚**逐字同参**。
+          // 为什么必须两边同值：共享元素两端各自的 options 里 duration/curve 谁生效由框架决定，
+          // 两边不同值时进入与退出的观感会不对称（这正是用户说的「点开是一套、关闭是另一套」）。
+          .sharedTransition('cover_' + item.sourceId + '_' + item.id, {
+            duration: Anim.pageHero,
+            curve: Anim.curveEaseOut(),
+            type: SharedTransitionEffectType.Exchange
+          })
 
         if (progress.length > 0) {
           Text(progress)

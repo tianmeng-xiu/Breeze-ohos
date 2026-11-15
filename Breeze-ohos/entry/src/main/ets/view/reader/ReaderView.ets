@@ -45,15 +45,16 @@
  *         手动重试走 AppStorage 信号（键 = 该行尺寸键，只有那一行自己响应），见 tapCenter。
  */
 
-import { router } from '@kit.ArkUI';
+import { router, promptAction } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { image } from '@kit.ImageKit';
 import { Theme, Dim } from '../common/Theme';
+import { Anim } from '../common/Anim';
 import { SourceManager } from '../../data/source/SourceManager';
 import { MangaSource } from '../../data/source/Source';
 import { ImageCache } from '../../data/image/ImageCache';
 import { MangaRepository } from '../../data/db/MangaRepository';
-import { UserSettings, ReadScrollMode } from '../../util/UserSettings';
+import { UserSettings, ReadScrollMode, ReadDirection, SettingLabels } from '../../util/UserSettings';
 import { ChapterInfo, PageImage, ReadProgress } from '../../data/model/Models';
 
 /**
@@ -69,30 +70,60 @@ import { ChapterInfo, PageImage, ReadProgress } from '../../data/model/Models';
 const READER_RETRY_KEY: string = 'readerRetryKey';
 
 /**
- * 纵向档数据源（s13 第 6 条，全仓首例 LazyForEach）：把整章 url 列表交给 LazyForEach，
+ * 纵向档数据源（s13 第 6 条，全仓首例 LazyForEach）：把整章页表交给 LazyForEach，
  * 由框架只实例化可见项与 cachedCount 范围内的邻居，滚远的项自动回收 —— 这是纵向档「跨页续加载」
  * 的实现前提：整章几百张位图不可能同时挂在内存里（ImageCache 的内存 LRU 只有 24 张，
  * 全靠这里不把整章一次性实例化才不会反复解码回吐）。
  *
- * 本类不做原地增删：换章节 = 换整个实例（见 loadPages 里 new WebtoonPageSource），
- * 所以只把监听器存下来（IDataSource 契约要求这两个方法存在，LazyForEach 绑定时会调 register），
- * 不实现 onDataReloaded 那组通知。将来若要「滚到底自动追加下一章」，再在这里补通知。
+ * 换章节 = 换整个实例（见 loadChapterAt 里 new WebtoonPageSource）；**同一实例内只做尾部追加**
+ * （五项轮无缝转场，appendAndNotify），不做删除与前插。
  */
 class WebtoonPageSource implements IDataSource {
-  private readonly urls: string[];
-  /** LazyForEach 绑定时注册进来的监听器：本类不主动通知，存下来只为满足契约 */
+  /**
+   * 五项轮（无缝转场）：条目类型从 string 换成 PageRef（每格自带章身份，理由见 PageRef 注释），
+   * 并去掉 readonly 支持尾部追加。追加走 appendAndNotify（同帧逐条通知 onDataAdd），
+   * 不整体替换数组实例：LazyForEach 的 key 见 WebtoonArea，跨章唯一，已有行的 key 不变
+   * ⇒ 不重建、不重新解码，画面不跳（上游 prependedSlotCount 那套位移在 ArkUI 这边不需要
+   * —— 我们只在尾部追加，视觉位置天然不动）。
+   */
+  private items: PageRef[];
+  /** LazyForEach 绑定时注册进来的监听器：追加下一章要靠它通知（五项轮前只存不通知） */
   private listeners: DataChangeListener[] = [];
 
-  constructor(urls: string[]) {
-    this.urls = urls;
+  constructor(items: PageRef[]) {
+    this.items = items;
   }
 
   totalCount(): number {
-    return this.urls.length;
+    return this.items.length;
   }
 
-  getData(index: number): string {
-    return this.urls[index];
+  getData(index: number): PageRef {
+    return this.items[index];
+  }
+
+  /** 尾部追加后的总格数（调用方拿它算追加起点，见 tryAppendNextChapter） */
+  size(): number {
+    return this.items.length;
+  }
+
+  /**
+   * 尾部追加一批格子并逐条通知 onDataAdd。两条刻意的口径：
+   * ① 不用 onDataReloaded：那会让 LazyForEach 重比对全部条目，代价是整章重新解码，
+   *    与"无缝"正好相反；逐条 onDataAdd 只新增末尾那几个格子。
+   * ② 顺序 = 先改数组再通知，且 index 用追加后的绝对下标（DataChangeListener.onDataAdd
+   *    语义 = 数据被加到该下标处，lazy_for_each.d.ts:644-656）。
+   * ③ 一次一格的循环通知（不是整批一次 onDataAdd）：ArkUI 的 onDataAdd 只带一个下标，
+   *    整批只通知末位会让中间那些格子在 LazyForEach 的计数里缺席 = 少画几页。
+   */
+  appendAndNotify(more: PageRef[]): void {
+    for (let i = 0; i < more.length; i++) {
+      this.items.push(more[i]);
+      const at: number = this.items.length - 1;
+      for (let k = 0; k < this.listeners.length; k++) {
+        this.listeners[k].onDataAdd(at);
+      }
+    }
   }
 
   registerDataChangeListener(listener: DataChangeListener): void {
@@ -107,6 +138,53 @@ class WebtoonPageSource implements IDataSource {
       this.listeners.splice(i, 1);
     }
   }
+}
+
+/**
+ * 纵向档渲染列表里的**一格**（五项轮，无缝转场的身份载体）。
+ *
+ * 为什么不能只塞 url：无缝转场把下一章的页拼进同一条 List 之后，行内三件事都必须按
+ * 「这一格真正属于哪一章」来算，按渲染列表的下标算必错：
+ * ① pageSizeKey(章, 页码) = 尺寸表键与手动重试信号键（跨章同页码会撞键 → 行高表串章）；
+ * ② ImageCache.loadPage/loadSize 的 chapterId 入参 = 插件取图上下文与反混淆意图判定；
+ * ③ 进度落库的 chapterId + page（滚进下一章还记在上一章 = 下次续读回到旧位置）。
+ * 上游同一件事的做法是给整条槽流配两个纯函数 mapGlobalToLocalSlot / mapLocalToGlobalSlot
+ * （reader_seamless_cubit.dart:448-463），本质也是"每格自带章身份"，只是它把映射收在 cubit 里。
+ * 我方只从尾部追加（不 prepend），所以全局下标 → 本地下标只需减去所属章的起点，
+ * 而那一起点直接存在格子上，比维护一张映射表更不容易错。
+ */
+class PageRef {
+  url: string = '';
+  ext: string = '';
+  /** 这一格真正属于的章节 id（不是当前打开的章） */
+  chapterId: string = '';
+  /** 章内页码（1 起），与 pageSizeKey 的口径一致 */
+  pageNo: number = 0;
+  /** 所属章的总页数（顶栏页码与滑杆分母 = 章内口径，不是整条流的长度） */
+  pageTotal: number = 0;
+  /** 属于 chapters 的哪一章（0 起）；进度落库与目录高亮按它判"现在在读第几章" */
+  chIdx: number = 0;
+
+  constructor(url: string, ext: string, chapterId: string, pageNo: number, pageTotal: number, chIdx: number) {
+    this.url = url;
+    this.ext = ext;
+    this.chapterId = chapterId;
+    this.pageNo = pageNo;
+    this.pageTotal = pageTotal;
+    this.chIdx = chIdx;
+  }
+}
+
+/**
+ * 无缝转场用的一章装载结果（五项轮）。刻意只带**已折好的格子**不带 ChapterInfo：追加时
+ * 页表已在手，再回源取一次是多余的请求；title 只给日志与目录高亮对账用。
+ * 载体是 PageRef[]（不是 urls/exts 两条平行数组）：追加路径与首载路径必须走同一枚
+ * buildCells，否则两条路折出来的格子字段口径会漂（chIdx 少写一位 = 追加闸永远不开）。
+ */
+class SeamlessChapter {
+  chapterId: string = '';
+  title: string = '';
+  cells: PageRef[] = [];
 }
 
 /**
@@ -334,6 +412,9 @@ export class ReaderDiag {
    * s27 判代 + 回归双用计数：本进程里 ReaderPageImage 自己的 TapLayer（下沉后的三列热区）收到过多少次点按。
    * ① 判代：装机包没这个字段 = 包早于 s27，回传读数一律作废（既有判代铁律：看新字段在不在）。
    * ② 回归：热区从行盒挪进图片容器后点按必须照样生效 —— 用户明确点过画面而 tap= 仍 0 = 新热区没接住事件。
+   * ★ s30 第 6 条起口径变更：中心列的命中面从「整条竖列」收成居中 96vp 方块 ⇒ 本计数只统计
+   *   ①左右两列翻页 ②中心那一小块。用户点了画面中部但没点中小块时 tap= 不涨属预期，
+   *   判代照看「字段在不在」，回归判定改看「点中小块后涨不涨」，别再拿 tap=>0 当「点过画面」的证据。
    */
   static tapHits: number = 0;
   /** 配对成功次数（同页两侧都量到才算一次）：gap= 的可信度分母，0 时 gap= 无意义 */
@@ -707,6 +788,18 @@ function looksTechnical(s: string): boolean {
 /** 单页图片：自己按 url 从 ImageCache 取 PixelMap（懒加载，Swiper 只实例化可见页） */
 @Component
 struct ReaderPageImage {
+  /**
+   * 中心热区高度（vp；s31 第 4 条把热区放大）。宽度不在这里给 —— 由下面 TapLayer 中列的
+   * width('100%') 撑满整列（中列 = 40% 屏宽，见三列宽度那条注释），本常量只管竖向 220vp。
+   * s30 那版是居中 96×96 方块，真机反馈「扩大打开设置的中央区域，当前太小」⇒ 现约 154×220vp，
+   * 面积是原来的五倍多。**刻意不让热区超出父 Stack 边界**（超出边界能否命中是未验证行为，不赌），
+   * 所以只把中列从 1/3 屏宽扩到 2/5、竖向给 220vp，而不是给一个会顶出屏幕的定值。
+   * ★ 必须声明在**本 struct**：TapLayer 是本组件的 @Builder，而常量原先声明在 ReaderView 上是
+   *   private static —— 跨 struct 取别人的 private 成员在 ArkTS 严格模式下就是访问权限错误
+   *   （补丁 C 搬的就是这一处）。static 成员写在 @Component struct 内是仓内既有做法
+   *   （先例 = ReaderView.SLIDER_JUMP_DEBOUNCE_MS）。
+   */
+  private static readonly TAP_CENTER_H: number = 220;
   @Prop @Watch('onUrlChanged') url: string = '';
   /** 图源 id（空 = 未知，走宿主 HTTP；插件图源才走插件取图 + 反混淆意图）。 */
   @Prop sourceId: string = '';
@@ -1346,8 +1439,10 @@ struct ReaderPageImage {
   @Builder
   TapLayer() {
     Row() {
+      // 三列宽度（s31 第 4 条）：左 30% / 中 40% / 右 30%（原先三等分 = 中列最多 1/3 屏宽，
+      // 中心热区跟着受限）。左右各留 30% ≈ 115vp，翻页照样好点。
       Column()
-        .layoutWeight(1)
+        .width('30%')
         .height('100%')
         .backgroundColor(Color.Transparent)
         .onClick(() => {
@@ -1355,17 +1450,28 @@ struct ReaderPageImage {
           this.onTapPrev();
         })
 
-      Column()
+      // 中列 = 纯容器（自身不挂 onClick ⇒ 不吞事件），真正的命中面是居中的一块矩形热区：
+      // s30 第 6 条「点击区域中心一定面积的区域内设置才弹出，再点一下中心，关闭设置」；
+      // s31 第 4 条按真机反馈把它放大成「中列整宽 × TAP_CENTER_H」= 约 154×220vp（原 96×96）。
+      // 竖向给 TAP_CENTER_H、横向 width('100%') 撑满中列 ⇒ 热区四边都在父 Stack 内。
+      // 背景仍写 Transparent —— s27 真机验证过「透明背景 + 空容器 + onClick」在 ArkUI 上可命中，
+      // 空 Column 不给背景则不参与命中，这两点是这套热区能用的前提，别顺手删。
+      Stack({ alignContent: Alignment.Center }) {
+        Column()
+          .width('100%')
+          .height(ReaderPageImage.TAP_CENTER_H)
+          .borderRadius(16)
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            ReaderDiag.tapHits += 1; // s27 判代 + 回归双用（s30 起只统计中心小块，见 ReaderDiag.tapHits 注释）
+            this.onTapCenter();
+          })
+      }
         .layoutWeight(1)
         .height('100%')
-        .backgroundColor(Color.Transparent)
-        .onClick(() => {
-          ReaderDiag.tapHits += 1; // s27 判代 + 回归双用
-          this.onTapCenter();
-        })
 
       Column()
-        .layoutWeight(1)
+        .width('30%')
         .height('100%')
         .backgroundColor(Color.Transparent)
         .onClick(() => {
@@ -1391,26 +1497,52 @@ export struct ReaderView {
   @Prop chapterId: string = '';
 
   @StorageProp('topSafeHeight') topSafe: number = 0;
+  /** 底栏/抽屉贴底部安全区用（AppStorage 键由 EntryAbility 写入，口径同 BreezeBottomTab） */
+  @StorageProp('bottomSafeHeight') bottomSafe: number = 0;
+  /** 浮层配色跟全局深浅色（阅读器正文区恒黑底，但抽屉与设置卡片要跟系统） */
+  @StorageProp('isDark') isDark: boolean = false;
   /**
    * 阅读模式的响应式副本（s13 第 6 条）：初值在 aboutToAppear 从偏好灌进 AppStorage，
    * 之后只由「更多页选项」或本文件的 applyScrollMode 改写 ⇒ 阅读器还活着时改档也能立刻翻档。
    */
   @StorageProp('readerScrollMode') @Watch('onScrollModeStorage') scrollMode: string = ReadScrollMode.PAGER;
+  /**
+   * 方向与「放大后点按平移」两档（五项轮）：原先只在 aboutToAppear 读一次，改档要重进阅读器。
+   * 阅读器内设置面板要能即时改这两档 ⇒ 照 scrollMode 那套补 AppStorage 副本 + @Watch。
+   */
+  @StorageProp('readerDirection') @Watch('onDirectionStorage') dirPref: string = ReadDirection.LTR;
+  @StorageProp('readerTapPan') @Watch('onTapPanStorage') tapPanPref: boolean = false;
+  /**
+   * **横向档（Pager）**的页表与取图入参（同下标成对，五项轮之后仍是"一次一章"）：
+   * 无缝转场只在纵向档做（上游同样只给条漫做，reader_seamless_cubit 只挂 Column 档），
+   * 所以这两枚数组不需要承载跨章身份；纵向档的渲染条目走 webtoonSource 里的 PageRef。
+   */
   @State urls: string[] = [];
   /**
    * 与 urls **同下标**的取图入参表（s18 第 5 条）。刻意不做 @State：它不参与任何渲染判定，
    * 只在 loadPage/loadSize 的调用点按下标取用（口径同那条「参与 UI 判定的忙闲态必须是 @State」——
-   * 反过来不参与渲染就不必挂装饰器）。与 urls 的唯一写入点是 loadPages 里那一次成对赋值，
+   * 反过来不参与渲染就不必挂装饰器）。与 urls 的唯一写入点是 loadChapterAt 里那一次成对赋值，
    * 换章节 = 两个数组一起换，不存在「urls 新、exts 旧」的中间态。
    */
   private pageExts: string[] = [];
+  /**
+   * 纵向档当前**渲染流**里的全部格子（五项轮）。与 urls 的分工：urls 只管横向档那一章，
+   * 这一枚管纵向档整条流（本章 + 已追加的邻章）。不挂 @State：渲染由 LazyForEach + IDataSource
+   * 驱动，挂 @State 反而会让框架在 append 时整表重排（与无缝相反）。
+   */
+  private cells: PageRef[] = [];
   @State pageIndex: number = 0;
   @State chapterName: string = '';
   /** 实际打开的章节 id（用于落库进度；入参 chapterId 为空时取首章） */
   @State currentChapterId: string = '';
   @State loading: boolean = true;
   @State errorMsg: string = '';
-  @State chromeVisible: boolean = true;
+  /**
+   * 顶栏 + 底栏的显隐（s30 第 6 条改默认值 = false）：用户裁定「设置默认沉浸，不要影响阅读」⇒
+   * 进阅读器两栏都不出，点画面中心那一小块才出（见 tapCenter 与 ReaderPageImage 的中心热区）。
+   * ★ 与 s27 那批装机包的判代无关，纯粹是产品口径：chrome 常驻既挡阅读又是 #5 那个全屏遮挡层的开关。
+   */
+  @State chromeVisible: boolean = false;
   @State zoomScale: number = 1;
   @State baseZoomScale: number = 1;
   /** 放大后的平移量（vp）：只有 zoomScale>1 时非零，翻页/重进章节都归零 */
@@ -1422,6 +1554,51 @@ export struct ReaderView {
   /** 进页时读一次：rtl 方向 + 放大后点按是否平移 */
   @State rtl: boolean = false;
   @State tapPans: boolean = false;
+  /**
+   * 章节表与当前章下标（五项轮新增）：原先章节表只是 loadPages 里的局部变量，
+   * TOC 跳转 / 上下章 / 无缝转场三件事都需要它常驻状态。下标语义 = chapters 的 0 起下标，
+   * -1 = 还没定位（加载失败或加载中）。
+   */
+  @State chapters: ChapterInfo[] = [];
+  @State chapterIndex: number = -1;
+  /**
+   * 阅读器内浮层两枚开关（五项轮）：设置面板 / 章节目录，都是根 Stack 上的兄弟层
+   * （全仓统一做法，理由见 SettingPage 的 UaOverlay 注释：ClickEvent 无 stopPropagation，
+   * 遮罩与卡片必须是兄弟节点才能各收各的点按）。底栏不另设开关 = 跟 chromeVisible 一起显隐，
+   * 与上游 isMenuVisible 同时驱动顶栏底栏的语义一致。
+   */
+  @State settingsVisible: boolean = false;
+  @State tocVisible: boolean = false;
+  /** 自动阅读（五项轮）：开关只在本章内有效（切章即停，见 loadChapterAt），速度进 UserSettings 持久化 */
+  @State autoReadOn: boolean = false;
+  /** 自动阅读计时器句柄；-1 = 空闲。aboutToDisappear 必须清（口径同 webtoonSaveTimer） */
+  private autoReadTimer: number = -1;
+  /** 进度滑杆的「挪档后 300ms 才真跳」定时器（上游 _jumpDebounce 的对应物，见 onSliderChange 注释） */
+  private sliderJumpTimer: number = -1;
+  private static readonly SLIDER_JUMP_DEBOUNCE_MS: number = 300;
+  /**
+   * 自动阅读速度（五项轮，口径**照抄上游** reader_auto_read_controller.dart:111-119：
+   * 速度 = 「每 intervalMs 走 distance% 视口高」两参数，不是"秒每张"的显式档）：
+   * 竖向默认 1600ms / 72%（界 300–5000 / 10–100），横向 = 纯定时翻页默认 3000ms（界 800–10000）。
+   * 存库不存"档位下标"，存实际值 ⇒ 以后调界不作废老数据。
+   */
+  @State autoReadIntervalMs: number = ReaderView.AUTO_READ_INTERVAL_DEFAULT;
+  @State autoReadPagerIntervalMs: number = ReaderView.AUTO_READ_PAGER_INTERVAL_DEFAULT;
+  @State autoReadDistancePct: number = ReaderView.AUTO_READ_DIST_DEFAULT;
+  /** 自动阅读速度档（横向秒/页旧暂定口径已废，改上游两参数制；常量保留给校验用） */
+  private static readonly AUTO_READ_INTERVAL_DEFAULT: number = 1600;
+  private static readonly AUTO_READ_INTERVAL_MIN: number = 300;
+  private static readonly AUTO_READ_INTERVAL_MAX: number = 5000;
+  private static readonly AUTO_READ_PAGER_INTERVAL_DEFAULT: number = 3000;
+  private static readonly AUTO_READ_PAGER_INTERVAL_MIN: number = 800;
+  private static readonly AUTO_READ_PAGER_INTERVAL_MAX: number = 10000;
+  private static readonly AUTO_READ_DIST_DEFAULT: number = 72;
+  private static readonly AUTO_READ_DIST_MIN: number = 10;
+  private static readonly AUTO_READ_DIST_MAX: number = 100;
+  /** 滑杆拖动中的页码（-1 = 未拖动）：Moving 期间只写它，不碰 pageIndex（避免与 Swiper 打架） */
+  @State sliderPage: number = -1;
+  /** 纵向档 List 是否已挂载：已挂载时 jumpToIndex 需立刻消费 pendingJump（见 jumpToIndex 注释） */
+  @State webtoonReady: boolean = false;
   /**
    * 纵向档数据源。刻意**不是** @State：它自己不是可观察数组，交给 LazyForEach 后由框架按
    * totalCount 取数；换章节时整体换成新实例，@State urls 负责触发 this.build() 重算即可。
@@ -1439,12 +1616,72 @@ export struct ReaderView {
   private pendingJumpIndex: number = -1;
   /** 纵向档落库节流计时器；-1 = 空闲 */
   private webtoonSaveTimer: number = -1;
+  /**
+   * 最后一次**手指按在滚动区上**的时刻（自动阅读的让位判据用，见 autoTick）。
+   * 刻意用 onTouch 而不是 onDidScroll：onDidScroll 也会被自动阅读自己的 scrollBy 触发，
+   * 用它判"用户在滚"会让定时器每 tick 都被自己挡掉 = 自动阅读永不生效。
+   */
+  private lastUserTouchAt: number = 0;
+  /**
+   * 无缝转场的在途闸门（五项轮）：一次只允许一章在拉。上游用两枚 Set
+   * （loadingChapterOrders / prefetchingChapterOrders）做同一件事，因为它是按 order 任意预取；
+   * 我方同一时刻只可能追加紧邻的下一章，一枚布尔就够，且**必须是实例字段不能是局部变量** ——
+   * onScrollIndex 在阈值区内会连触好几帧，没有这道闸就是同一章并发拉两次。
+   */
+  private seamlessAppending: boolean = false;
+  /**
+   * s31 第 2 条：从「贴底」这条驱动已经连续追加了几轮（封顶用）。
+   * 判据 = SEAMLESS_CHAIN_MAX，归零点 = onWebtoonScrollIndex 里画面真推进的那一刻。
+   * 必须放实例字段不能放局部变量 —— 它要跨多次 onReachEnd 回调累计（口径同 seamlessAppending）。
+   */
+  private seamlessChainRounds: number = 0;
+  /** 上一次贴底追加当时的页码；观察到的页码超过它 = 画面真推进了 ⇒ 轮次归零。-1 = 无 */
+  private bottomAnchorIndex: number = -1;
+  /** 上一次贴底追加的时刻（0 = 从未；BOTTOM_APPEND_COOLDOWN_MS 的节流基准） */
+  private lastBottomAppendAt: number = 0;
+  /** 「延后一拍复核贴底」的一次性计时器；-1 = 空闲。销毁口径同 webtoonSaveTimer */
+  private touchBottomRetryTimer: number = -1;
 
   private swiperController: SwiperController = new SwiperController();
   /** 放大判定的死区：缩放回到 1 附近就恢复「点按翻页」，别留 1.0000001 的尾巴 */
   private static readonly ZOOM_EPS: number = 0.02;
   /** 纵向档落库节流窗口：一屏滚到底最多写一次库 */
   private static readonly WEBTOON_SAVE_DEBOUNCE_MS: number = 800;
+  /**
+   * 无缝转场的追加阈值（**章内剩余页数**，不是渲染流剩余条数）。上游是两个阈值
+   * _nextPrefetchThreshold=2 / _nextAutoResolveThreshold=1（reader_seamless_cubit.dart:62-63）：
+   * 前者只预取章节信息、后者才真加载并拼接。我方没有「预取章节信息」这一层（chapters 表
+   * 进页就已在手，不像上游要先按 order 回源解析），所以两层合成一层 = 取 2：
+   * 距本章还剩 2 页就发邻章请求，走到章尾那一屏时邻章基本已到 = 手感是「无缝」的；
+   * 取 1 则请求发在最后一屏，弱网下必然还是撞到空白。
+   */
+  private static readonly SEAMLESS_APPEND_AHEAD: number = 2;
+  /**
+   * s31 第 2 条：从「已贴在流末尾」这条驱动连续追加的封顶轮数。
+   * 它只在**画面没往前走**时累加（归零点见 onWebtoonScrollIndex 里的 bottomAnchorIndex），
+   * 所以挡的是「邻章追加进来了却没把画面撑开」（邻章交了空表只剩壳、坏图 0 高）这一类
+   * 死循环，不限制用户实际连读多少章 —— 画面一推进就清零。
+   */
+  private static readonly SEAMLESS_CHAIN_MAX: number = 5;
+  /**
+   * 贴底追加的最小间隔 = 「画面撑不开」兜底的节流闸：极端情况下把无界重试压成
+   * 每 1.2 秒最多一次请求。正常连读两章之间的间隔远大于一秒，撞不到它。
+   */
+  private static readonly BOTTOM_APPEND_COOLDOWN_MS: number = 1200;
+  /**
+   * 「延后一拍再看是否贴底」的等待量。SDK 明写内容不满一屏时 onReachEnd 在首帧就触发
+   * 一次（list.d.ts:1646-1647），那一刻布局常未定稿、isAtEnd 不可信 ⇒ 延后一拍复核，
+   * 且只复核一拍（不轮询）：还没贴底就当噪声丢掉。
+   */
+  private static readonly TOUCH_BOTTOM_RETRY_MS: number = 420;
+  /**
+   * 横向档 Swiper 的 cachedCount（s31 第 3 条）：翻页动画进行中，前一页 / 当前页 /
+   * 后一页要同时在场。缓存不够时新页是「边滑进来边解码」= 滑进来的是背景，
+   * 真机现象就是自动阅读每翻一页露一帧黑底。SDK 建议 1 到 2（swiper.d.ts:1612、1631）。
+   */
+  private static readonly PAGER_CACHED_COUNT: number = 2;
+  /** 节奏滑杆的刻度（0.1 秒/格）。存储域仍是毫秒，这里只决定滑杆分辨率（s31 第 5 条） */
+  private static readonly AUTO_READ_SEC_STEP: number = 0.1;
   /** 纵向档点按一侧的滚动距离 = 视口高的 80%（留 20% 当上下文，避免整屏替换看不出衔接） */
   private static readonly WEBTOON_PAGE_STEP_RATIO: number = 0.8;
   /**
@@ -1468,8 +1705,23 @@ export struct ReaderView {
   private static readonly WEBTOON_CACHED_COUNT: number = 4;
 
   aboutToAppear(): void {
-    this.rtl = UserSettings.isRtl();
-    this.tapPans = UserSettings.tapToScroll();
+    // 五项轮：方向与平移两档改为「灌进 AppStorage + @StorageProp 订阅」，
+    // 口径与 scrollMode 完全一致（灌晚了首帧会闪默认档）
+    const dir: string = UserSettings.readDirection();
+    UserSettings.pushDirection(dir);
+    this.dirPref = dir;
+    this.rtl = dir === ReadDirection.RTL;
+    const pan: boolean = UserSettings.tapToScroll();
+    UserSettings.pushTapPan(pan);
+    this.tapPanPref = pan;
+    this.tapPans = pan;
+    // 自动阅读速度灌值（未设置 = 0 ⇒ 回落各档默认；界内钳一道，脏数据不许把间隔打成 0）
+    this.autoReadIntervalMs = UserSettings.clampInt(UserSettings.autoColIntervalMs(),
+      ReaderView.AUTO_READ_INTERVAL_MIN, ReaderView.AUTO_READ_INTERVAL_MAX, ReaderView.AUTO_READ_INTERVAL_DEFAULT);
+    this.autoReadPagerIntervalMs = UserSettings.clampInt(UserSettings.autoPageIntervalMs(),
+      ReaderView.AUTO_READ_PAGER_INTERVAL_MIN, ReaderView.AUTO_READ_PAGER_INTERVAL_MAX, ReaderView.AUTO_READ_PAGER_INTERVAL_DEFAULT);
+    this.autoReadDistancePct = UserSettings.clampInt(UserSettings.autoDistancePct(),
+      ReaderView.AUTO_READ_DIST_MIN, ReaderView.AUTO_READ_DIST_MAX, ReaderView.AUTO_READ_DIST_DEFAULT);
     // 先把偏好里的档位灌进 AppStorage 再读：@StorageProp 的初值取的就是那个键，
     // 灌晚了首帧会闪一下默认档（冷启动阅读器时最容易看到）
     const mode: string = UserSettings.readScrollMode();
@@ -1479,12 +1731,17 @@ export struct ReaderView {
   }
 
   aboutToDisappear(): void {
+    // 五项轮：自动阅读的定时器必须跟着销毁（口径同 webtoonSaveTimer，漏了 = 退出阅读器还在翻页）
+    this.stopAutoRead();
     // 退出阅读器：取消未落地的节流落库，并补写一次当前页
     // （旧版没有这次补写，纵向档「滚到一半直接退出」会把最后不到 800ms 的进度丢掉）
     if (this.webtoonSaveTimer >= 0) {
       clearTimeout(this.webtoonSaveTimer);
       this.webtoonSaveTimer = -1;
     }
+    // s31 第 2 条：贴底复核那枚一次性计时器与它同性质 —— 退出阅读器还留着它，
+    // 420ms 后就会在已销毁的组件上调 Scroller（轻则空操作、重则抛错），一并清掉。
+    this.clearTouchBottomRetry();
     this.saveProgress();
   }
 
@@ -1533,6 +1790,702 @@ export struct ReaderView {
     this.saveProgress();
   }
 
+  /** 方向被阅读器内面板/设置页改动：即时翻向，不必重进阅读器（五项轮补的口子） */
+  private onDirectionStorage(): void {
+    this.rtl = this.dirPref === ReadDirection.RTL;
+  }
+
+  /** 「放大后点按平移」被改动：tapSide 每次现读 this.tapPans，改完下一跳就生效 */
+  private onTapPanStorage(): void {
+    this.tapPans = this.tapPanPref;
+  }
+
+  /**
+   * 自动阅读开关（五项轮）。上游语义照搬 reader_auto_read_controller.dart:71-73：
+   * 「关→开」强制解除暂停，所以这里不留上次的暂停态；开/关只影响本页会话，
+   * 切章会停（loadChapterAt 里 stopAutoRead），重进阅读器默认关 —— 误开自动翻页
+   * 比误关更恼火，刻意不进持久化。
+   */
+  private setAutoRead(on: boolean): void {
+    if (on === this.autoReadOn) {
+      return;
+    }
+    this.autoReadOn = on;
+    if (on) {
+      // s30 第 4 条：按下开关就退沉浸（收 chrome + 两枚浮层）—— 一是让位判据现在与 chrome 无关，
+      // 收栏纯粹为了「别拿工具条挡着自动滚的画」；二是浮层若还开着 autoTick 会让位，收起即开始推进。
+      this.chromeVisible = false;
+      this.settingsVisible = false;
+      this.tocVisible = false;
+      this.startAutoRead();
+    } else {
+      this.stopAutoRead();
+    }
+  }
+
+  /**
+   * 起自动阅读定时器。两档分开（口径同上游 _resolveIntervalMs）：
+   * 纵向 = 每 intervalMs 滚 distance% 视口高；横向 = 每 intervalMs 翻一页（无距离量）。
+   * 用 setInterval 不用递归 setTimeout：本仓没有帧回调先例（displaySync 零使用），
+   * 而"每 tick 让位给用户手势"由 autoTick 自己判（见下），不需要帧级精度。
+   */
+  private startAutoRead(): void {
+    this.stopAutoRead();
+    if (!this.autoReadOn) {
+      return;
+    }
+    const ms: number = this.isWebtoon()
+      ? UserSettings.clampInt(this.autoReadIntervalMs, ReaderView.AUTO_READ_INTERVAL_MIN, ReaderView.AUTO_READ_INTERVAL_MAX, ReaderView.AUTO_READ_INTERVAL_DEFAULT)
+      : UserSettings.clampInt(this.autoReadPagerIntervalMs, ReaderView.AUTO_READ_PAGER_INTERVAL_MIN, ReaderView.AUTO_READ_PAGER_INTERVAL_MAX, ReaderView.AUTO_READ_PAGER_INTERVAL_DEFAULT);
+    this.autoReadTimer = setInterval((): void => {
+      this.autoTick();
+    }, ms);
+  }
+
+  private stopAutoRead(): void {
+    if (this.autoReadTimer >= 0) {
+      clearInterval(this.autoReadTimer);
+      this.autoReadTimer = -1;
+    }
+    // 滑杆的去抖定时器与自动阅读同性质：都是「面板一收/一页翻完就该作废」的挂起动作，
+    // 放同一处清，避免切章后 300ms 又跳回旧位置。
+    if (this.sliderJumpTimer >= 0) {
+      clearTimeout(this.sliderJumpTimer);
+      this.sliderJumpTimer = -1;
+    }
+  }
+
+  /**
+   * 毫秒 -> 「多少秒」的展示串（s31 第 5 条：节奏改用秒表达，**存储与取值域仍是毫秒**）。
+   * 刻意做成方法而不是塞进 build 的表达式：ArkTS 严格模式不容忍把算术结果直接喂进调用
+   * （本仓踩过的那条 Return type Object is not supported），一律先落显式类型局部变量。
+   * 尾零口径自洽 = 整秒不带小数（3 秒 / 8 秒），非整秒留一位（0.3 秒 / 1.6 秒 / 2.5 秒）；
+   * 全程只用整除与取余，不碰字符串切割类 API，免得再踩类型坑。
+   */
+  private cadenceText(ms: number): string {
+    const tenth: number = Math.round(ms / 100);
+    const whole: number = Math.floor(tenth / 10);
+    const dec: number = tenth - whole * 10;
+    if (dec === 0) {
+      return whole + ' 秒';
+    }
+    return whole + '.' + dec + ' 秒';
+  }
+
+  /** 毫秒 -> 秒刻度（Slider 的 value/min/max 用）。同样先落显式类型局部变量再返回 */
+  private cadenceSec(ms: number): number {
+    const sec: number = ms / 1000;
+    return sec;
+  }
+
+  /** 秒刻度 -> 毫秒：滑杆 step = 0.1，乘回来本就是 100 的整数倍，Math.round 只收浮点尾巴 */
+  private msFromCadenceSec(sec: number): number {
+    const ms: number = Math.round(sec * 1000);
+    return ms;
+  }
+
+  /**
+   * 一次自动阅读推进。三条让位（上游 canTick = !isMenuVisible && !isSliderRolling && !isComicRolling
+   * 的 ArkTS 等价，comic_read_auto_read_part.dart:5-20）：
+   * ① 设置面板或目录浮层开着（**s30 起顶/底栏不再参与**，理由见下面函数内注释）
+   * ② 滑杆正拖着 ③ 这一章还没页（失败或加载中）。
+   * 让位 = 这一 tick 什么都不做（不重置定时器），跟上游「直接 return」一致，
+   * 用户关掉面板就接着走，不需要重新开一次。
+   */
+  private autoTick(): void {
+    // s30 第 4 条修正：原先这条含 chromeVisible ⇒ 自动阅读开关长在底栏里，开栏才能开自动阅读，
+    // 而栏一开就把自己挡死（真机现象 = 点了完全不动）。上游 canTick 里的 isMenuVisible 是浮层语义，
+    // 我们的顶/底栏是常驻 chrome，不能当「用户在操作」看 ⇒ 让位只看两枚浮层与拖动/加载。
+    if (this.settingsVisible || this.tocVisible) {
+      return;
+    }
+    if (this.sliderPage >= 0 || this.loading || this.pageCount() === 0) {
+      return;
+    }
+    if (this.isWebtoon()) {
+      // 用户手指正按在屏幕上（Down/Move 后 240ms 内）就让位：不硬抢他指下的画面。
+      // 判据取 onTouch 不取 onDidScroll —— 后者会被本定时器自己的 scrollBy 触发，
+      // 用它等于自己把自己挡死（自动阅读永远不动）。
+      if (Date.now() - this.lastUserTouchAt < 240) {
+        return;
+      }
+      const step: number = this.areaH * (this.autoReadDistancePct / 100);
+      if (step <= 0) {
+        return;
+      }
+      this.webtoonScroller.scrollBy(0, step);
+      this.scheduleProgressSave();
+      return;
+    }
+    // s31 第 3 条：原先这条走 jumpToIndex ⇒ 直接写 @State pageIndex ⇒ Swiper 的 .index()
+    // 受控跳页 = 无动画硬切，真机现象 = 自动阅读每翻一页露一帧黑底（lead 给的根因判定）。
+    // 改走控制器 showNext()（swiper.d.ts:50 @since 7）：它走原生翻页动画，时长由 .duration(200)
+    // 决定，动画结束由 onChange 把 index 回写 pageIndex（swiper.d.ts:1869 明写「因动画引起的
+    // 索引变化在动画结束时触发」）⇒ 数据只有「动画 -> onChange」单向流，不会和受控属性互灌。
+    if (this.pageIndex < this.pageCount() - 1) {
+      this.swiperController.showNext();
+      return;
+    }
+    // s31 第 2 条 B：横向档自动阅读走到最后一页 = 接下一章，不再 clamp 在末页干等。
+    // 原先「停住等用户重开」的保守口径要和 loadChapterAt 的自动续开（F2-RESUME）配套，
+    // 单独上任何一半都不成立：只上这条 = 每翻进一章都要手动重开一次自动阅读。
+    this.advancePagerChapter();
+  }
+
+  // ---------------- 五项轮：底栏 / 进度滑杆 / 设置面板 / 目录浮层 ----------------
+
+  /**
+   * 顶栏与底栏共用的页码串。★ 章内口径（第 k 页 / 本章共 n 页），不是整条渲染流口径：
+   * 无缝转场把下一章追加进同一条流之后，用 cells.length 当分母会打出 137/204 这种
+   * 用户看不懂的数（上游同理 = getDisplayPageNumber 只吃章内槽位）。
+   * 滑杆拖动中（sliderPage >= 0）显示目标页 = 上游「拖动全程联动页码显示」的对应物。
+   */
+  private pageLabel(): string {
+    const total: number = this.pageTotalAt(this.pageIndex);
+    if (total <= 0) {
+      return '0/0';
+    }
+    if (this.sliderPage >= 0) {
+      const p: number = this.pageNoAt(this.sliderPage);
+      const t: number = this.pageTotalAt(this.sliderPage);
+      return p + '/' + (t > 0 ? t : total);
+    }
+    return this.pageNoAt(this.pageIndex) + '/' + total;
+  }
+
+  /** 滑杆分母 = 整条渲染流的格数（跨章追加后滑杆覆盖到底栏打开时所见的全流）。 */
+  private sliderMax(): number {
+    const n: number = this.pageCount();
+    return n > 1 ? n - 1 : 0;
+  }
+
+  /**
+   * 滑杆拖动 = 「挪一档重启 300ms 去抖，到点才真跳」（上游 _jumpDebounce 语义，
+   * 不是「松手才跳」）：Begin/Moving 每次触发都重挂定时器，全程只联动页码显示；
+   * End/Click 立即收尾跳一次。sliderPage 保持到 End/Click 才清零 = 拖动与刚跳完的
+   * 短暂窗口里顶栏都显示目标页。
+   */
+  private onSliderChange(value: number, mode: SliderChangeMode): void {
+    const n: number = this.pageCount();
+    if (n === 0) {
+      return;
+    }
+    let page: number = Math.round(value);
+    if (page < 0) {
+      page = 0;
+    }
+    if (page > n - 1) {
+      page = n - 1;
+    }
+    this.sliderPage = page;
+    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+      if (this.sliderJumpTimer >= 0) {
+        clearTimeout(this.sliderJumpTimer);
+        this.sliderJumpTimer = -1;
+      }
+      this.jumpToIndex(page);
+      this.sliderPage = -1;
+      return;
+    }
+    if (this.sliderJumpTimer >= 0) {
+      clearTimeout(this.sliderJumpTimer);
+    }
+    this.sliderJumpTimer = setTimeout((): void => {
+      this.sliderJumpTimer = -1;
+      this.jumpToIndex(page);
+    }, ReaderView.SLIDER_JUMP_DEBOUNCE_MS);
+  }
+
+  /**
+   * 阅读器内切章的统一入口（TOC 点选 / 上下章键）。带 loading 与失败上屏：
+   * loadChapterAt 里 fetchPages 的异常会抛给调用方，这里不接住就是静默失败
+   * （s15 那条「用户只看到五个字、真因在 console」的教训同款）。
+   */
+  private switchChapter(idx: number): void {
+    this.tocVisible = false;
+    this.settingsVisible = false;
+    if (idx === this.chapterIndex) {
+      return;
+    }
+    this.loading = true;
+    this.errorMsg = '';
+    this.loadChapterAt(idx, false).then((): void => {
+      this.loading = false;
+    }).catch((err: Object): void => {
+      this.loading = false;
+      const raw: string = typeof (err as Error).message === 'string' ? (err as Error).message : '';
+      this.errorMsg = briefForScreen(raw, '章节加载失败，可点按重试');
+      ReaderDiag.noteChapterError(this.errorMsg);
+    });
+  }
+
+  /**
+   * 上下章键：先弹确认再切（上游 JumpChapter 的 AlertDialog 语义 = 阅读器内切章是
+   * 不可逆动作，误触代价 = 丢当前页）。TOC 点选不弹（列表里点 = 显式意图）。
+   */
+  private confirmJumpChapter(idx: number): void {
+    if (idx < 0 || idx >= this.chapters.length) {
+      return;
+    }
+    const title: string = this.chapters[idx].title;
+    const opts: promptAction.ShowDialogOptions = {
+      title: '切换章节',
+      message: title,
+      buttons: [
+        { text: '切过去', color: Theme.brand },
+        { text: '取消', color: Theme.text2(this.isDark) }
+      ]
+    };
+    promptAction.showDialog(opts).then((res: promptAction.ShowDialogSuccessResponse): void => {
+      if (res.index !== 0) {
+        return;
+      }
+      this.switchChapter(idx);
+    }).catch((): void => {
+      // 点遮罩会让 Promise 走失败分支，等同取消（SearchPage:531 同口径）
+    });
+  }
+
+  private toast(msg: string): void {
+    promptAction.showToast({ message: msg.length > 80 ? msg.slice(0, 80) : msg });
+  }
+
+  /**
+   * 底栏：chromeVisible 的兄弟层（与顶栏同进同退，对齐上游 isMenuVisible 同时喂两栏）。
+   * ★ 必须自己包一层 alignContent Bottom 的 Stack：根 Stack 是 TopStart，裸 Row 会贴顶。
+   * 五键全用文字（目录/自动两个图标名在 SDK 里没有已验证的先例，不赌）。
+   */
+  @Builder
+  ReaderBottomBar() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column() {
+        // 进度滑杆行：滑杆 + 页码（顶栏页码与此同源 = pageLabel()）
+        Row({ space: 10 }) {
+          Slider({
+            value: this.sliderPage >= 0 ? this.sliderPage : this.pageIndex,
+            min: 0,
+            max: this.sliderMax(),
+            step: 1,
+            style: SliderStyle.OutSet
+          })
+            .layoutWeight(1)
+            .blockColor(Theme.brand)
+            .selectedColor(Theme.brand)
+            .trackColor('#40FFFFFF')
+            .enabled(this.sliderMax() > 0)
+            .onChange((value: number, mode: SliderChangeMode): void => {
+              this.onSliderChange(value, mode);
+            })
+          Text(this.pageLabel())
+            .fontSize(12)
+            .fontColor(Theme.white)
+            .maxLines(1)
+        }
+        .width('100%')
+        .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: 6 })
+
+        // 五键行（键宽随屏宽均分，44vp 最小高保证可点）
+        Row() {
+          Text('上一章')
+            .fontSize(13)
+            .fontColor(this.chapterIndex > 0 ? Theme.white : '#66FFFFFF')
+            .textAlign(TextAlign.Center)
+            .height(36)
+            .layoutWeight(1)
+            .borderRadius(18)
+            .backgroundColor('#26FFFFFF')
+            .onClick((): void => {
+              if (this.chapterIndex > 0) {
+                this.confirmJumpChapter(this.chapterIndex - 1);
+              }
+            })
+          Text('目录')
+            .fontSize(13)
+            .fontColor(Theme.white)
+            .textAlign(TextAlign.Center)
+            .height(36)
+            .layoutWeight(1)
+            .margin({ left: 8 })
+            .borderRadius(18)
+            .backgroundColor('#26FFFFFF')
+            .onClick((): void => {
+              this.settingsVisible = false;
+              this.tocVisible = true;
+            })
+          Text(this.autoReadOn ? '停止自动' : '自动阅读')
+            .fontSize(13)
+            .fontColor(this.autoReadOn ? Theme.brand : Theme.white)
+            .textAlign(TextAlign.Center)
+            .height(36)
+            .layoutWeight(1)
+            .margin({ left: 8 })
+            .borderRadius(18)
+            .backgroundColor('#26FFFFFF')
+            .onClick((): void => {
+              this.setAutoRead(!this.autoReadOn);
+            })
+          Text('设置')
+            .fontSize(13)
+            .fontColor(Theme.white)
+            .textAlign(TextAlign.Center)
+            .height(36)
+            .layoutWeight(1)
+            .margin({ left: 8 })
+            .borderRadius(18)
+            .backgroundColor('#26FFFFFF')
+            .onClick((): void => {
+              // s30 第 6 条：这枚键改幂等 = 面板已开着时再点一下关它（原先只会重复置 true）
+              this.tocVisible = false;
+              this.settingsVisible = !this.settingsVisible;
+            })
+          Text('下一章')
+            .fontSize(13)
+            .fontColor(this.chapterIndex >= 0 && this.chapterIndex < this.chapters.length - 1
+              ? Theme.white : '#66FFFFFF')
+            .textAlign(TextAlign.Center)
+            .height(36)
+            .layoutWeight(1)
+            .margin({ left: 8 })
+            .borderRadius(18)
+            .backgroundColor('#26FFFFFF')
+            .onClick((): void => {
+              if (this.chapterIndex >= 0 && this.chapterIndex < this.chapters.length - 1) {
+                this.confirmJumpChapter(this.chapterIndex + 1);
+              }
+            })
+        }
+        .width('100%')
+        .padding({
+          left: Dim.pagePadding,
+          right: Dim.pagePadding,
+          top: 8,
+          bottom: 8 + this.bottomSafe
+        })
+      }
+      .width('100%')
+      .backgroundColor(Theme.scrim)
+    }
+    .width('100%')
+    .height('100%')
+    // s30 第 5 条（真机缺陷「点击和滑动失效，无法切换到下一页」的根因）：这层是**定位用的全屏容器**，
+    // 自身必须退出命中测试。ArkUI 的命中只按 frame 判，透明背景一样算命中（enums.d.ts:3292 起四个成员，
+    // @since 9）—— 全屏 frame + Default 就把下面整片阅读区的点按与 List 拖动全截住了。
+    // None 的定义原文：节点自身不响应命中，且**不挡子节点**、不挡兄弟与祖先 ⇒ 滑杆与五枚键照常可点，
+    // 遮罩区（这层自己）不再吞事件。
+    // s30 第 7 条：底栏与顶栏成对（同进同退 ⇒ 时长曲线也同一条）。转场必须挂在这层**被增删的子树根**上
+    // （ArkUI 的 transition 只在组件自身增删时触发，挂在里面的工具条 Column 上不会随 if 分支删除而播退场）。
+    // 这层 frame 是全屏且透明的，translate y=56 挪的是它整棵子树的渲染位置 ⇒ 观感 = 工具条从屏幕下沿
+    // 升起/落回，透明区挪 56vp 不产生任何可见空档（它本来就没画东西，遮罩那格 Column 贴在底部跟着走）。
+    .hitTestBehavior(HitTestMode.None)
+    .transition(TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ y: 56 }))
+      .animation({ duration: Anim.barCollapse, curve: Anim.curveBarCollapse() }))
+  }
+
+  /**
+   * 设置面板：底部抽屉，全仓「遮罩 + 卡片兄弟层」口径（SettingPage.UaOverlay 同款结构，
+   * ClickEvent 无 stopPropagation，遮罩与卡片必须兄弟）。条目全部即时生效 = 上游口径
+   * （无「重进生效」项）：写口先推 AppStorage，@Watch 立刻翻档。
+   * 与上游的差距如实登记：上游是四 tab 大面板（60+ 项含逐书偏好/背景四档/滤镜），
+   * 本轮只做阅读器最常用五组，其余留 T4 后续档。
+   */
+  @Builder
+  SettingsOverlay() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(0,0,0,0.45)')
+        .onClick((): void => {
+          this.settingsVisible = false;
+        })
+      Column({ space: 14 }) {
+        Text('阅读设置')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.text1(this.isDark))
+          .width('100%')
+          .textAlign(TextAlign.Start)
+
+        // 滚动方式（两档，即时切档 = @Watch + applyScrollMode）
+        Column({ space: 8 }) {
+          Text('滚动方式')
+            .fontSize(13)
+            .fontColor(Theme.text3(this.isDark))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+          Row({ space: 8 }) {
+            ForEach(SettingLabels.READ_SCROLL_MODE, (label: string, idx: number) => {
+              Text(label)
+                .fontSize(13)
+                .fontColor(this.scrollMode === (idx === 0 ? ReadScrollMode.PAGER : ReadScrollMode.WEBTOON)
+                  ? Theme.white : Theme.text2(this.isDark))
+                .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+                .borderRadius(16)
+                .backgroundColor(this.scrollMode === (idx === 0 ? ReadScrollMode.PAGER : ReadScrollMode.WEBTOON)
+                  ? Theme.brand : Theme.fillColor(this.isDark))
+                .onClick((): void => {
+                  const v: string = idx === 0 ? ReadScrollMode.PAGER : ReadScrollMode.WEBTOON;
+                  if (v !== this.scrollMode) {
+                    UserSettings.setScrollMode(v).catch((_e: Object): void => {});
+                  }
+                })
+            }, (label: string, idx: number) => 'sm' + idx)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        // 阅读方向（两档，即时生效 —— 本轮补了 @StorageProp 订阅，SettingPage 的
+        // 「重进阅读器生效」旧口径自本项起作废）
+        Column({ space: 8 }) {
+          Text('阅读方向')
+            .fontSize(13)
+            .fontColor(Theme.text3(this.isDark))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+          Row({ space: 8 }) {
+            ForEach(SettingLabels.READ_DIRECTION, (label: string, idx: number) => {
+              Text(label)
+                .fontSize(13)
+                .fontColor(this.dirPref === (idx === 0 ? ReadDirection.LTR : ReadDirection.RTL)
+                  ? Theme.white : Theme.text2(this.isDark))
+                .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+                .borderRadius(16)
+                .backgroundColor(this.dirPref === (idx === 0 ? ReadDirection.LTR : ReadDirection.RTL)
+                  ? Theme.brand : Theme.fillColor(this.isDark))
+                .onClick((): void => {
+                  const v: string = idx === 0 ? ReadDirection.LTR : ReadDirection.RTL;
+                  if (v !== this.dirPref) {
+                    UserSettings.setReadDirection(v).catch((_e: Object): void => {});
+                  }
+                })
+            }, (label: string, idx: number) => 'dir' + idx)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        // 放大后点按平移（仅横向档有意义，开关语义与设置页同一条记录）
+        Row() {
+          Text('放大后点按平移')
+            .fontSize(13)
+            .fontColor(Theme.text3(this.isDark))
+            .layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.tapPans })
+            .onChange((on: boolean): void => {
+              if (on !== this.tapPans) {
+                UserSettings.setTapToScroll(on).catch((_e: Object): void => {});
+              }
+            })
+        }
+        .width('100%')
+
+        Divider().strokeWidth(0.5).color(Theme.dividerColor(this.isDark))
+
+        // 自动阅读（两参数口径照上游：竖向 = 每 ms 走 pct% 视口高；横向 = 每 ms 翻一页）
+        Row() {
+          Text('自动阅读')
+            .fontSize(14)
+            .fontColor(Theme.text1(this.isDark))
+            .layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.autoReadOn })
+            .onChange((on: boolean): void => {
+              this.setAutoRead(on);
+            })
+        }
+        .width('100%')
+
+        if (this.autoReadOn) {
+          Column({ space: 4 }) {
+            Row() {
+              Text('步进距离')
+                .fontSize(13)
+                .fontColor(Theme.text3(this.isDark))
+                .layoutWeight(1)
+              Text(this.autoReadDistancePct + '%')
+                .fontSize(13)
+                .fontColor(Theme.text2(this.isDark))
+            }
+            .width('100%')
+            Slider({
+              value: this.autoReadDistancePct,
+              min: ReaderView.AUTO_READ_DIST_MIN,
+              max: ReaderView.AUTO_READ_DIST_MAX,
+              step: 1,
+              style: SliderStyle.OutSet
+            })
+              .width('100%')
+              .blockColor(Theme.brand)
+              .selectedColor(Theme.brand)
+              .onChange((value: number, mode: SliderChangeMode): void => {
+                const v: number = UserSettings.clampInt(
+                  Math.round(value), ReaderView.AUTO_READ_DIST_MIN, ReaderView.AUTO_READ_DIST_MAX,
+                  ReaderView.AUTO_READ_DIST_DEFAULT);
+                if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+                  this.autoReadDistancePct = v;
+                  return;
+                }
+                this.autoReadDistancePct = v;
+                UserSettings.setAutoDistancePct(v).catch((_e: Object): void => {});
+              })
+          }
+          .width('100%')
+
+          Column({ space: 4 }) {
+            Row() {
+              Text(this.isWebtoon() ? '滚动节奏（秒/步）' : '翻页节奏（秒/页）')
+                .fontSize(13)
+                .fontColor(Theme.text3(this.isDark))
+                .layoutWeight(1)
+              // s31 第 5 条：读数换成秒（存储仍是毫秒，cadenceText 只做显示层换算）
+              Text(this.cadenceText(this.isWebtoon() ? this.autoReadIntervalMs : this.autoReadPagerIntervalMs))
+                .fontSize(13)
+                .fontColor(Theme.text2(this.isDark))
+            }
+            .width('100%')
+            // s31 第 5 条：滑杆整条刻度换成秒。换算全走 cadenceSec（内部先落显式类型
+            // 局部变量再返回），不把算术结果直接写进 SliderOptions 的字段里。
+            // 区间端点由毫秒常量换算而来 = 取值域一个字节都没动，老存档继续有效。
+            Slider({
+              value: this.cadenceSec(this.isWebtoon() ? this.autoReadIntervalMs : this.autoReadPagerIntervalMs),
+              min: this.cadenceSec(this.isWebtoon() ? ReaderView.AUTO_READ_INTERVAL_MIN : ReaderView.AUTO_READ_PAGER_INTERVAL_MIN),
+              max: this.cadenceSec(this.isWebtoon() ? ReaderView.AUTO_READ_INTERVAL_MAX : ReaderView.AUTO_READ_PAGER_INTERVAL_MAX),
+              step: ReaderView.AUTO_READ_SEC_STEP,
+              style: SliderStyle.OutSet
+            })
+              .width('100%')
+              .blockColor(Theme.brand)
+              .selectedColor(Theme.brand)
+              .onChange((value: number, mode: SliderChangeMode): void => {
+                const col: boolean = this.isWebtoon();
+                // s31 第 5 条：刻度已是秒 ⇒ 第一步就换算回毫秒，后面的钳位、@State、落库、
+                // 重启定时器全部沿用原逻辑（持久化键与取值域不变 = 老存档不失效）。
+                // 算术结果一律先落显式类型局部变量：直接塞进 clampInt 会撞 ArkTS 的
+                // Return type Object is not supported（本仓既有教训）。
+                const sec: number = value;
+                const ms: number = this.msFromCadenceSec(sec);
+                const v: number = col
+                  ? UserSettings.clampInt(ms, ReaderView.AUTO_READ_INTERVAL_MIN,
+                    ReaderView.AUTO_READ_INTERVAL_MAX, ReaderView.AUTO_READ_INTERVAL_DEFAULT)
+                  : UserSettings.clampInt(ms, ReaderView.AUTO_READ_PAGER_INTERVAL_MIN,
+                    ReaderView.AUTO_READ_PAGER_INTERVAL_MAX, ReaderView.AUTO_READ_PAGER_INTERVAL_DEFAULT);
+                if (col) {
+                  this.autoReadIntervalMs = v;
+                } else {
+                  this.autoReadPagerIntervalMs = v;
+                }
+                if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+                  return;
+                }
+                if (col) {
+                  UserSettings.setAutoColIntervalMs(v).catch((_e: Object): void => {});
+                } else {
+                  UserSettings.setAutoPageIntervalMs(v).catch((_e: Object): void => {});
+                }
+                // 开着自动阅读时改节奏 = 立刻按新节奏重启定时器（上游改参数即时重排程）
+                if (this.autoReadOn) {
+                  this.startAutoRead();
+                }
+              })
+          }
+          .width('100%')
+        }
+      }
+      .width('100%')
+      .padding({
+        left: Dim.pagePadding,
+        right: Dim.pagePadding,
+        top: 16,
+        bottom: 16 + this.bottomSafe
+      })
+      .backgroundColor(Theme.cardColor(this.isDark))
+      .borderRadius({ topLeft: Dim.radius, topRight: Dim.radius })
+    }
+    .width('100%')
+    .height('100%')
+    // s30 第 7 条：设置面板 = 底部抽屉，进/退都走下边（位移量给 220vp ≈ 面板本体高度的一截，
+    // 比整块高度小是因为整块位移会把遮罩一起拖出屏幕边缘、露出底色）。
+    .transition(TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ y: 220 }))
+      .animation({ duration: Anim.barCollapse, curve: Anim.curveBarCollapse() }))
+  }
+
+  /**
+   * 目录浮层：左侧抽屉。章节序 = fetchChapters 原序（正序，第 0 章 = 第一章；
+   * 倒序只是详情页的显示开关，目录与上下游一致保持原序）。
+   * initialIndex 直接给到当前章前 2 行：浮层每次都是 if 新建的子树，构造参数必生效，
+   * 不需要命令式定位（上游的 ensureVisible + 3 次 reveal 是它在已有列表里找，场景不同）。
+   */
+  @Builder
+  TocOverlay() {
+    Stack({ alignContent: Alignment.Start }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(0,0,0,0.45)')
+        .onClick((): void => {
+          this.tocVisible = false;
+        })
+      Column() {
+        Text('目录（' + this.chapters.length + '）')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.text1(this.isDark))
+          .width('100%')
+          .padding({
+            left: Dim.pagePadding,
+            right: Dim.pagePadding,
+            top: 12 + this.topSafe,
+            bottom: 10
+          })
+          .textAlign(TextAlign.Start)
+        List({ space: 0, initialIndex: this.chapterIndex > 2 ? this.chapterIndex - 2 : 0 }) {
+          ForEach(this.chapters, (ch: ChapterInfo, idx: number) => {
+            ListItem() {
+              Row({ space: 8 }) {
+                Text(ch.title)
+                  .fontSize(14)
+                  .fontColor(idx === this.chapterIndex ? Theme.brand : Theme.text1(this.isDark))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+                if (idx === this.chapterIndex) {
+                  Text('当前')
+                    .fontSize(11)
+                    .fontColor(Theme.brand)
+                }
+              }
+              .width('100%')
+              .height(Dim.listItemH - 12)
+              .padding({ left: Dim.pagePadding, right: Dim.pagePadding })
+              .backgroundColor(idx === this.chapterIndex ? Theme.fillColor(this.isDark) : Color.Transparent)
+              .onClick((): void => {
+                this.switchChapter(idx);
+              })
+            }
+          }, (ch: ChapterInfo) => ch.id)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+      }
+      .width('72%')
+      .height('100%')
+      .backgroundColor(Theme.cardColor(this.isDark))
+    }
+    .width('100%')
+    .height('100%')
+    // s30 第 7 条：目录 = 左侧抽屉，进/退都走左边（x 负向 = 从左侧屏幕外进来）。
+    // 目录与设置面板互斥（openToc/openSettings 各自关掉对方）⇒ 两条转场不会同帧打架。
+    .transition(TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ x: -160 }))
+      .animation({ duration: Anim.barCollapse, curve: Anim.curveBarCollapse() }))
+  }
+
 
   /**
    * 让纵向档定位到指定页（要求 3 的定位实现）。两条腿一起走，覆盖「容器还没建好」和
@@ -1546,7 +2499,7 @@ export struct ReaderView {
    * 未绑定的 Scroller 调滚动命令是空操作，静默不报错 = 最难查的那种失败。
    */
   private jumpToIndex(index: number): void {
-    const n: number = this.urls.length;
+    const n: number = this.pageCount();
     if (n === 0) {
       return;
     }
@@ -1560,6 +2513,12 @@ export struct ReaderView {
     this.pageIndex = i;
     this.webtoonStartIndex = i;
     this.pendingJumpIndex = i;
+    // 五项轮：List 已挂载时（典型 = 滑杆 / TOC 在「活列表」上跳页）initialIndex 不会再被读，
+    // 必须立刻消费这次 scrollToIndex；未挂载保持原语义 = 等 onAppear 消费，
+    // 切档与进章节两条老路径到达这里时 webtoonReady 都是 false ⇒ 行为一字不变。
+    if (this.isWebtoon() && this.webtoonReady) {
+      this.consumePendingJump();
+    }
   }
 
   /** List 挂载后补一次定位：只消费一次，之后用户怎么滚都不再插手 */
@@ -1590,26 +2549,122 @@ export struct ReaderView {
 
   /** 纵向档页码判定（要求 3 的口径）：见方法内注释 */
   private onWebtoonScrollIndex(start: number, end: number, center: number): void {
-    if (this.urls.length === 0) {
+    if (this.pageCount() === 0) {
       return;
     }
     // 取 center（屏幕中央那一页）：纵向档一屏常跨两三页，取 start 会让页码长期停在
     // 刚露头的那页、看着「比看到的落后一页」，取 end 会跑到还没读的那页。
     // SDK list.d.ts:1605 未写明三值不可见时的哨兵值，所以 center 非法时退回 start。
     let idx: number = center;
-    if (idx < 0 || idx >= this.urls.length) {
+    // ★ 三处分母全改成 pageCount()（无缝转场追加后可滚条数已大于本章页数）：继续拿
+    // urls.length 判越界会把邻章的 index 一律打回 start = 页码永远回弹到本章第一页，
+    // 且进度会记错章（saveProgress 已改成按 pageIndex 取身份）。
+    const n: number = this.pageCount();
+    if (idx < 0 || idx >= n) {
       idx = start;
     }
-    if (idx < 0 || idx >= this.urls.length) {
+    if (idx < 0 || idx >= n) {
       return;
     }
     if (idx !== this.pageIndex) {
       this.pageIndex = idx;
+      // s31 第 2 条：画面真往前走了 = 上一轮「贴底追加」已经兑现成可见内容 ⇒ 连续计数
+      // 归零。这样 SEAMLESS_CHAIN_MAX 只掐「追加了却撑不开画面」的死循环，
+      // 不会把用户连读几十章的正常路径掐掉。
+      if (idx > this.bottomAnchorIndex) {
+        this.bottomAnchorIndex = idx;
+        this.seamlessChainRounds = 0;
+      }
       this.scheduleProgressSave();
       // 换页就补一轮预取：onScrollIndex 只在跨页时回调（不是每帧），所以这里发不出几轮，
       // 且 isInFlight 判重会把「行组件已在取」的地址全部挡掉，不会把请求队列灌爆
       this.prefetchAround(idx);
     }
+    // 无缝转场的主驱动点：每次跨页都问一次「是否该把下一章拼进来了」，闸门全在
+    // tryAppendNextChapter 里（阈值 + 在途去重 + 已追加判定），这里无条件调即可。
+    // s31 第 2 条 A：这条只覆盖「跨页那一帧」。人停在最后一屏不再跨页时它一次都不响，
+    // 于是最该接下一章的位置反而永远问不到 ⇒ 另加 onReachEnd 这条腿（两者共用同一批闸门，
+    // appendFromBottom 只多一道节流与封顶），不会重复发请求。
+    this.tryAppendNextChapter();
+  }
+
+  /**
+   * s31 第 2 条 A：纵向档「已经贴在流的末尾」时的追加驱动（List .onReachEnd 调它）。
+   * 根因：onScrollIndex 只在跨页那一帧回调，用户停在最后一屏 = 不再跨页 = 一次都不再问。
+   * 三道自己的闸：① 只在纵向档、非加载态、有页时问；② 沿用 autoTick 那条 240ms 让位判据
+   * （手指还按着就不抢他指下的画面）；③ 必须**真贴底**（isAtEnd，scroll.d.ts:566 @since 10）
+   * —— SDK 明写内容不满一屏时首帧白触发一次（list.d.ts:1646-1647），那一刻不认，延后一拍复核。
+   */
+  private onWebtoonReachEnd(): void {
+    if (!this.isWebtoon() || this.loading || this.pageCount() === 0) {
+      return;
+    }
+    if (Date.now() - this.lastUserTouchAt < 240) {
+      return;
+    }
+    if (!this.webtoonScroller.isAtEnd()) {
+      this.scheduleTouchBottomRetry();
+      return;
+    }
+    this.appendFromBottom();
+  }
+
+  /** 延后一拍复核贴底（只一拍、不排第二轮；销毁时在 aboutToDisappear 里清） */
+  private scheduleTouchBottomRetry(): void {
+    if (this.touchBottomRetryTimer >= 0) {
+      return;
+    }
+    this.touchBottomRetryTimer = setTimeout((): void => {
+      this.touchBottomRetryTimer = -1;
+      if (!this.isWebtoon() || this.loading || this.pageCount() === 0) {
+        return;
+      }
+      if (Date.now() - this.lastUserTouchAt < 240) {
+        return;
+      }
+      if (this.webtoonScroller.isAtEnd()) {
+        this.appendFromBottom();
+      }
+    }, ReaderView.TOUCH_BOTTOM_RETRY_MS);
+  }
+
+  private clearTouchBottomRetry(): void {
+    if (this.touchBottomRetryTimer >= 0) {
+      clearTimeout(this.touchBottomRetryTimer);
+      this.touchBottomRetryTimer = -1;
+    }
+  }
+
+  /**
+   * 「贴在流末尾」这条驱动的追加入口（onReachEnd 与延后一拍共用）。
+   * 与 onScrollIndex 那条的关键差别：贴底时流的末格常常**已经是上一轮追加进来的邻章**，
+   * 而 tryAppendNextChapter 的第 ④ 道闸（末格 chIdx >= chapterIndex+1 直接返回）会把它挡死
+   * ⇒ 原样调它 = 读完已经拼进来的那一章之后，再也不会接下一章（这正是本轮要修的）。
+   * 所以这里先把当前章提升到末格所属章。这不是投机：用户此刻就读在那一章上
+   * （saveProgress 早就是按 pageIndex 取格子里的身份落库的，与 chapterIndex 无关），
+   * 提升只是让 chapterIndex / TOC 高亮与画面上看到的一致，顺带把闸门重新打开。
+   * 再叠两道防失控：BOTTOM_APPEND_COOLDOWN_MS 节流 + SEAMLESS_CHAIN_MAX 连续封顶
+   * （归零点在 onWebtoonScrollIndex，见 F2-CHAINRESET）。
+   */
+  private appendFromBottom(): void {
+    if (!this.isWebtoon() || this.loading || this.seamlessAppending || this.pageCount() === 0) {
+      return;
+    }
+    const last: PageRef = this.cells[this.cells.length - 1];
+    if (last.chIdx > this.chapterIndex) {
+      if (this.seamlessChainRounds >= ReaderView.SEAMLESS_CHAIN_MAX) {
+        return;
+      }
+      const now: number = Date.now();
+      if (this.lastBottomAppendAt > 0 && now - this.lastBottomAppendAt < ReaderView.BOTTOM_APPEND_COOLDOWN_MS) {
+        return;
+      }
+      this.seamlessChainRounds = this.seamlessChainRounds + 1;
+      this.lastBottomAppendAt = now;
+      this.bottomAnchorIndex = this.pageIndex;
+      this.chapterIndex = last.chIdx;
+    }
+    this.tryAppendNextChapter();
   }
 
   /**
@@ -1628,14 +2683,89 @@ export struct ReaderView {
    */
   /** 第 index 页（0 起）的取图入参；越界或该图源没给 = 空串（ImageCache 空串不参与键） */
   private extAt(index: number): string {
+    if (this.isWebtoon()) {
+      const c: PageRef | null = this.cellAt(index);
+      return c === null ? '' : c.ext;
+    }
     if (index < 0 || index >= this.pageExts.length) {
       return '';
     }
     return this.pageExts[index];
   }
 
+  // ---------------- 五项轮：两档统一的「按渲染下标问页身份」访问口 ----------------
+  // 无缝转场之后，纵向档一条渲染流里跨了好几章，**下标不再是页码、也不再唯一对应一章**，
+  // 所以任何"按下标取身份"的地方都必须走这里，禁止就地写 urls[i] / currentChapterId + i + 1。
+  // 横向档没有跨章（只挂 Pager 那一章），因此这些口在它身上退化成老语义，行为一字不变。
+
+  /** 当前档这一条流的总格数（顶栏分母、边界判定的分母） */
+  private pageCount(): number {
+    return this.isWebtoon() ? this.cells.length : this.urls.length;
+  }
+
+  /** 纵向档第 index 格；越界 = null（调用方各自早退，不在这里造一个假身份） */
+  private cellAt(index: number): PageRef | null {
+    if (index < 0 || index >= this.cells.length) {
+      return null;
+    }
+    return this.cells[index];
+  }
+
+  /** 第 index 格的 url（横向档 = urls 同下标） */
+  private urlAt(index: number): string {
+    if (this.isWebtoon()) {
+      const c: PageRef | null = this.cellAt(index);
+      return c === null ? '' : c.url;
+    }
+    if (index < 0 || index >= this.urls.length) {
+      return '';
+    }
+    return this.urls[index];
+  }
+
+  /** 第 index 格所属章节 id（**不是** currentChapterId：滚进邻章后两者不同） */
+  private chapterIdAt(index: number): string {
+    if (this.isWebtoon()) {
+      const c: PageRef | null = this.cellAt(index);
+      return c === null ? this.currentChapterId : c.chapterId;
+    }
+    return this.currentChapterId;
+  }
+
+  /** 第 index 格的章内页码（1 起）——尺寸表键、页码显示、落库 page 三处共用 */
+  private pageNoAt(index: number): number {
+    if (this.isWebtoon()) {
+      const c: PageRef | null = this.cellAt(index);
+      return c === null ? index + 1 : c.pageNo;
+    }
+    return index + 1;
+  }
+
+  /** 第 index 格所属章的总页数（页码显示的分母 = 章内口径，与上游 getDisplayPageNumber 一致） */
+  private pageTotalAt(index: number): number {
+    if (this.isWebtoon()) {
+      const c: PageRef | null = this.cellAt(index);
+      return c === null ? this.urls.length : c.pageTotal;
+    }
+    return this.urls.length;
+  }
+
+  /** 第 index 格所属章在 chapters 里的下标（横向档 = 当前章） */
+  private chIdxAt(index: number): number {
+    if (this.isWebtoon()) {
+      const c: PageRef | null = this.cellAt(index);
+      return c === null ? this.chapterIndex : c.chIdx;
+    }
+    return this.chapterIndex;
+  }
+
+  /** 当前页的「页身份」键 = 章 id + 章内页码，与行内 sizeKey() 逐字同源（都转调 pageSizeKey） */
+  private pageKeyAt(index: number): string {
+    return pageSizeKey(this.chapterIdAt(index), this.pageNoAt(index));
+  }
+
   private prefetchAround(index: number): void {
-    const n: number = this.urls.length;
+    const n: number = this.pageCount();
     if (n === 0 || !ImageCache.getInstance().isReady()) {
       return;
     }
@@ -1648,15 +2778,16 @@ export struct ReaderView {
       to = n - 1;
     }
     for (let i = from; i <= to; i++) {
-      const u: string = this.urls[i];
+      const u: string = this.urlAt(i);
       // 判重按页身份（与行内 load 同一个键）：按 url 判在哨兵地址图源上会把整章当成一条在途，
-      // 预取整章静默全废。i + 1 = 页码（1 起），与行内 sizeKey() 的口径逐字一致。
-      const pk: string = pageSizeKey(this.currentChapterId, i + 1);
+      // 预取整章静默全废。身份一律走 pageKeyAt —— 无缝转场后邻章的格子混在同一条流里，
+      // 用 currentChapterId + i + 1 拼会把邻章第 3 页记成本章第 (追加起点+3) 页 = 键错位。
+      const pk: string = this.pageKeyAt(i);
       if (u.length === 0 || ReaderDiag.isInFlight(pk)) {
         continue;
       }
       ReaderDiag.prefetchTotal += 1;
-      ImageCache.getInstance().loadPage(u, this.sourceId, this.currentChapterId, this.extAt(i))
+      ImageCache.getInstance().loadPage(u, this.sourceId, this.chapterIdAt(i), this.extAt(i))
         .then((): void => {})
         .catch((): void => {});
     }
@@ -1670,7 +2801,7 @@ export struct ReaderView {
    * 前移一页后目标页必然在顶栏下方可见。代价 = 高图章节可能多露上一页尾巴，误差一页以内。
    */
   private async resumeOnOpen(): Promise<void> {
-    if (!this.isWebtoon() || this.urls.length === 0) {
+    if (!this.isWebtoon() || this.pageCount() === 0) {
       return;
     }
     try {
@@ -1679,7 +2810,7 @@ export struct ReaderView {
         return;
       }
       const target: number = p.page > 0 ? p.page - 1 : 0;
-      if (target >= this.urls.length) {
+      if (target >= this.pageCount()) {
         return;
       }
       this.jumpToIndex(target);
@@ -1711,44 +2842,19 @@ export struct ReaderView {
         ReaderDiag.noteChapterError(this.errorMsg);
         return;
       }
-      let target: ChapterInfo = chapters[0];
+      // 五项轮：章节表常驻状态（TOC / 上下章 / 无缝转场三件事的共同数据前提）。
+      // 原先它只是这里的局部变量，取完目标章就丢了。
+      this.chapters = chapters;
+      let idx: number = 0;
       if (this.chapterId.length > 0) {
         for (let i = 0; i < chapters.length; i++) {
           if (chapters[i].id === this.chapterId) {
-            target = chapters[i];
+            idx = i;
             break;
           }
         }
       }
-      this.chapterName = target.title;
-      this.currentChapterId = target.id;
-      const pages: PageImage[] = await src.fetchPages(target.id);
-      const list: string[] = [];
-      // s18：extern 必须和 url 一起搬过来。上游插件把每页真正的取图入参放在页对象 extern 里
-      // （e-hentai 整章 url 相同，只有这份 extern 区分页），宿主原先只 push url = 第二处丢失点。
-      const exts: string[] = [];
-      for (let i = 0; i < pages.length; i++) {
-        list.push(pages[i].url);
-        exts.push(pages[i].ext);
-      }
-      this.urls = list;
-      this.pageExts = exts;
-      // 换章节 = 换整个数据源实例（LazyForEach 不认「同实例换内容」，靠 @State urls 变化
-      // 重跑 build，LazyForEach 重新按 key 取数）。页码同步归零，再按存档续读。
-      this.webtoonSource = new WebtoonPageSource(list);
-      this.pageIndex = 0;
-      if (list.length === 0) {
-        this.errorMsg = '本章节没有图片';
-        // 同上：fetchPages 没抛但交了空页表，界面与失败一模一样，必须记账
-        ReaderDiag.noteChapterError(this.errorMsg);
-      } else {
-        ReaderDiag.readerPagesLoaded += 1;
-        // 必须在 finally 置 loading=false（列表真正开始布局）之前把 pageIndex 落好，
-        // 否则首帧先画第一页、下一帧才跳走，看着像进章节抖一下
-        await this.resumeOnOpen();
-        // 章节就绪 + 落点定好之后立刻按窗口预取一轮（首屏之后的几页在用户还没翻到时就进内存）
-        this.prefetchAround(this.pageIndex);
-      }
+      await this.loadChapterAt(idx, true);
     } catch (err) {
       const e = err as BusinessError;
       console.error(`[Reader] load failed: code=${e.code} msg=${e.message}`);
@@ -1766,14 +2872,198 @@ export struct ReaderView {
   }
 
   /**
+   * 切到章节表第 idx 章并装载页表（五项轮新增 = 原 loadPages 的装载段抽出复用）。
+   * 三个调用方：loadPages（首开，resume=true）、TOC 点选与上下章键（resume=false，新章从头读）、
+   * 无缝转场的预取（不走这里，它只追加不重置）。
+   * resume=true 才走 resumeOnOpen：首开要续读，阅读器内主动切章是「我要读这一章」的显式意图，
+   * 从上一章带过来的进度页码套在新章上是错误的。
+   */
+  private async loadChapterAt(idx: number, resume: boolean): Promise<void> {
+    if (this.chapters.length === 0) {
+      return;
+    }
+    let i: number = idx;
+    if (i < 0) {
+      i = 0;
+    }
+    if (i > this.chapters.length - 1) {
+      i = this.chapters.length - 1;
+    }
+    const target: ChapterInfo = this.chapters[i];
+    this.chapterIndex = i;
+    this.chapterName = target.title;
+    this.currentChapterId = target.id;
+    const src: MangaSource | null = SourceManager.getInstance().get(this.sourceId);
+    if (src === null) {
+      this.errorMsg = '图源未就绪';
+      ReaderDiag.noteChapterError(this.errorMsg);
+      return;
+    }
+    const pages: PageImage[] = await src.fetchPages(target.id);
+    const list: string[] = [];
+    // s18：extern 必须和 url 一起搬过来。上游插件把每页真正的取图入参放在页对象 extern 里
+    // （e-hentai 整章 url 相同，只有这份 extern 区分页），宿主原先只 push url = 第二处丢失点。
+    const exts: string[] = [];
+    for (let k = 0; k < pages.length; k++) {
+      list.push(pages[k].url);
+      exts.push(pages[k].ext);
+    }
+    this.urls = list;
+    this.pageExts = exts;
+    // 换章节 = 换整个数据源实例（LazyForEach 不认「同实例换内容」，靠 @State urls 变化
+    // 重跑 build，LazyForEach 重新按 key 取数）。页码同步归零，再按存档续读。
+    // 五项轮：纵向档条目换成带章身份的 PageRef（无缝转场会在尾部追加邻章的格子）。
+    this.cells = ReaderView.buildCells(pages, target.id, i);
+    this.webtoonSource = new WebtoonPageSource(this.cells);
+    this.pageIndex = 0;
+    this.sliderPage = -1;
+    // s31 第 2 条：换章 = 一条全新的无缝链条，上一串贴底追加的状态全部作废
+    // （数据源、cells、pageIndex 上面已整体换新，这里补上本轮新加的那几枚）
+    this.seamlessChainRounds = 0;
+    this.bottomAnchorIndex = -1;
+    this.lastBottomAppendAt = 0;
+    this.clearTouchBottomRetry();
+    // 五项轮原口径「切章即停」+ s31 第 2 条 C 改成先停、后按原样续：
+    // 停是必须的（旧定时器还按旧章的页数与节奏在跑），停完若原先是开的就照当前设置
+    // 重启（见函数末尾 F2-RESUME 处）—— 用户要求不该每章手动重开一次。
+    // startAutoRead 头部自带 stopAutoRead 与间隔重算，重复调用安全，不新增参数。
+    const wasAutoRead: boolean = this.autoReadOn;
+    this.stopAutoRead();
+    if (list.length === 0) {
+      this.errorMsg = '本章节没有图片';
+      // 同上：fetchPages 没抛但交了空页表，界面与失败一模一样，必须记账
+      ReaderDiag.noteChapterError(this.errorMsg);
+    } else {
+      ReaderDiag.readerPagesLoaded += 1;
+      // 必须在 finally 置 loading=false（列表真正开始布局）之前把 pageIndex 落好，
+      // 否则首帧先画第一页、下一帧才跳走，看着像进章节抖一下
+      if (resume) {
+        await this.resumeOnOpen();
+      }
+      // 章节就绪 + 落点定好之后立刻按窗口预取一轮（首屏之后的几页在用户还没翻到时就进内存）
+      this.prefetchAround(this.pageIndex);
+      // s31 第 2 条 C：只有「切之前就是开的」才续开。空章、以及 fetchPages 抛异常的路径
+      // 都到不了这一行 = 自动阅读自然停住，不会在没有页面的章上空转定时器。
+      // 另外三个调用方（loadPages / switchChapter / advancePagerChapter）都在 await 之后
+      // 才置 loading=false ⇒ 续开后的第一个 tick 若撞上 loading 会被 autoTick 自己让位，
+      // 顶多少走一拍，不会读到半个数据源。
+      if (wasAutoRead) {
+        this.startAutoRead();
+      }
+    }
+  }
+
+  /**
+   * 把一章的 PageImage[] 折成**带章身份**的格子（纯函数、无副作用，五项轮）。
+   * 章内页码在这里一次性定死（1 起）并且把该章总页数一起塞进每格：顶栏页码与滑杆的分母
+   * 必须是「本章第几页 / 本章共几页」，用整条渲染流的长度当分母会在这种时候打出 137/204
+   * 这种用户看不懂的数（上游同理 = getDisplayPageNumber 只吃章内槽位）。
+   */
+  private static buildCells(pages: PageImage[], chapterId: string, chIdx: number): PageRef[] {
+    const total: number = pages.length;
+    const out: PageRef[] = [];
+    for (let k = 0; k < total; k++) {
+      out.push(new PageRef(pages[k].url, pages[k].ext, chapterId, k + 1, total, chIdx));
+    }
+    return out;
+  }
+
+  /**
+   * 无缝转场（五项轮）：取 chapters[idx] 的页表并折成格子，**只取不改任何状态**。
+   * 与 loadChapterAt 的区别是刻意的 —— 追加不能碰 pageIndex / 进度 / 自动阅读 / chapterName，
+   * 否则用户正读着当前章，画面被邻章的装载过程打断（上游也是这个分法：预取与拼接走
+   * reader_seamless_cubit，切章走 router.replace 整页重建，两条路互不干涉）。
+   * 失败返回 null 并只记 console.warn：邻章取不到**不许**影响当前章，也不上屏报错
+   * （上游语义 = 只把那一枚转场卡置 error，当前视图一字不动）。
+   */
+  private async fetchSeamlessChapter(idx: number): Promise<SeamlessChapter | null> {
+    if (idx < 0 || idx >= this.chapters.length) {
+      return null;
+    }
+    const src: MangaSource | null = SourceManager.getInstance().get(this.sourceId);
+    if (src === null) {
+      return null;
+    }
+    const ch: ChapterInfo = this.chapters[idx];
+    try {
+      const pages: PageImage[] = await src.fetchPages(ch.id);
+      if (pages.length === 0) {
+        return null;
+      }
+      const out: SeamlessChapter = new SeamlessChapter();
+      out.chapterId = ch.id;
+      out.title = ch.title;
+      out.cells = ReaderView.buildCells(pages, ch.id, idx);
+      return out;
+    } catch (err) {
+      const e = err as BusinessError;
+      console.warn(`[Reader] seamless fetch chapter ${idx} failed: code=${e.code} msg=${e.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * 尾部追加下一章（五项轮无缝转场的唯一写入口）。四道闸，缺一都出事：
+   * ① 只在纵向档做（横向档是一屏一页的 Swiper，追加进同一条流没有视觉意义，上游亦然）；
+   * ② 阈值闸 = 距本章末尾不足 SEAMLESS_APPEND_AHEAD 页才动手（上游 _nextAutoResolveThreshold=1
+   *    的等价，见常量注释）—— 没有这道闸就是"进第一章就把整本书拉完"；
+   * ③ 在途去重闸 seamlessAppending：**没有它 = 同一章并发拉两次**（onScrollIndex 在阈值区内
+   *    会连着回调好几帧，上游用两枚 Set 做这件事，这里同一时刻只可能追加紧邻的下一章，一枚布尔够用）；
+   * ④ 已追加过闸 cells 末格的 chIdx 已经是下一章 ⇒ 直接返回（重复点/重复回调都不重发请求）。
+   * 追加成功后**不改 pageIndex、不改进度、不停自动阅读**，只补一轮预取。
+   */
+  private tryAppendNextChapter(): void {
+    if (!this.isWebtoon() || this.seamlessAppending) {
+      return;
+    }
+    const n: number = this.cells.length;
+    if (n === 0 || this.chapterIndex < 0) {
+      return;
+    }
+    const nextIdx: number = this.chapterIndex + 1;
+    if (nextIdx >= this.chapters.length) {
+      return;
+    }
+    const cur: PageRef = this.cells[n - 1];
+    if (cur.chIdx >= nextIdx) {
+      return;
+    }
+    const lastOfCur: number = this.pageNoAt(n - 1);
+    if (cur.chIdx !== this.chapterIndex || cur.pageTotal - lastOfCur >= ReaderView.SEAMLESS_APPEND_AHEAD) {
+      return;
+    }
+    this.seamlessAppending = true;
+    this.fetchSeamlessChapter(nextIdx).then((got: SeamlessChapter | null): void => {
+      this.seamlessAppending = false;
+      if (got === null || got.cells.length === 0) {
+        return;
+      }
+      // 二次确认：异步回来的这一刻用户可能已经通过 TOC 切了章，那这批格子就是过期的
+      if (this.chapterIndex !== cur.chIdx || this.cells.length !== n) {
+        return;
+      }
+      this.webtoonSource.appendAndNotify(got.cells);
+      // 追加完顺手按当前页补一轮预取：新进来的邻章头几页正好在窗口外，等下一帧的
+      // onScrollIndex 才有机会被取，这里补一次让它更早进内存（幂等，isInFlight 会去重）
+      this.prefetchAround(this.pageIndex);
+    }).catch((): void => {
+      this.seamlessAppending = false;
+    });
+  }
+
+  /**
    * 落库进度，并把 sourceId / title 一起带上（bug④ 修法）。
    * manga 表只有「加入书架」才会写 ⇒ 从发现页直接读的书若不带上这两项，
    * 阅读记录页会因查不到元数据而整页空白。
+   * 五项轮：章 id 与页码都改成**按当前页身份取**（chapterIdAt / pageNoAt）。无缝转场之后
+   * 用户可能已经滚进追加进来的下一章，继续写 currentChapterId + pageIndex 会把进度记成
+   * 「上一章第 137 页」= 下次续读直接落到不存在的页，且目录高亮也回错章。
    */
   private async saveProgress(): Promise<void> {
     try {
       await MangaRepository.getInstance()
-        .saveProgress(this.mangaId, this.currentChapterId, this.pageIndex, this.sourceId, this.title);
+        .saveProgress(this.mangaId, this.chapterIdAt(this.pageIndex), this.pageNoAt(this.pageIndex),
+          this.sourceId, this.title);
     } catch (err) {
       const e = err as BusinessError;
       console.error(`[Reader] saveProgress failed: code=${e.code} msg=${e.message}`);
@@ -1787,9 +3077,46 @@ export struct ReaderView {
   }
 
   private nextPage(): void {
-    if (this.pageIndex < this.urls.length - 1) {
+    if (this.pageIndex < this.pageCount() - 1) {
       this.swiperController.showNext();
+      return;
     }
+    // s31 第 2 条 B：已在最后一页还往「继续」那一侧点 = 意图明确 ⇒ 真接下一章。
+    // 横向档里**可观测**的入口只有这一条（左右热区经 tapSide 进来）与 autoTick 两条：
+    // Swiper 在末页被 clamp 的那一下不回调 onChange（swiper.d.ts:1880；其文档 1861 行写明
+    // 只有 index 变化才触发，1869 行写明动画引起的变化在动画结束时触发），
+    // onGestureSwipe（2063）又只在「真的翻了一页」时给，本 SDK 里没有任何回调能观察到
+    // 「末页又被推了一下」（onContentWillChange 在这份 d.ts 里根本不存在）⇒
+    // 手指在末页硬滑那一下无法可靠接线，已如实报给 lead，不臆造 API。
+    this.advancePagerChapter();
+  }
+
+  /**
+   * 横向档「翻过本章最后一页」= 切到下一章并从第一页读起（resume=false，口径同 TOC 点选，
+   * 不是续读）。形态照抄 switchChapter：带 loading + 失败上屏，绝不静默失败
+   * （s15 那条「用户只看到五个字、真因在 console」的教训同款）。
+   * 四道闸：① 不在加载中（切章是 await，重入会拿错数据源）② 无缝追加没在途
+   * ③ 后面确实还有章 ④ 有页可翻。自动阅读的原样续开由 loadChapterAt 末尾负责
+   * （见 F2-RESUME），这里一律不碰定时器，避免两处抢着重启。
+   */
+  private advancePagerChapter(): void {
+    if (this.loading || this.seamlessAppending || this.pageCount() === 0) {
+      return;
+    }
+    const nextIdx: number = this.chapterIndex + 1;
+    if (this.chapterIndex < 0 || nextIdx >= this.chapters.length) {
+      return;
+    }
+    this.loading = true;
+    this.errorMsg = '';
+    this.loadChapterAt(nextIdx, false).then((): void => {
+      this.loading = false;
+    }).catch((err: Object): void => {
+      this.loading = false;
+      const raw: string = typeof (err as Error).message === 'string' ? (err as Error).message : '';
+      this.errorMsg = briefForScreen(raw, '章节加载失败，可点按重试');
+      ReaderDiag.noteChapterError(this.errorMsg);
+    });
   }
 
   /** 放大后允许的最大平移：内容放大后超出视口的那一半（锚点是中心） */
@@ -1857,21 +3184,49 @@ export struct ReaderView {
   * 键直接取模块级 pageSizeKey（与 ReaderPageImage.sizeKey() 共用同一处定义，见那边注释），
   * 所以「点了重试没有一行响应」这种键错位在这里结构性不可能发生，探针只核那一处定义。
    */
+  /**
+   * 中心热区（s31 第 1 条改口径）。三段语义，按顺序判：
+   * ① 当前页最后一次取图失败 → 这一按当手动重试且**什么都不弹**（沿用 s16 第 2 条丁，理由不变：
+   *    用户点重试时菜单跳出来正好盖住他要看的那一页）。
+   * ② 此刻是沉浸态（chrome 与两枚浮层全关）→ **只出顶栏 + 底栏**。
+   * ③ 否则（任何一层开着）→ 全收，回到沉浸态。
+   * ★ s30 那版是「点一下同时出 chrome + 设置面板」，真机反馈原话 =「点击中间后会自动打开阅读设置
+   *   页面，我的意思是点击中央后跳出阅读器底栏」⇒ 设置面板交回底栏那枚「设置」键单独控制（它本就
+   *   是幂等开合），中心点按只负责「进 / 出沉浸」这一件事。
+   */
   private tapCenter(): void {
     const idx: number = this.pageIndex;
     // 与行内同一枚页键（失败表现在按页记，这里也按页问，两侧不会再因哨兵地址错开）。
     // 顺序刻意是先判下标合法再问表：越界页码可能凑出一枚「历史失败过」的键，
     // 那样一次无意义点按就会去推重试信号（虽然没人响应，但会把 retry 计数与顶栏语义带偏）。
-    if (idx < 0 || idx >= this.urls.length) {
-      this.chromeVisible = !this.chromeVisible;
+    if (idx < 0 || idx >= this.pageCount()) {
+      this.toggleChrome();
       return;
     }
-    const pk: string = pageSizeKey(this.currentChapterId, idx + 1);
+    // ★ 页键走 pageKeyAt（= 该格自己的章 id + 章内页码），不再用 currentChapterId + idx + 1：
+    // 无缝转场后正读邻章时，用当前章拼键会问错行 = 点重试推给一条不在屏幕上的行。
+    const pk: string = this.pageKeyAt(idx);
     if (ReaderDiag.isFailed(pk)) {
       ReaderDiag.pushRetry(pk);
       return;
     }
-    this.chromeVisible = !this.chromeVisible;
+    this.toggleChrome();
+  }
+
+  /**
+   * 中心热区的开合（s31 第 1 条：改名 + 改口径 = 只碰 chrome，不再带设置面板）。
+   * 全隐 → 出顶栏 + 底栏；有任何一层开着（含两枚浮层）→ 全收。目录也算「开着」⇒ 读目录时
+   * 点中心直接回沉浸，不用先点遮罩再点中心（少一次操作）。要开设置面板请点底栏「设置」键。
+   */
+  private toggleChrome(): void {
+    const anyOpen: boolean = this.chromeVisible || this.settingsVisible || this.tocVisible;
+    if (anyOpen) {
+      this.chromeVisible = false;
+      this.settingsVisible = false;
+      this.tocVisible = false;
+      return;
+    }
+    this.chromeVisible = true;
   }
 
   /**
@@ -1889,14 +3244,17 @@ export struct ReaderView {
    *   不会拿到上一个 url 的 PixelMap = 不会串图）。
    * - edgeEffect(None)：顶底不要回弹。阅读器里「拉到顶还想再拉」不该给出弹性反馈，
    *   那下回弹在长条漫里看着像整章在抖（默认值是 EdgeEffect.Spring，list.d.ts:1025）。
-   * - key 用 'p' 加下标、不带 url：与横向档同一份 key 语义。章节变化时 @State urls 变化
-   *   会让 LazyForEach 整体重建（数据源也是新实例），所以「同章内 url 换了 key 不变」
-   *   这种情况不存在（页列表一次取全，不会原地改）；若将来做「追加下一章」，key 必须改成带 url。
+   * - ★ key 五项轮改成 **章 id + # + 章内页码**（与尺寸表同一个 pageSizeKey）。原口径「'p' + 下标」
+   *   在追加下一章之后必错：追加只往尾部加、已有格子下标不动看似安全，但**换章时数据源虽是
+   *   新实例、key 串却与上一章完全相同**（'p0'…'pN' 两章一样），LazyForEach 按 key 比对会认为
+   *   「这些行还在」= 行组件不重建 = 沿上一章的 url 与尺寸表渲染 = 串章（且切章必现，不是边缘情况）。
+   *   为什么不按 url 当 key：e-hentai 这类图源整章共用同一 url（只有 extern 区分页，见 s18 那段），
+   *   按 url 会把整章压成一行。章 id + 章内页码才同时满足「同章唯一、跨章不撞、换章必换」。
    */
   @Builder
   WebtoonArea() {
     List({ space: 0, scroller: this.webtoonScroller, initialIndex: this.webtoonStartIndex }) {
-      LazyForEach(this.webtoonSource, (item: string, index: number) => {
+      LazyForEach(this.webtoonSource, (item: PageRef, index: number) => {
         ListItem() {
           // 热区必须挂在**行内**，不能整屏盖一层在 List 之上：ArkUI 的命中测试只沿「根到命中节点」
           // 这条链派发，List 是热区的兄弟而不是祖先时，起于热区的拖动永远进不了 List 的滚动手势
@@ -1908,12 +3266,15 @@ export struct ReaderView {
           // 那里的容器有 aspectRatio 或显式 height 定出的确定高，100% 只解析成本行自己的尺寸。
           Stack({ alignContent: Alignment.Center }) {
             ReaderPageImage({
-              url: item,
+              url: item.url,
               sourceId: this.sourceId,
-              chapterId: this.currentChapterId,
+              // ★ 三项身份取自 item 自己，不再用 currentChapterId / index + 1 / extAt(index)：
+              // 无缝转场后一条渲染流里跨章，按「当前章」算会把邻章的格子套进本章的取图上下文
+              // （尺寸表按章 id + 页码定键 = 行高串章；反混淆意图与 Referer 也会用错章）。
+              chapterId: item.chapterId,
               fitHeight: true,
-              pageNo: index + 1,
-              pageExt: this.extAt(index),
+              pageNo: item.pageNo,
+              pageExt: item.ext,
               viewportH: this.areaH,
               // s17：骨架铺满整行要用父宽复算行高（行高 = 宽 / 真比），与骨架高同源
               viewportW: this.areaW,
@@ -1932,11 +3293,11 @@ export struct ReaderView {
           // s17 A1（纯度量）：这枚 Stack 就是行盒本体（ListItem 只约束宽），它的高 = 这一行真占的高。
           // 与组件自报的 rowH 配对才能判 e2：单量组件会必然读到健康值。
           .onAreaChange((_o: Area, n: Area) => {
-            ReaderDiag.noteRowBox(Number(n.height), pageSizeKey(this.currentChapterId, index + 1));
+            ReaderDiag.noteRowBox(Number(n.height), pageSizeKey(item.chapterId, item.pageNo));
           })
         }
         .width('100%')
-      }, (item: string, index: number) => 'p' + index)
+      }, (item: PageRef, index: number) => pageSizeKey(item.chapterId, item.pageNo))
     }
     .width('100%')
     .height('100%')
@@ -1944,11 +3305,34 @@ export struct ReaderView {
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.None)
     .onAppear(() => {
+      // 五项轮：告诉 jumpToIndex「这枚 List 已经活着」，此后滑杆/目录跳页立刻 scrollToIndex。
+      // 老语义只在挂载这一刻消费待执行定位 = 已挂载时跳页静默失效（滑杆拖完画面不动）。
+      this.webtoonReady = true;
       // 挂载后补一次待执行定位（见 consumePendingJump）
       this.consumePendingJump();
     })
+    .onDisAppear((): void => {
+      // 切档（纵向→横向）会拆掉这棵子树：不置回 false，切回来时 jumpToIndex 会走「立刻
+      // scrollToIndex」那条腿，而此刻 Scroller 还没绑上新 List = 空操作静默不跳。
+      this.webtoonReady = false;
+    })
     .onScrollIndex((start: number, end: number, center: number): void => {
       this.onWebtoonScrollIndex(start, end, center);
+    })
+    // s31 第 2 条 A：补上「停在最后一屏」这条腿（list.d.ts:1661 onReachEnd，@since 7）。
+    // 它两次白触发由闸门兜住：内容不满一屏时首帧触发一次（那一刻 isAtEnd 不可信 ⇒
+    // 延后一拍复核），弹性回弹到末尾会再触发一次（在途闸 + 节流 + 封顶）。
+    // 本 List 的 edgeEffect 已是 None，第二次那类回弹本来就不存在。
+    .onReachEnd((): void => {
+      this.onWebtoonReachEnd();
+    })
+    .onTouch((ev: TouchEvent): void => {
+      // 自动阅读的让位判据（见 lastUserTouchAt / autoTick）：只记按下与拖动，Up 刻意不记 =
+      // 抬手后推进立刻恢复，不必再多等一个窗口。
+      const t: TouchType = ev.type;
+      if (t === TouchType.Down || t === TouchType.Move) {
+        this.lastUserTouchAt = Date.now();
+      }
     })
   }
 
@@ -2006,7 +3390,7 @@ export struct ReaderView {
         .alignItems(HorizontalAlign.Start)
         .margin({ left: 4 })
 
-        Text(this.urls.length > 0 ? `${this.pageIndex + 1}/${this.urls.length}` : '0/0')
+        Text(this.pageLabel())
           .fontSize(12)
           .fontColor(Theme.white)
           .maxLines(1)
@@ -2029,6 +3413,12 @@ export struct ReaderView {
     }
     .width('100%')
     .backgroundColor(Theme.scrim)
+    // s30 第 7 条：顶栏「从上边来、回上边去」（进/退用同一条 translate = ArkUI 里即来去同向）。
+    // 挂这里 = @Builder 根节点的属性链尾，if 分支移除时退场动画才会播（挂外面那层 Stack 上不生效）。
+    // 型制与仓内既有 12 处完全一致（OPACITY.combine(translate).animation(Anim Token)），不引入新范式。
+    .transition(TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ y: -Dim.topBarH }))
+      .animation({ duration: Anim.topBarFade, curve: Anim.curveBarCollapse() }))
   }
 
   build() {
@@ -2091,6 +3481,10 @@ export struct ReaderView {
           .vertical(false)
           .indicator(false)
           .duration(200)
+          // s31 第 3 条：翻页动画进行中要同时有前一页 / 当前页 / 后一页在场，
+          // 缓存不够时新页是边滑进来边解码 = 露出背景（自动阅读那帧黑的另一半原因）。
+          // SDK 建议 1 到 2（swiper.d.ts:1612、1631），取上限 2。
+          .cachedCount(ReaderView.PAGER_CACHED_COUNT)
           .width('100%')
           .height('100%')
           .scale({ x: this.zoomScale, y: this.zoomScale })
@@ -2161,10 +3555,24 @@ export struct ReaderView {
       )
 
 
-      // 顶栏：单击屏中切换显隐（隐藏即全屏沉浸）
+      // 顶栏：单击屏中热区切换显隐（隐藏即全屏沉浸；s31 第 1 条起中心点按不再带出设置面板）
       if (this.chromeVisible) {
         this.ReaderTopBar();
       }
+      // 五项轮：底栏与顶栏同进同退（与上游 isMenuVisible 同时喂顶栏和底栏的语义一致）；
+      // 两枚浮层排在底栏之后 = 后盖前，浮层打开时把底栏压在下层。
+      if (this.chromeVisible) {
+        this.ReaderBottomBar();
+      }
+      if (this.settingsVisible) {
+        this.SettingsOverlay();
+      }
+      if (this.tocVisible) {
+        this.TocOverlay();
+      }
+      // s30 第 7 条：这四层的进出场动画挂在**各 @Builder 自己根节点**的属性链尾（ReaderTopBar /
+      // ReaderBottomBar / SettingsOverlay / TocOverlay 各一条 .transition），不挂在这段挂载点上 ——
+      // transition 只在「被移除的那棵子树的根」上才播退场，挂外层兄弟位置等于挂在 if 容器上，不生效。
     }
     .width('100%')
     .height('100%')

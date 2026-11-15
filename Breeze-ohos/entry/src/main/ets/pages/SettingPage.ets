@@ -181,7 +181,7 @@ struct SettingPage {
       await UserSettings.setReadDirection(v);
       this.directionLabel = v === ReadDirection.RTL
         ? SettingLabels.READ_DIRECTION[1] : SettingLabels.READ_DIRECTION[0];
-      this.toast(v === ReadDirection.RTL ? '已改为从右到左，重进阅读器生效' : '已改为从左到右');
+      this.toast(v === ReadDirection.RTL ? '已改为从右到左' : '已改为从左到右');
     }).catch((e: Error): void => {
       Logger.i('阅读方向选择取消：' + e.message);
     });

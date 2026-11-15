@@ -24,6 +24,25 @@ export class Anim {
   /** 顶栏标题淡切 */
   static readonly topBarFade: number = 180;
 
+  // ---------------- 第 6 条 / 第 7 条：跨页转场统一档（s31） ----------------
+  /**
+   * 页级转场 + 封面共享元素的**统一时长**。第 6 条用户要「适当放缓」，而这三处原先各吃
+   * Anim.contentIn（220）：书架封面、详情页头图、详情页页级推拉 —— 三处同值但各自手抄，
+   * 一改就漏 ⇒ 收敛成这一枚 Token，两页四写点共读（书架 CoverCell、DetailCover 头图、
+   * DetailPage.pageTransition、ReaderPage.pageTransition）。
+   * 取 360 = 淡入淡出 + 封面跨越两级页面（104×139 → 整屏卡片）的位移量需要比列表进场更长的
+   * 落地时间；再长（400+）在返回连点上会拖手感的下限由真机复验决定。
+   */
+  static readonly pageHero: number = 360;
+  /** 封面浮层的退场时长（浮层淡出、阅读页显影；不属于第 6 条要求的对称段，故单独一档且更短）。 */
+  static readonly heroFadeOut: number = 200;
+  /**
+   * 定时器安全垫：动画名义结束到收尾动作之间留的余量（掉帧 + 调度抖动）。
+   * ★ 浮层的清理**只由定时器驱动**，不挂 onTransitionEnd（共享元素的 End 属组件级、跨页时不可靠），
+   *   所以余量必须给足，宁多勿少 —— 早一步摘浮层 = 封面在半空被抹掉。
+   */
+  static readonly heroSlack: number = 90;
+
   // ---------------- 曲线 ----------------
   /** 页签切换曲线：springMotion(response=0.34, damping=0.85)（§3，与 spike 一致） */
   static curveTabSwitch(): curves.ICurve {
