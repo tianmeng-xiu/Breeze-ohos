@@ -1050,6 +1050,26 @@ struct Index {
     return '#9EC9FF';
   }
 
+  /**
+   * s32 第 1 条（用户原话「从书架进入书籍详情页和从书籍详情页退出到书架动画仍不统一，
+   * 应当全部统一为封面飞入飞出的效果」）：本页此前**全文件零 pageTransition**，
+   * 于是详情页那侧是 360 ms 淡入淡出（pages/DetailPage.ets:701）而书架这侧吃 router 默认转场
+   * （位移推拉）⇒ 进入 = 详情页淡入 + 封面飞；返回 = 详情页淡出 + 书架整页滑入，
+   * 两套方向感叠在一起就是「不统一」。补上与详情页**同 duration 同 curve 同构造**的一档淡入淡出：
+   * 两页四写点（本页 Enter/Exit + 详情页 Enter/Exit）全同 ⇒ 任意方向的页级观感只剩淡入淡出，
+   * 方向感统一交给封面共享元素（第 1 条要的「飞入飞出」）。
+   * ★ 书架是 TabContent 子组件，结构上没有独立的 pageTransition 入口 ⇒ 只能挂在宿主 @Entry 页上，
+   *   这也是刻意**不给 DetailPage 单独设位移**的原因（详情在滑、书架不动 = 又是两套观感）。
+   * 已知副作用（真机要盯）：pageTransition 是页级、不区分去向 ⇒ 冷启动第一帧的主页可能也走一次
+   * 360 ms 淡入。若真机确认难看，回退方案 = 只留 PageTransitionExit（返回侧不再依赖本页）。
+   */
+  pageTransition() {
+    PageTransitionEnter({ duration: Anim.pageHero, curve: Anim.curveEaseOut() })
+      .opacity(0);
+    PageTransitionExit({ duration: Anim.pageHero, curve: Anim.curveEaseOut() })
+      .opacity(0);
+  }
+
   build() {
     Stack({ alignContent: Alignment.BottomStart }) {
       // ---- 正常页面（诊断面板绝不再压在顶部：用户真机反馈顶部与状态栏冲突、按钮点不到）

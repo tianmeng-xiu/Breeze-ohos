@@ -45,6 +45,20 @@ struct ReaderPage {
   /** 两枚定时器：飞行段 → 起淡出；淡出 → 出树。-1 = 空（同 pages/WebLoginPage.ets 的 timer 约定）。 */
   private heroFadeTimer: number = -1;
   private heroGoneTimer: number = -1;
+  /**
+   * s32 第 2 条：**进场的两枚入参留一份**（上面那两枚 AppStorage 键是一次性消费、读完就清空，
+   * 退场要再挂一次浮层就得自己留着）。刻意不做成 @State：它不参与任何渲染判定，
+   * 只在退场那一刻被读出来喂给 heroId/浮层（判据仍是 heroOn）。
+   */
+  private heroIdHold: string = '';
+  private heroUrlHold: string = '';
+  /**
+   * s32 第 2 条：浮层处于**退场档**。true = 卡片档渲染：去掉整屏不透明占位底（否则退场时满屏
+   * 都是一块盖色，看不见底下的详情页在淡出），也不做淡出（卡片要在整段飞行里保持可见）。
+   */
+  @State heroExit: boolean = false;
+  /** s32 第 2 条：退出已接管标记（连点返回键/返回键与手势并发时，第二次不再重排一遍动画） */
+  private exiting: boolean = false;
 
   aboutToAppear(): void {
     try {
@@ -74,6 +88,9 @@ struct ReaderPage {
     if (hid.length > 0 && hurl.length > 0) {
       this.heroId = hid;
       this.heroOn = true;
+      // s32 第 2 条：同一份入参留档给退场用（AppStorage 那两枚键下面就被清空了）
+      this.heroIdHold = hid;
+      this.heroUrlHold = hurl;
       this.loadHero(hurl);
       const gap: number = Anim.pageHero + Anim.heroSlack;
       this.heroFadeTimer = setTimeout((): void => {
@@ -113,6 +130,67 @@ struct ReaderPage {
     if (prev !== undefined && prev !== next) {
       ImageCache.getInstance().unpin(prev);
     }
+  }
+
+  /**
+   * s32 第 2 条（用户原话「从书籍详情页进入书本和从书本退出到书籍详情页动画仍不统一，
+   * 应当统一使用淡入淡出或飞入飞出」）：**退出时的封面飞回**，与进场那趟是同一条共享元素线、
+   * 同一个 id、同一组参数 ⇒ 两向观感成对。
+   * 三个必须：
+   * ① 浮层必须**在 router.back() 之前**挂回树上 —— pageTransition 起转场的那一刻，
+   *    共享元素两端节点得都已存在，晚一帧挂就是「封面突然消失」的半截动画（与进场那条同理）；
+   *    所以排 Anim.heroExitBeat（一拍 = 32 ms）让节点先走完一次布局再出页。
+   * ② 退场档**去掉整屏盖色**：进场时那层不透明盖色是必要的（它撑住「封面展开成阅读页」的背景），
+   *    退场时留着它就等于满屏盖色、看不见详情页在淡出 ⇒ 卡片档只留卡片本身。
+   * ③ 没有封面可飞（详情页没封面 / 从首页「继续阅读」直连阅读器）⇒ 返回 false，
+   *    调用方照旧直接出页 = 只剩两页同参淡入淡出，仍是成对的（不做半截动画）。
+   * @returns true = 本方法已接管退出（稍后自己 router.back），调用方不要再出页。
+   */
+  requestExitWithHero(): boolean {
+    if (this.heroIdHold.length === 0 || this.heroUrlHold.length === 0) {
+      return false;
+    }
+    if (this.exiting) {
+      // 已经在演了：吞掉这一次，避免连点把 router.back 排两遍
+      return true;
+    }
+    this.exiting = true;
+    // 进场那两套 timer 可能还在飞（进页就立刻返回）：先停干净，否则淡出/摘层的 timer
+    // 会在退场浮层上乱插手，把正在飞的卡片半路抹掉。
+    if (this.heroFadeTimer >= 0) {
+      clearTimeout(this.heroFadeTimer);
+      this.heroFadeTimer = -1;
+    }
+    if (this.heroGoneTimer >= 0) {
+      clearTimeout(this.heroGoneTimer);
+      this.heroGoneTimer = -1;
+    }
+    this.heroExit = true;
+    this.heroOn = true;
+    this.heroId = this.heroIdHold;
+    this.heroOpacity = 1;
+    this.loadHero(this.heroUrlHold);
+    // 出树 timer 照排一个：正常情况下本页随 router.back 销毁、aboutToDisappear 兜底清理，
+    // 留着是为了「router.back 失败（路由栈异常）」那种边角不致留一层永久盖住的浮层。
+    this.heroGoneTimer = setTimeout((): void => {
+      this.heroGoneTimer = -1;
+      this.dropHero();
+      this.heroExit = false;
+      this.exiting = false;
+    }, Anim.pageHero + Anim.heroSlack);
+    setTimeout((): void => {
+      router.back();
+    }, Anim.heroExitBeat);
+    return true;
+  }
+
+  /**
+   * s32 第 2 条：系统返回键 / 侧滑手势与顶栏返回箭头**同一条退场线**（否则按返回键就绕过飞行，
+   * 又变成「一个方向有飞、另一个方向没飞」）。@Entry + router 页才有这个回调（common.d.ts:24694，
+   * @since 7）；返回 true = 自处理、框架不再默认出页 —— 出页由 requestExitWithHero 里那一拍代发。
+   */
+  onBackPress(): boolean {
+    return this.requestExitWithHero();
   }
 
   /** 飞行段（含余量）走完：淡出浮层，再排尾 timer 把整层摘掉。 */
@@ -155,6 +233,10 @@ struct ReaderPage {
       clearTimeout(this.heroGoneTimer);
       this.heroGoneTimer = -1;
     }
+    // s32 第 2 条：退场档与接管标记一并复位（本页是 @Entry，正常随出页销毁；
+    // 留这一手是给路由复用实例那种边角，别把 exiting=true 带到下一次进页 = 返回键永久失灵）
+    this.heroExit = false;
+    this.exiting = false;
     this.setHero(undefined);
   }
 
@@ -194,7 +276,9 @@ struct ReaderPage {
           mangaId: this.params.mangaId,
           sourceId: this.params.sourceId,
           title: this.params.title,
-          chapterId: this.params.chapterId
+          chapterId: this.params.chapterId,
+          // s32 第 2 条：顶栏返回箭头先问本页要不要演封面飞回（不演就返回 false 让 ReaderView 自己出页）
+          onExitReader: (): boolean => this.requestExitWithHero()
         })
       }
       .width('100%')
@@ -230,15 +314,22 @@ struct ReaderPage {
           .sharedTransition(this.heroId, {
             duration: Anim.pageHero,
             curve: Anim.curveEaseOut(),
-            type: SharedTransitionEffectType.Exchange
+            type: SharedTransitionEffectType.Exchange,
+            // s32 第 1 条：三处共享元素（书架 CoverCell / 详情头图 / 这里）同值飞行层序
+            zIndex: Anim.heroZ
           })
         }
         .width('100%')
         .height('100%')
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Center)
-        .backgroundColor(Theme.coverColor(this.isDark))
+        // s32 第 2 条：进场档 = 整屏不透明盖色（撑住「封面展开成阅读页」）；
+        // 退场档 = **透明**，只留那枚正在飞回详情头图槽位的卡片。
+        .backgroundColor(this.heroExit ? Color.Transparent : Theme.coverColor(this.isDark))
         .opacity(this.heroOpacity)
+        // s32 第 2 条：退场档这层是透明的且页面马上就要出栈，刻意放行命中（None = 自身不响应
+        // 也不挡下层，见 key 记忆里 hitTestBehavior 那条）；进场档维持默认 Default 阻断误触（理由见下）。
+        .hitTestBehavior(this.heroExit ? HitTestMode.None : HitTestMode.Default)
         // 命中测试说明（真机要盯的一条）：浮层是不透明节点且默认 HitTestMode.Default
         // （enums.d.ts:3292/:3294：自身响应命中并**阻断**下层），所以飞行 + 淡出的约 0.65 秒里
         // 落在浮层上的点击不会漏给下面的阅读器。刻意不给 hitTestBehavior(None)：那会把这段时间

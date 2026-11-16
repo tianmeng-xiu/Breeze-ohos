@@ -231,7 +231,10 @@ export struct BookshelfPage {
           .sharedTransition('cover_' + item.sourceId + '_' + item.id, {
             duration: Anim.pageHero,
             curve: Anim.curveEaseOut(),
-            type: SharedTransitionEffectType.Exchange
+            type: SharedTransitionEffectType.Exchange,
+            // s32 第 1 条：飞行的封面必须压在目标页之上（默认 0 会被目标页不透明根底盖住
+            // ⇒ 返回时看不见封面飞回，只剩淡出 = 两个方向观感不一致）。三处同值。
+            zIndex: Anim.heroZ
           })
 
         if (progress.length > 0) {

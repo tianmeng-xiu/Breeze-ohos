@@ -134,7 +134,9 @@ struct DetailCover {
     .sharedTransition(this.heroId, {
       duration: Anim.pageHero,
       curve: Anim.curveEaseOut(),
-      type: SharedTransitionEffectType.Exchange
+      type: SharedTransitionEffectType.Exchange,
+      // s32 第 1 条：与书架 CoverCell、阅读器浮层**同值**的飞行层序（见 Anim.heroZ 注释）
+      zIndex: Anim.heroZ
     })
   }
 
