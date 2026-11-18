@@ -26,6 +26,7 @@ import { MangaSummary, SourceInfo } from '../../data/model/Models';
 import { DetailParams } from '../detail/DetailParams';
 import { LastSourceStore } from '../search/LastSourceStore';
 import { Logger } from '../../util/Logger';
+import { TextConvert } from '../../util/TextConvert';
 
 @Component
 export struct DiscoverPage {
@@ -35,6 +36,22 @@ export struct DiscoverPage {
   private listScroller: Scroller = new Scroller();
 
   @StorageProp('isDark') isDark: boolean = false;
+  /**
+   * 简繁转换版本号（util/TextConvert.bumpRev 在词典就绪或切档后自增）：
+   * 词典是异步读的，首帧拿到的是原文，就绪后靠它把这一屏重算一遍。
+   * 必须在渲染表达式里读到一次（见 cvtShow），只声明不用不会触发重渲染。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /** 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。 */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      // 本进程还没就绪过词典也没切过档 = 首帧，原样给，连表都不查
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
   /** 任务 A②：插件装载/删除/开关后 chip 条同步（bump 端 = PluginManagerView）。 */
   @StorageProp('pluginSourceEpoch') @Watch('onSourceEpoch') pluginEpoch: number = 0;
   @State sources: SourceInfo[] = [];
@@ -287,7 +304,7 @@ export struct DiscoverPage {
         .draggable(false)
 
       Column() {
-        Text(item.title)
+        Text(this.cvtShow(item.title))
           .fontSize(14)
           .fontColor(Theme.text1(this.isDark))
           .maxLines(1)

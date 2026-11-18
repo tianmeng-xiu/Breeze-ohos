@@ -8,6 +8,7 @@ import { image } from '@kit.ImageKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { Theme, Dim } from './Theme';
 import { ImageCache } from '../../data/image/ImageCache';
+import { TextConvert } from '../../util/TextConvert';
 
 @Component
 export struct MangaGridCard {
@@ -18,6 +19,26 @@ export struct MangaGridCard {
   /** 图源小字（如 MangaDex / 禁漫天堂） */
   @Prop sourceName: string = '';
   @StorageProp('isDark') isDark: boolean = false;
+  /**
+   * 简繁转换版本号（util/TextConvert.bumpRev 在词典就绪或切档后自增）。
+   * ★ 关键：它必须在**渲染书名那个节点的表达式里被读到一次**（见 cvtShow）——
+   *   节点级依赖只记「求值这段表达式时读到的状态变量」，光声明不用则词典异步到货时
+   *   这一行停在首帧的原文。这条机制本仓已实测两处并写下注释：
+   *   pages/SettingPage.ets:355-361（subOf 取值函数为什么必须是函数）、
+   *   pages/CommentPage.ets:297-298（ForEach 键不变 ⇒ 子项不重建，只能靠节点级依赖）。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /** 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。 */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      // 本进程还没就绪过词典也没切过档 = 首帧，原样给，连表都不查
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
+
   @State pm: image.PixelMap | undefined = undefined;
   @State failed: boolean = false;
   /**
@@ -90,7 +111,7 @@ export struct MangaGridCard {
       .clip(true)
       .backgroundColor(Theme.fillColor(this.isDark))
 
-      Text(this.title.length > 0 ? this.title : '无标题')
+      Text(this.title.length > 0 ? this.cvtShow(this.title) : '无标题')
         .fontSize(13)
         .fontColor(Theme.text1(this.isDark))
         .maxLines(2)

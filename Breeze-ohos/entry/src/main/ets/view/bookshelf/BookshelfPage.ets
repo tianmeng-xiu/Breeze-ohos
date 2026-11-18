@@ -23,6 +23,7 @@ import { MangaRepository } from '../../data/db/MangaRepository';
 import { MangaSummary, ReadProgress } from '../../data/model/Models';
 import { DetailParams } from '../detail/DetailParams';
 import { SourceManager } from '../../data/source/SourceManager';
+import { TextConvert } from '../../util/TextConvert';
 
 /** 第 3 条：等数据库就绪的退避档（毫秒）；首屏最多 1 + 2 次尝试，全失败才落错误态。 */
 const READY_RETRY_DELAYS: number[] = [150, 300];
@@ -48,6 +49,28 @@ export struct BookshelfPage {
   private gridScroller: Scroller = new Scroller();
 
   @StorageProp('isDark') isDark: boolean = false;
+  /**
+   * 简繁转换版本号（util/TextConvert.bumpRev 在词典就绪或切档后自增）：
+   * 词典是异步读入的，就绪那一刻 this.list 里的数据没变、只有这个数变 ⇒ 由本页观察它，
+   * 下面 CoverCell 里的书名才会重新求值。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /**
+   * 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。
+   * ★ 版本号必须**在渲染这行文案的表达式里被读到一次**：CoverCell 是 @Builder，
+   *   形参是按值快照、父层状态变化不会重跑整个 builder 子树，但**取值函数里读到的状态
+   *   会记成该 Text 节点的依赖**（本仓实测口径，见 pages/SettingPage.ets 的 ManageRow 注释、
+   *   pages/DetailPage.ets 的 ActionBtn 注释）⇒ 词典异步读完或切档时这一行才会重画。
+   *   rev 为 0 = 本次进程从未切过档也从未就绪过（首帧），直接给原文，连表都不查。
+   */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
   /** 书架数据版本号：DetailPage 加/移书架后 push（AppStorage 'shelfRevision'），变化即静默重查。
    *  本页是 TabContent 子组件，router.back 回来不会重跑 aboutToAppear，不接这个就会「加完不显示」。 */
   @StorageProp('shelfRevision') @Watch('onShelfRevision') shelfRevision: number = 0;
@@ -250,7 +273,7 @@ export struct BookshelfPage {
       }
       .width('100%')
 
-      Text(item.title)
+      Text(this.cvtShow(item.title))
         .fontSize(12)
         .fontColor(Theme.text1(this.isDark))
         .maxLines(2)

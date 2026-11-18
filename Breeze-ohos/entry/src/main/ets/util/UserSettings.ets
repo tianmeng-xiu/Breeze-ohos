@@ -39,12 +39,28 @@ export class ReadDirection {
   static readonly RTL: string = 'rtl';
 }
 
+/**
+ * 简繁转换档取值（存库用英文名，与上游 lib/config/global/global_setting.dart 的
+ * enum ChineseConvertMode 成员名逐字一致 ⇒ 老用户的存档跨端可读；默认 off）。
+ * 只影响界面显示（util/TextConvert），不参与搜索匹配与屏蔽词匹配。
+ */
+export class ChineseConvertMode {
+  /** 关闭（默认，原文照显） */
+  static readonly OFF: string = 'off';
+  /** 转为简体中文 */
+  static readonly SIMPLIFIED: string = 'simplified';
+  /** 转为繁体中文 */
+  static readonly TRADITIONAL: string = 'traditional';
+}
+
 /** 设置项的可读标签（选择器与摘要行共用，避免两处文案漂移）。 */
 export class SettingLabels {
   /** 与 ReadDirection 取值顺序一一对应 */
   static readonly READ_DIRECTION: string[] = ['从左到右', '从右到左'];
   /** 与 ReadScrollMode 取值顺序一一对应（s13 第 6 条：更多页「阅读模式」行与选项菜单共用） */
   static readonly READ_SCROLL_MODE: string[] = ['横向翻页', '从上向下滚动'];
+  /** 与 ChineseConvertMode 取值顺序一一对应（文案照抄上游 zh_CN.i18n.json 的 chineseConvertMode） */
+  static readonly CHINESE_CONVERT: string[] = ['关闭', '简体中文', '繁体中文'];
 }
 
 /** 设置页展示用的运行时快照（不含敏感值，Cookie 只给条目数）。 */
@@ -56,6 +72,8 @@ export class UserSettingsSnapshot {
   tapToScroll: boolean = false;
   /** s13 第 6 条：阅读模式（pager / webtoon） */
   scrollMode: string = ReadScrollMode.PAGER;
+  /** 简繁转换档（off / simplified / traditional） */
+  chineseConvert: string = ChineseConvertMode.OFF;
   cookieHostCount: number = 0;
 }
 
@@ -68,6 +86,12 @@ export class UserSettings {
    * 后续整理时可原样搬进 PrefKeys 并改成引用，值不得改（改值 = 作废老用户已存的档位）。
    */
   private static readonly KEY_SCROLL_MODE: string = 'reader_scroll_mode';
+  /**
+   * 简繁转换的配置键。同样不进 PrefKeys（写域外），键名照抄上游
+   * global_setting.dart 里 ChineseConvertMode 的存档字段名 chineseConvertMode，
+   * 值域也照抄（成员名字符串），这样同一份偏好在两端语义一致。值不得改。
+   */
+  private static readonly KEY_CHINESE_CONVERT: string = 'chineseConvertMode';
   /**
    * 自动阅读三项（五项轮新增，口径照抄上游 ReadSettingState：竖向间隔 / 横向间隔 / 竖向距离%）。
    * 存实际值不存档位下标 ⇒ 以后调界不作废老数据。非法值（0/负数）一律返 0 由消费方回落默认。
@@ -140,6 +164,46 @@ export class UserSettings {
   static async setScrollMode(value: string): Promise<void> {
     const v: string = UserSettings.pushScrollMode(value);
     await PreferenceStore.getInstance().putString(UserSettings.KEY_SCROLL_MODE, v);
+  }
+
+  /**
+   * 简繁转换档：非法值（老数据、手改库、别端写进来的陌生档）一律回落 off，
+   * 兜底方向同样选「原文照显」—— 转换是有副作用的显示改写，脏数据不该改用户看到的字。
+   */
+  static readChineseConvert(): string {
+    const v: string = PreferenceStore.getInstance()
+      .getString(UserSettings.KEY_CHINESE_CONVERT, ChineseConvertMode.OFF);
+    if (v === ChineseConvertMode.SIMPLIFIED || v === ChineseConvertMode.TRADITIONAL) {
+      return v;
+    }
+    return ChineseConvertMode.OFF;
+  }
+
+  /**
+   * 档位的响应式副本键（AppStorage）：写入口只在本类一处，消费方别各自 setOrCreate。
+   * 注意转换结果的重绘不靠这个键 —— 词典是异步读入的，UI 需要的是「词典到货」信号，
+   * 那条走 TextConvert.STORAGE_CONVERT_REV（util/TextConvert 里 bumpRev）。
+   */
+  static readonly STORAGE_CHINESE_CONVERT: string = 'chineseConvertMode';
+
+  /** 同步推档位副本（不落库、不读词典） */
+  static pushChineseConvert(value: string): string {
+    let v: string = ChineseConvertMode.OFF;
+    if (value === ChineseConvertMode.SIMPLIFIED || value === ChineseConvertMode.TRADITIONAL) {
+      v = value;
+    }
+    AppStorage.setOrCreate<string>(UserSettings.STORAGE_CHINESE_CONVERT, v);
+    return v;
+  }
+
+  /**
+   * 写档：先推副本再落库（顺序与 setScrollMode 同口径）。
+   * 本方法刻意不 import TextConvert（依赖方向只能单向：TextConvert → UserSettings），
+   * 读词典由调用方接手 —— 冷启动在 pages/Index 的 aboutToAppear，切档在设置页选择器里。
+   */
+  static async setChineseConvert(value: string): Promise<void> {
+    const v: string = UserSettings.pushChineseConvert(value);
+    await PreferenceStore.getInstance().putString(UserSettings.KEY_CHINESE_CONVERT, v);
   }
 
   /** 纵向滚动模式下点按是否翻一屏；横向翻页模式不受此项影响（点按恒翻页） */
@@ -236,6 +300,7 @@ export class UserSettings {
     s.readDirection = UserSettings.readDirection();
     s.tapToScroll = UserSettings.tapToScroll();
     s.scrollMode = UserSettings.readScrollMode();
+    s.chineseConvert = UserSettings.readChineseConvert();
     s.cookieHostCount = cookieHostCount;
     return s;
   }

@@ -58,6 +58,7 @@ import { MangaSource } from '../../data/source/Source';
 import { ImageCache } from '../../data/image/ImageCache';
 import { MangaRepository } from '../../data/db/MangaRepository';
 import { UserSettings, ReadScrollMode, ReadDirection, SettingLabels } from '../../util/UserSettings';
+import { TextConvert } from '../../util/TextConvert';
 import { ChapterInfo, PageImage, ReadProgress } from '../../data/model/Models';
 
 /**
@@ -477,6 +478,13 @@ export class ReaderDiag {
    *   判代照看「字段在不在」，回归判定改看「点中小块后涨不涨」，别再拿 tap=>0 当「点过画面」的证据。
    */
   static tapHits: number = 0;
+  /**
+   * s34 第 2 条：中心热区的实测口径（vp）—— 由 ReaderPageImage.tapCenterH() 在排行高时顺手写入，
+   * 恒 = 视口宽 × 48% 与 视口高 × 32%。① 判代：回传里没有 tapBox= = 包早于 s34；② 判读：用户换
+   * 机型/折叠屏展开态时这两个数应跟着 vw=/vh= 一起变，不变 = 自适应没吃到实测视口。
+   */
+  static tapBoxW: number = 0;
+  static tapBoxH: number = 0;
   // ---------------- s32 第 3/4 条：竖向「到底接下一章」链与自动阅读模式的可见性 ----------------
   // 审计⑦：追加/切章链在诊断面板上原本**完全不可见**（真机卡死时读不出卡在哪一环），这里补六枚计数。
   // 判读速记（卡死现场）：reachEnd>0 且 touchSkip>0 而 appN 停值不动 = 那发 onReachEnd 被触摸闸吞了；
@@ -776,7 +784,9 @@ export class ReaderDiag {
       ' pairN=' + ReaderDiag.rowPairCount +
       ' vw=' + ReaderDiag.viewportW.toFixed(0) + ' vh=' + ReaderDiag.viewportH.toFixed(0) +
       // s27 判代 + 回归两用：tap= 下沉后热区收到的点按总数（无此字段 = 包早于 s27；点过画面却恒 0 = 热区搬完没接住事件）。
-      ' tap=' + ReaderDiag.tapHits;
+      // s34 tapBox= 中心热区实测尺寸（宽x高，vp）：判代 + 「自适应在这台机器上到底算成多大」的读数。
+      ' tap=' + ReaderDiag.tapHits +
+      ' tapBox=' + ReaderDiag.tapBoxW.toFixed(0) + 'x' + ReaderDiag.tapBoxH.toFixed(0);
   }
 
   /** 诊断面板用的一行文本（章） */
@@ -906,17 +916,25 @@ function looksTechnical(s: string): boolean {
 @Component
 struct ReaderPageImage {
   /**
-   * 中心热区高度（vp；s31 第 4 条把热区放大）。宽度不在这里给 —— 由下面 TapLayer 中列的
-   * width('100%') 撑满整列（中列 = 40% 屏宽，见三列宽度那条注释），本常量只管竖向 220vp。
-   * s30 那版是居中 96×96 方块，真机反馈「扩大打开设置的中央区域，当前太小」⇒ 现约 154×220vp，
-   * 面积是原来的五倍多。**刻意不让热区超出父 Stack 边界**（超出边界能否命中是未验证行为，不赌），
-   * 所以只把中列从 1/3 屏宽扩到 2/5、竖向给 220vp，而不是给一个会顶出屏幕的定值。
+   * 中心热区尺寸（s34 第 2 条改比例自适应，用户原话「参考我上传图片的中心白框大小…各个机型屏幕
+   * 大小不同，请做到自适应」）：白框在该机 1320×2848 截屏上实测 x 380..1003 / y 891..1806
+   * ⇒ 47.3% 屏宽 × 32.1% 屏高，取整成 48% × 32%（宽就当中列宽，两侧翻页区各留 26%）。
+   * 旧口径 = 中列整宽（40%）× 恒 220vp：220vp 在小屏上快半屏、在折叠屏展开态又偏小，且换机型
+   * 不会跟着变 —— 这一版起只有**比例**是常量。
+   * **刻意不让热区超出父 Stack 边界**（超出边界能否命中是未验证行为，不赌）⇒ 用「把中列拓宽到
+   * 48%」而不是「给一个会顶出中列的定宽」；左右翻页区各 26%（377vp 屏上 98vp，照样好点）。
    * ★ 必须声明在**本 struct**：TapLayer 是本组件的 @Builder，而常量原先声明在 ReaderView 上是
    *   private static —— 跨 struct 取别人的 private 成员在 ArkTS 严格模式下就是访问权限错误
    *   （补丁 C 搬的就是这一处）。static 成员写在 @Component struct 内是仓内既有做法
    *   （先例 = ReaderView.SLIDER_JUMP_DEBOUNCE_MS）。
    */
-  private static readonly TAP_CENTER_H: number = 220;
+  private static readonly TAP_CENTER_W: string = '48%';
+  private static readonly TAP_SIDE_W: string = '26%';
+  private static readonly TAP_CENTER_H_RATIO: number = 0.32;
+  /** 只给诊断回显用（热区宽实际由 TAP_CENTER_W 这个百分比落，这里给同一个比例算 vp 数好读） */
+  private static readonly TAP_CENTER_W_RATIO: number = 0.48;
+  /** 视口高还没量到（首帧 onAreaChange 未落地）时的兜底高 = 旧的 s31 定值，宁小也不给 0 */
+  private static readonly TAP_CENTER_H_FALLBACK: number = 220;
   @Prop @Watch('onUrlChanged') url: string = '';
   /** 图源 id（空 = 未知，走宿主 HTTP；插件图源才走插件取图 + 反混淆意图）。 */
   @Prop sourceId: string = '';
@@ -1276,6 +1294,54 @@ struct ReaderPageImage {
     return h;
   }
 
+  /**
+   * 中心热区的高（s34 第 2 条）。按**视口高**的比例、不按父容器比例 —— 竖向档里本行容器可能比
+   * 屏幕还高（长图切图 rowH 到 1.16 屏），写 height('32%') 会跟着行高跑，用户眼里的「中心块」
+   * 尺寸就随图源比例变了；横向档容器高 == 视口高，两种口径重合，所以统一取视口高这个口径。
+   * viewportH 还没量到（首帧 onAreaChange 未落地）时退回旧常量，宁小也不给 0。
+   * ★ 纯度量 + 只写诊断（同 skeletonBlockH 写 bareVoidMax 的先例）：不参与任何布局判定。
+   *   tapBox= 兼作 s34 的**判代字段**（回传里没有它 = 包早于 s34），也是「自适应到底落多大」的
+   *   唯一读数 —— 换机型不用改代码，看这一行就知道实际尺寸。
+   */
+  private tapCenterH(): number {
+    if (this.viewportH <= 0) {
+      return ReaderPageImage.TAP_CENTER_H_FALLBACK;
+    }
+    let h: number = this.viewportH * ReaderPageImage.TAP_CENTER_H_RATIO;
+    const row: number = this.rowHeightForTap();
+    if (row > 0 && h > row) {
+      h = row; // 短行（骨架行 / 横向长条图）夹到本行高，热区永不越出父 Stack
+    }
+    if (this.viewportW > 0) {
+      ReaderDiag.tapBoxW = this.viewportW * ReaderPageImage.TAP_CENTER_W_RATIO;
+      ReaderDiag.tapBoxH = h;
+    }
+    return h;
+  }
+
+  /**
+   * 给热区夹取用的「本行容器高」，必须与 build() 三个分支的口径逐一对齐（同 pendingRowH 的纪律）：
+   * 横向档 = 视口高（build 走 height('100%')）；纵向窄骨架档 = skeletonHeight()；
+   * 纵向真比档 = 视口宽 / 真比（build 走 .aspectRatio(真比)）。返回 0 = 判不出来，调用侧不夹。
+   * ★ 只用纯读口径：刻意调 knownRatio()（纯读、不计数）而不是 aspect() —— aspect() 命中尺寸表那档
+   *   会 sizeHits++，热区多问一次就会把 16 号行的 hit= 打成渲染次数（s16 抓过的缺陷形态）。
+   *   代价 = 「位图刚到手、尺寸表还没有这一页」那一瞬夹不到（该档行高本来就 >= 一页真高，
+   *   与旧的恒 220vp 同行为），宁可少夹一次也不污染判据。
+   */
+  private rowHeightForTap(): number {
+    if (!this.fitHeight) {
+      return this.viewportH;
+    }
+    if (!this.ratioKnown()) {
+      return this.skeletonHeight();
+    }
+    const r: number = this.knownRatio();
+    if (r > 0 && this.viewportW > 0) {
+      return this.viewportW / r;
+    }
+    return 0;
+  }
+
   /** 窄骨架高：常量与「1/4 屏」取小；viewportH 还没量到时用常量本身（168vp 已小于真机 1/4 屏 203vp） */
   private skeletonHeight(): number {
     if (this.viewportH > 0 && this.viewportH / 4 < ReaderPageImage.SKELETON_H) {
@@ -1548,18 +1614,20 @@ struct ReaderPageImage {
   }
   /**
    * s27 黑区修法 R1：三列点按热区（左/中/右），由父组件原先挂在行盒上的那两枚 @Builder 逐字
-   * 变换而来 —— 只把 tapSide(false) / tapCenter() / tapSide(true) 换成下面三枚回调属性，列结构、
-   * layoutWeight(1)、height('100%')、Transparent、onClick 全部原样。唯一区别是**挂载位置**：这里的
+   * 变换而来 —— 只把 tapSide(false) / tapCenter() / tapSide(true) 换成下面三枚回调属性，
+   * height('100%')、Transparent、onClick 全部原样（★ s34 起中列宽度从 layoutWeight(1) 改成显式
+   * 48%，中心块高度从恒 220vp 改成 tapCenterH() 按屏比例 —— 这两处是有意的改动，不是背离）。挂载位置：这里的
    * 外层容器有 aspectRatio 或显式 height 定出的确定高，height('100%') 只解析成本行自己的尺寸，
    * 不再把行盒撑大。仍排在 Body 与 PageBadge 之后 = 命中层级与旧版逐列一致。
    */
   @Builder
   TapLayer() {
     Row() {
-      // 三列宽度（s31 第 4 条）：左 30% / 中 40% / 右 30%（原先三等分 = 中列最多 1/3 屏宽，
-      // 中心热区跟着受限）。左右各留 30% ≈ 115vp，翻页照样好点。
+      // 三列宽度（s34 第 2 条）：左 26% / 中 48% / 右 26%（s31 那版是 30/40/30）。中列要容纳
+      // 「48% 屏宽」的中心热区，两侧同步收窄；26% 在 377vp 屏上是 98vp，翻页仍好点。
+      // 三列都是百分比 ⇒ 本身随屏宽自适应，没有任何手抄 vp。
       Column()
-        .width('30%')
+        .width(ReaderPageImage.TAP_SIDE_W)
         .height('100%')
         .backgroundColor(Color.Transparent)
         .onClick(() => {
@@ -1569,14 +1637,17 @@ struct ReaderPageImage {
 
       // 中列 = 纯容器（自身不挂 onClick ⇒ 不吞事件），真正的命中面是居中的一块矩形热区：
       // s30 第 6 条「点击区域中心一定面积的区域内设置才弹出，再点一下中心，关闭设置」；
-      // s31 第 4 条按真机反馈把它放大成「中列整宽 × TAP_CENTER_H」= 约 154×220vp（原 96×96）。
-      // 竖向给 TAP_CENTER_H、横向 width('100%') 撑满中列 ⇒ 热区四边都在父 Stack 内。
+      // s31 第 4 条按真机反馈放大成「中列整宽 × 恒 220vp」（约 154×220）；
+      // s34 第 2 条改成按屏比例（见 TAP_CENTER_W / TAP_CENTER_H_RATIO 那段注释）。
+      // 热区四边仍都在父 Stack 内：宽 = 中列整宽（48% 屏宽），高 = 视口高 × 32% 且**再夹到不超过
+      // 本行容器高**（tapCenterH / rowHeightForTap）。竖向长图那行比屏幕高时热区按屏幕高算，
+      // 骨架行（只有 1/4 屏）与横向长条图那种矮行则被夹到行高 —— 两种口径都在 tapBox= 里读得到。
       // 背景仍写 Transparent —— s27 真机验证过「透明背景 + 空容器 + onClick」在 ArkUI 上可命中，
       // 空 Column 不给背景则不参与命中，这两点是这套热区能用的前提，别顺手删。
       Stack({ alignContent: Alignment.Center }) {
         Column()
           .width('100%')
-          .height(ReaderPageImage.TAP_CENTER_H)
+          .height(this.tapCenterH())
           .borderRadius(16)
           .backgroundColor(Color.Transparent)
           .onClick(() => {
@@ -1584,11 +1655,13 @@ struct ReaderPageImage {
             this.onTapCenter();
           })
       }
-        .layoutWeight(1)
+        // 原来是 layoutWeight(1) 吃剩余宽度（= 40%）；s34 起改成显式百分比，与两侧那两列同口径，
+        // 三列相加正好 100% ⇒ 中心热区的宽度就是「屏宽的 48%」这个可复算的数，不再依赖分配结果。
+        .width(ReaderPageImage.TAP_CENTER_W)
         .height('100%')
 
       Column()
-        .width('30%')
+        .width(ReaderPageImage.TAP_SIDE_W)
         .height('100%')
         .backgroundColor(Color.Transparent)
         .onClick(() => {
@@ -1627,6 +1700,23 @@ export struct ReaderView {
   @StorageProp('bottomSafeHeight') bottomSafe: number = 0;
   /** 浮层配色跟全局深浅色（阅读器正文区恒黑底，但抽屉与设置卡片要跟系统） */
   @StorageProp('isDark') isDark: boolean = false;
+  /**
+   * 简繁转换版本号（util/TextConvert.bumpRev 在词典就绪或切档后自增）：
+   * 词典是异步读的，首帧拿到的是原文，就绪后靠它把顶栏章节名与目录重算一遍。
+   * 必须在渲染表达式里读到一次（见 cvtShow），只声明不用不会触发重渲染。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /** 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。 */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      // 本进程还没就绪过词典也没切过档 = 首帧，原样给，连表都不查
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
+
   /**
    * 阅读模式的响应式副本（s13 第 6 条）：初值在 aboutToAppear 从偏好灌进 AppStorage，
    * 之后只由「更多页选项」或本文件的 applyScrollMode 改写 ⇒ 阅读器还活着时改档也能立刻翻档。
@@ -2769,7 +2859,7 @@ export struct ReaderView {
           ForEach(this.chapters, (ch: ChapterInfo, idx: number) => {
             ListItem() {
               Row({ space: 8 }) {
-                Text(ch.title)
+                Text(this.cvtShow(ch.title))
                   .fontSize(14)
                   .fontColor(idx === this.chapterIndex ? Theme.brand : Theme.text1(this.isDark))
                   .maxLines(1)
@@ -3829,7 +3919,7 @@ export struct ReaderView {
         })
 
         Column() {
-          Text(this.title)
+          Text(this.cvtShow(this.title))
             .fontSize(Dim.topBarTitle)
             .fontWeight(FontWeight.Medium)
             .fontColor(Theme.white)
@@ -3838,7 +3928,7 @@ export struct ReaderView {
             .width('100%')
             .textAlign(TextAlign.Start)
 
-          Text(this.chapterName)
+          Text(this.cvtShow(this.chapterName))
             .fontSize(11)
             .fontColor(Theme.dTextSecondary)
             .maxLines(1)

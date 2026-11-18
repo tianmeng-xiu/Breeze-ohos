@@ -12,10 +12,10 @@
  *  - 失败一律抛可直接展示的中文 Error（Source.ets 契约）；JSON 解析全走 JsonUtil 防御式取值。
  * 依据系统 Kit：无（仅 util + data 层）。
  */
-import { MangaSource } from './Source';
+import { MangaSource, SearchPageResult } from './Source';
 import { MangaSummary, ChapterInfo, PageImage, SourceInfo } from '../model/Models';
 import { bundleCall, bundleCallBytes, bundleLoadFromPath, bundleList, BytesResult } from '../../util/PluginRuntime';
-import { jparse, jstr, jobj, jarr, jstrArr, jisEmpty } from '../../util/JsonUtil';
+import { jparse, jstr, jobj, jarr, jstrArr, jisEmpty, jint, jbool } from '../../util/JsonUtil';
 import { Logger } from '../../util/Logger';
 
 /** 图源 id 前缀：plugin:<清单 uuid>。 */
@@ -332,6 +332,64 @@ export class PluginSourceAdapter implements MangaSource {
     return out;
   }
 
+  /**
+   * 搜索分页解析（★ 与 itemsToSummaries 的区别 = 这一条要把 paging / extern 带出来）。
+   * paging 位置照上游 unified_plugin_search.dart:64-66：`data.paging` 优先、退回顶层 `paging`；
+   * items 同样 data.items 优先退顶层 items（与 itemsToSummaries 同一口径）。
+   * ★ 判「到底」只有两条腿（★ 曾经有第三条腿「pages > 0 且 page >= pages」，s34 已删，理由见下）：
+   *   ① paging.hasReachedMax == true（插件明说）
+   *   ② 本页零条目（最弱信号，但插件普遍就这么表达到底）
+   * ★★ 为什么不得拿 pages 与 page 比（s34 真机缺陷一的根因）：JMComic 的 searchComic 回包写的是
+   *   paging:{page:f,pages:f,...}（bundle 内 f = 本次请求页码）—— 它的 pages 是 **页码的别名**、
+   *   不是总页数，于是「page >= pages」在第一页就成立 ⇒ 宿主把每一源都判「到底」⇒ 底部直接显示
+   *   「没有更多了」且永远不再取下一页。上游同样不看 pages：get_plugin_result.dart:34-35 只把
+   *   parsed.paging.page 记成「下次取 page+1」的游标、只有 parsed.paging.hasReachedMax 参与判到底
+   *   （unified_plugin_search.dart:21 `map['hasReachedMax'] == true`）。真没到底的源由插件自己回
+   *   hasReachedMax=false（JM 的式子 = 空页 / 不足 80 条 / 累计条数达 total 三者之一）+ 本处 ② 兜住。
+   * itemsToSummaries 里那条「id/title 双非空」过滤在这里同样生效，
+   * 但**判空用原始条数**：过滤后为空而原始非空 = 数据脏，不能当成「到底」。
+   */
+  static parseSearchPage(root: ESObject, sourceId: string, reqPage: number): SearchPageResult {
+    const r: SearchPageResult = new SearchPageResult();
+    r.page = reqPage;
+    const data: ESObject = jobj(root, 'data');
+    let items: ESObject[] = jarr(data, 'items');
+    if (items.length === 0) {
+      items = jarr(root, 'items');
+    }
+    const pgSrc: ESObject = jisEmpty(data) ? jobj(root, 'paging') : jobj(data, 'paging');
+    const pg: ESObject = jisEmpty(pgSrc) ? jobj(root, 'paging') : pgSrc;
+    if (!jisEmpty(pg)) {
+      const p: number = jint(pg, 'page', 0);
+      if (p > 0) {
+        r.page = p;
+      }
+      r.pages = jint(pg, 'pages', 0);
+      r.hasReachedMax = jbool(pg, 'hasReachedMax', false);
+    }
+    const out: MangaSummary[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const s: MangaSummary = PluginSourceAdapter.mapItem(items[i], null, sourceId);
+      if (s.id.length > 0 && s.title.length > 0) {
+        out.push(s);
+      }
+    }
+    r.items = out;
+    if (!r.hasReachedMax && items.length === 0) {
+      r.hasReachedMax = true;
+    }
+    // 回包 extern（顶层，上游 get_plugin_result.dart:37）：非空对象才序列化带走。
+    const ext: ESObject = jobj(root, 'extern');
+    if (!jisEmpty(ext)) {
+      try {
+        r.extern = JSON.stringify(ext);
+      } catch (e) {
+        r.extern = '';
+      }
+    }
+    return r;
+  }
+
   private rememberChapter(mangaId: string, chapters: ChapterInfo[]): void {
     for (let i = 0; i < chapters.length; i++) {
       if (this.chapterComic.size > 256) {
@@ -353,13 +411,26 @@ export class PluginSourceAdapter implements MangaSource {
     return PluginSourceAdapter.itemsToSummaries(o, PLUGIN_SOURCE_PREFIX + this.uuid);
   }
 
-  /** 搜索：searchComic（两家均 1 基，直接透传）。 */
-  async search(keyword: string, page: number): Promise<MangaSummary[]> {
+  /**
+   * 搜索：searchComic（两家均 1 基，直接透传）。
+   * 上游 get_plugin_result.dart:21-27 的 core = {keyword, page, isSearchAggregate} + extern
+   * ⇒ **本轮刻意不带 isSearchAggregate**：上游只有聚合页才传 true，而 s32 之前所有真机验收
+   *   都是在「无此键」的载荷上跑出来的；插件若读它（多半用来在聚合态省掉逐条富化），
+   *   加键 = 改动全部 21 枚插件的已验收路径，与本次「加翻页」无关，不顺手做。
+   * externJson 非空 = 回传上一页游标（上游 :37 `blocState.pluginExtern = parsed.extern`）。
+   */
+  async searchPage(keyword: string, page: number, externJson: string): Promise<SearchPageResult> {
     const a: SearchArg = new SearchArg();
     a.keyword = keyword;
     a.page = Math.max(1, Math.floor(page) || 1);
+    if (externJson.length > 0) {
+      const ext: ESObject = jparse(externJson);
+      if (!jisEmpty(ext)) {
+        a.extern = ext;
+      }
+    }
     const o: ESObject = await this.call('搜索失败', 'searchComic', a);
-    return PluginSourceAdapter.itemsToSummaries(o, PLUGIN_SOURCE_PREFIX + this.uuid);
+    return PluginSourceAdapter.parseSearchPage(o, PLUGIN_SOURCE_PREFIX + this.uuid, a.page);
   }
 
   /** 详情：getComicDetail → data.normal.comicInfo（raw 兜底取 data.raw，照抄 mirror）；确认不存在返回 null。 */

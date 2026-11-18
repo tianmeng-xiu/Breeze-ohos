@@ -35,13 +35,14 @@ import { Theme, Dim } from '../view/common/Theme';
 import { Anim } from '../view/common/Anim';
 import { LoadingView, EmptyView, ErrorView } from '../view/common/StateViews';
 import { SourceManager } from '../data/source/SourceManager';
-import { MangaSource } from '../data/source/Source';
+import { MangaSource, SearchPageResult } from '../data/source/Source';
 import { MangaSummary, SourceInfo } from '../data/model/Models';
 import { SearchHistory } from '../data/kv/SearchHistory';
 import { DetailParams } from '../view/detail/DetailParams';
 import { GlassStyle, GlassButton } from '../view/common/GlassStyle';
 import { LastSourceStore } from '../view/search/LastSourceStore';
 import { Logger } from '../util/Logger';
+import { FeatureDiag } from '../util/FeatureDiag';
 
 /** 聚合搜索伪图源 id（chips 行首「全部」）。 */
 const ALL_SOURCES_ID: string = '__all__';
@@ -51,6 +52,32 @@ class SourceOutcome {
   name: string = '';
   items: MangaSummary[] = [];
   err: string = '';
+  /** 本次拿到的页码（1 基）。 */
+  page: number = 1;
+  /** 该源是否已到底（回包 paging 判定，三条腿见 PluginSourceAdapter.parseSearchPage）。 */
+  reached: boolean = true;
+  /** 翻页游标（回包 extern 原样 JSON 串，'' = 该源不用游标）。 */
+  extern: string = '';
+}
+
+/**
+ * s33 需求 2：每个源各自的翻页状态。
+ * ★ 为什么按源存而不是全局存一个页码：聚合搜索是 N 个源拼成一列（doSearch 并发聚合），
+ *   各源页数与游标互不相干，全局页码会让第二页只有「最后一个源」在推进、其余源重复第 1 页。
+ * 非 @State：只参与取数决策，不进 build；底部那一行读的是 moreState（下面那个 @State）。
+ */
+class SourcePaging {
+  id: string = '';
+  name: string = '';
+  /**
+   * 已取到的最后一页（1 基）。★ 0 = 连第 1 页都没拿到（首屏就失败）—— 取下一页统一发
+   * page + 1，所以这一档必须真是 0，否则「重新加载」会去发第 2 页、把失败那源的第 1 页永久跳过。
+   */
+  page: number = 1;
+  reached: boolean = true;
+  /** 取下一页失败过 ⇒ 不再重试（弱网下避免每次触底都撞一遍）。 */
+  failed: boolean = false;
+  extern: string = '';
 }
 
 @Entry
@@ -73,6 +100,23 @@ struct SearchPage {
   @State partialMsg: string = '';
   /** T9 需求 2：工具区随累计滚动收起（滞回判据见 syncToolCollapse） */
   @State toolCollapsed: boolean = false;
+
+  /**
+   * s33 需求 2：底部那一行的状态（'' = 不显示这行 / 'more' = 还有下一页 /
+   * 'loading' = 正在取下一页 / 'end' = 没有更多了 / 'fail' = 取下一页失败）。
+   * 用字符串而不是三个 bool：四态互斥，三个 bool 要维护 8 种组合里的非法那些。
+   */
+  @State moreState: string = '';
+  /** 下一页取数中（不进 build 判据，只当互斥闸；与 moreState='loading' 同步维护）。 */
+  private loadingMore: boolean = false;
+  /** 各源翻页状态（见 SourcePaging 注释）。 */
+  private pagings: SourcePaging[] = [];
+  /**
+   * 搜索代号：每次 doSearch 自增。loadMoreResults 是异步的，用户在它 in-flight 时
+   * 改词重搜 ⇒ 手里那份「上一页 + 新页」会把旧结果追加到新结果后面。返回时比代号，
+   * 不一致直接丢弃（不追加、不改 moreState）。
+   */
+  private searchSeq: number = 0;
 
   /**
    * s11 第 6 条：本次是不是「带词进来」（详情页点作者名 / 标签）。
@@ -379,7 +423,11 @@ struct SearchPage {
     return this.chips[this.chipIndex].id;
   }
 
-  /** 单源搜索（含装载等待），异常转 SourceOutcome.err，绝不冒泡打断其它源。 */
+  /**
+   * 单源搜索（含装载等待），异常转 SourceOutcome.err，绝不冒泡打断其它源。
+   * s33 需求 2：改走 searchPage 以带回 paging / extern（旧 search() 把两者丢了，
+   * 宿主无从判断还有没有下一页）。
+   */
   private async searchOne(info: SourceInfo, kw: string): Promise<SourceOutcome> {
     const out: SourceOutcome = new SourceOutcome();
     out.name = info.name;
@@ -389,11 +437,165 @@ struct SearchPage {
         out.err = '图源未就绪';
         return out;
       }
-      out.items = await src.search(kw, 1);
+      const r: SearchPageResult = await src.searchPage(kw, 1, '');
+      out.items = r.items;
+      out.page = r.page;
+      out.reached = r.hasReachedMax;
+      out.extern = r.extern;
     } catch (e) {
       const x = e as Error;
       const m = x.message;
       out.err = (typeof m === 'string' && m.length > 0) ? m : String(e);
+      out.reached = true;
+    }
+    return out;
+  }
+
+  /**
+   * s33 需求 2：取各源下一页。
+   * ★ 触底自动翻页但**失败不无限重试**：失败的源一次性标 failed 剔除，否则弱网下每次触底
+   *   都会重打一遍（评论页那边靠 hasReachedMax=false 时点一次只重试一次，这里同理收口）。
+   * ★ 只在「还开着」（未到底且未失败）的源上推进；全部关掉 ⇒ 'end'。
+   */
+  async loadMoreResults(): Promise<void> {
+    if (this.loadingMore || this.loading || this.moreState !== 'more') {
+      // s34：这里必须留读数。这一行 return 掉的情形（在翻页 / 首屏没回 / 已判到底）与「触底事件
+      // 压根没触发」在 20 号行上原本长一个样，真机那一轮就是被这个歧义拖了一轮。
+      FeatureDiag.get().spBlocked += 1;
+      return;
+    }
+    const kw: string = this.keyword.trim();
+    if (kw.length === 0) {
+      return;
+    }
+    const open: SourcePaging[] = [];
+    for (let i = 0; i < this.pagings.length; i++) {
+      if (!this.pagings[i].reached && !this.pagings[i].failed) {
+        open.push(this.pagings[i]);
+      }
+    }
+    if (open.length === 0) {
+      this.moreState = 'end';
+      FeatureDiag.get().spEnd += 1;
+      return;
+    }
+    FeatureDiag.get().spCalls += 1;
+    this.loadingMore = true;
+    this.moreState = 'loading';
+    const seq: number = this.searchSeq;
+    const jobs: Promise<SourceOutcome>[] = [];
+    for (let i = 0; i < open.length; i++) {
+      jobs.push(this.searchOnePage(open[i], kw));
+    }
+    const outs: SourceOutcome[] = await Promise.all(jobs);
+    if (seq !== this.searchSeq) {
+      // 期间用户已改词重搜 ⇒ 这一批属于旧结果，整批丢弃（doSearch 已重置 moreState/pagings）
+      this.loadingMore = false;
+      FeatureDiag.get().spStale += 1;
+      Logger.i('[Search] loadMore 结果作废（搜索已换代）');
+      return;
+    }
+    const merged: MangaSummary[] = [];
+    for (let i = 0; i < this.items.length; i++) {
+      merged.push(this.items[i]);
+    }
+    let anyOk: boolean = false;
+    for (let i = 0; i < open.length; i++) {
+      const p: SourcePaging = open[i];
+      const o: SourceOutcome = outs[i];
+      if (o.err.length > 0) {
+        p.failed = true;
+        FeatureDiag.get().spFail += 1;
+        continue;
+      }
+      anyOk = true;
+      FeatureDiag.get().spOk += 1;
+      // s34：「翻页无进展」兜底 —— 回包页码没往前走（插件不认页码、或把自己的页码原样回吐）就说明
+      // 这一源再也取不出新东西，就地关掉它。刻意用「页码有没有前进」而不是「page >= pages」判到底：
+      // 后者会被 JMComic 那种 pages = 页码别名的回包误判（见 PluginSourceAdapter.parseSearchPage 注释）。
+      p.reached = o.reached || !(o.page > p.page);
+      p.page = o.page > p.page ? o.page : p.page;
+      p.extern = o.extern.length > 0 ? o.extern : p.extern;
+      if (!p.reached && o.items.length === 0) {
+        p.reached = true; // 零条目 = 到底（parseSearchPage 同样这么判，这里补上聚合侧）
+      }
+      for (let k = 0; k < o.items.length; k++) {
+        merged.push(o.items[k]);
+      }
+    }
+    this.loadingMore = false;
+    let stillOpen: boolean = false;
+    let anyFailed: boolean = false;
+    for (let i = 0; i < this.pagings.length; i++) {
+      if (this.pagings[i].failed) {
+        anyFailed = true;
+      }
+      if (!this.pagings[i].reached && !this.pagings[i].failed) {
+        stillOpen = true;
+      }
+    }
+    // ★ s34 第 1 条：只要还有失败源就是 'fail'，不能因为「别的源到底了」就报 'end'。
+    //   旧写法 anyOk ? 'end' : 'fail' 的真机后果 = jm 翻页超时、pic 恰好到底 ⇒ 底部显示
+    //   「没有更多了」，而 jm 那个失败源再没有任何重试入口（用户原话「也没有按钮让其重新加载」）。
+    //   不 break 也是为了把 anyFailed 数完（stillOpen 先到 true 就跳会漏掉后面的失败源）。
+    const next: string = stillOpen ? 'more' : (anyFailed ? 'fail' : (anyOk ? 'end' : 'fail'));
+    if (next === 'end') {
+      FeatureDiag.get().spEnd += 1;
+    }
+    Logger.i('[Search] loadMore page+1 ok=' + (anyOk ? 1 : 0) + ' total=' + merged.length + ' state=' + next);
+    // @State 对数组 push 不敏感 ⇒ 整体换引用（同 CommentPage.loadMore 口径）
+    this.animContent((): void => {
+      this.items = merged;
+      this.moreState = next;
+    });
+  }
+
+  /**
+   * 「下一页加载失败」那行的点击重试：把被标 failed 的源放回候选（页码不推进 = 重打同一页），
+   * 然后走正常翻页路。只在 'fail' 态可点，所以这里不必再判状态。
+   */
+  private retryMore(): void {
+    let revived: number = 0;
+    for (let i = 0; i < this.pagings.length; i++) {
+      if (this.pagings[i].failed) {
+        this.pagings[i].failed = false;
+        // ★ 一起清 reached：出错时 reached 被置过 true（那只是「别再自动试」的语义），
+        // 不复位的话 loadMoreResults 的候选（!reached && !failed）仍然为空 ⇒ 按钮点了等于没点。
+        // 页码不动 = 从「最后一个成功页 + 1」续，不会重复已拿到的那几页。
+        this.pagings[i].reached = false;
+        revived++;
+      }
+    }
+    if (revived === 0) {
+      this.moreState = 'end';
+      return;
+    }
+    // loadMoreResults 首行要求 'more'，而这里是 'fail' 态 ⇒ 先把闸门打开
+    this.moreState = 'more';
+    this.loadMoreResults();
+  }
+
+  /** 单源下一页（searchOnePage 与 searchOne 同构，只是页码与游标由 p 提供）。 */
+  private async searchOnePage(p: SourcePaging, kw: string): Promise<SourceOutcome> {
+    const out: SourceOutcome = new SourceOutcome();
+    out.name = p.name;
+    out.page = p.page + 1;
+    try {
+      const src: MangaSource | null = SourceManager.getInstance().get(p.id);
+      if (src === null) {
+        out.err = '图源未就绪';
+        return out;
+      }
+      const r: SearchPageResult = await src.searchPage(kw, p.page + 1, p.extern);
+      out.items = r.items;
+      out.page = r.page;
+      out.reached = r.hasReachedMax;
+      out.extern = r.extern;
+    } catch (e) {
+      const x = e as Error;
+      const m = x.message;
+      out.err = (typeof m === 'string' && m.length > 0) ? m : String(e);
+      out.reached = true;
     }
     return out;
   }
@@ -417,6 +619,12 @@ struct SearchPage {
       return;
     }
     this.resetViewForNewSearch();
+    // s33 需求 2：换代 + 清翻页现场。loadingMore 也一并清掉：上一次「下一页」可能正在
+    // in-flight，它回来时会比 searchSeq 发现已换代而自己丢弃结果（见 loadMoreResults）。
+    this.searchSeq = this.searchSeq + 1;
+    this.pagings = [];
+    this.loadingMore = false;
+    this.moreState = '';
     const sid: string = this.currentChipId();
     const targets: SourceInfo[] = [];
     if (sid === ALL_SOURCES_ID) {
@@ -455,9 +663,20 @@ struct SearchPage {
       const outs: SourceOutcome[] = await Promise.all(jobs);
       const merged: MangaSummary[] = [];
       const errs: string[] = [];
+      const pgs: SourcePaging[] = [];
       let okCount: number = 0;
       for (let i = 0; i < outs.length; i++) {
         const o: SourceOutcome = outs[i];
+        const p: SourcePaging = new SourcePaging();
+        p.id = targets[i].id;
+        p.name = o.name;
+        // s34：失败的源页码记 0（不是 o.page —— 出错时它停在默认值 1，看着像「第 1 页已到手」）。
+        // 取下一页发的是 page + 1 ⇒ 记 1 会让重试直接跳第 2 页，该源第 1 页永久缺失且不报错。
+        p.page = o.err.length > 0 ? 0 : o.page;
+        p.reached = o.reached || o.err.length > 0;
+        p.failed = o.err.length > 0;
+        p.extern = o.extern;
+        pgs.push(p);
         if (o.err.length > 0) {
           errs.push(o.name + '：' + o.err);
         } else {
@@ -467,17 +686,37 @@ struct SearchPage {
           }
         }
       }
+      this.pagings = pgs;
       if (merged.length === 0 && errs.length > 0 && okCount === 0) {
         // 全失败 ⇒ ErrorView，文案带失败源（截断防爆行）
         const j: string = errs.join('；');
         this.animContent((): void => {
           this.items = [];
+          this.moreState = '';
           this.errorMsg = '搜索失败（' + j.slice(0, 160) + '）';
         });
       } else {
+        let anyOpen: boolean = false;
+        let anyFailed: boolean = false;
+        for (let i = 0; i < pgs.length; i++) {
+          if (pgs[i].failed) {
+            anyFailed = true;
+          }
+          if (!pgs[i].reached && !pgs[i].failed) {
+            anyOpen = true;
+          }
+        }
         this.animContent((): void => {
           this.items = merged;
           this.partialMsg = errs.length > 0 ? ('部分源失败：' + errs.join('；').slice(0, 120)) : '';
+          // 底部行只在有结果时出现（空结果走 EmptyView，那已经是「没有更多」的意思）
+          // 同理 s34：失败源存在时最终要给 'fail'（那一行带「重新加载」按钮），别报「没有更多了」。
+          //   jm 首屏超时、pic 出结果的组合在真机很常见，旧写法这时底部只有「继续下滑加载更多」
+          //   或「没有更多了」，失败源被永久剔除（p.failed 之后没人再复位）。
+          //   ★ 档位次序 = more 优先于 fail：还有源能翻就先让它翻（这里若让 fail 抢先，
+          //   loadMoreResults 首行的 moreState !== 'more' 闸门会把健康源的翻页一起挡死）。
+          //   翻页侧那条（loadMoreResults 末尾）用的是同一个次序，两边必须一致。
+          this.moreState = merged.length === 0 ? '' : (anyOpen ? 'more' : (anyFailed ? 'fail' : 'end'));
         });
         // 至少一源成功才记（与旧 Discover 搜索口径一致：全失败不记废词）
         if (okCount > 0) {
@@ -882,12 +1121,66 @@ struct SearchPage {
         .scrollBar(BarState.Off)
         // 底部留白用 contentEndOffset（=72），不要 padding —— padding 会裁末行
         .contentEndOffset(Dim.contentBottomReserve)
+        // s33 需求 2：触底自动取下一页（List/Scroll 同 SDK 方法，grid.d.ts:1048）。
+        // 触底后还会不会再来一次取决于内容是否变高：变了重新布局就不再触发，
+        // 没变（该源到底）⇒ 靠 moreState 闸住（loadMoreResults 首行判 'more'）。
+        .onReachEnd((): void => {
+          this.loadMoreResults();
+        })
         // T9 需求 2：onDidScroll 只给每帧增量 ⇒ 从 scroller 读绝对偏移，同喂顶栏斜坡与工具区收起
         .onDidScroll((_offset: number, _state: ScrollState) => {
           const y: number = this.gridScroller.currentOffset().yOffset;
           Anim.reportTopBar(y);
           this.syncToolCollapse(y);
         })
+
+        // s33 需求 2：翻页状态行。**放 Grid 外**（固定贴在结果区底部）—— 本 SDK 的
+        // GridItemAttribute 没有 columnSpan（gridItem.d.ts 实测零命中），塞进 GridItem
+        // 只占一列宽、三列下看着像坏了，与上面那条计数行同一个理由。
+        if (this.moreState.length > 0) {
+          Row() {
+            if (this.moreState === 'loading') {
+              // 不用 LoadingView：它自带 width/height 100%（StateViews.ets:27-28），
+              // 塞进这条 40vp 的行里会把行撑满剩余高度。这里要的是行内小转圈。
+              LoadingProgress()
+                .width(16)
+                .height(16)
+                .color(Theme.brand)
+                .margin({ right: 6 })
+              Text('加载中…')
+                .fontSize(12)
+                .fontColor(Theme.text3(this.isDark))
+            } else if (this.moreState === 'end') {
+              Text('没有更多了')
+                .fontSize(12)
+                .fontColor(Theme.text3(this.isDark))
+            } else if (this.moreState === 'fail') {
+              // s34 第 1 条（用户原话「也没有按钮让其重新加载」）：原来这里是一行 12fp 的橙字，
+              // 真机上既看不出可点、点起来也只有几个字的面积 ⇒ 改成胶囊按钮，文案自解释。
+              // 文案不写「下一页」：这一态现在也覆盖首屏某源失败（见 doSearch 的 anyFailed 分支），
+              // 那种情况下失败的是第 1 页，写「下一页」会误导。
+              Text('有图源加载失败')
+                .fontSize(12)
+                .fontColor(Theme.warning)
+                .margin({ right: 10 })
+              Button('重新加载', { type: ButtonType.Capsule, stateEffect: true })
+                .height(28)
+                .fontSize(12)
+                .backgroundColor(Theme.brand)
+                .fontColor(Theme.white)
+                .onClick((): void => {
+                  this.retryMore();
+                })
+            } else {
+              Text('继续下滑加载更多')
+                .fontSize(12)
+                .fontColor(Theme.text3(this.isDark))
+            }
+          }
+          .width('100%')
+          .height(40)
+          .justifyContent(FlexAlign.Center)
+        }
       }
     }
     .width('100%')

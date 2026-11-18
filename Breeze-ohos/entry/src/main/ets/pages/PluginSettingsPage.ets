@@ -49,6 +49,7 @@ import { WebLoginParams } from '../data/source/WebLogin';
 import { PluginStore, PluginRecord } from '../util/PluginStore';
 import { PluginSourceRegistry } from '../data/source/PluginSourceRegistry';
 import { PluginImageOps } from '../data/source/PluginImageOps';
+import { FeatureDiag } from '../util/FeatureDiag';
 import { PLUGIN_SOURCE_PREFIX } from '../data/source/PluginSourceAdapter';
 import { JmMode } from '../data/image/JmDeobfuscate';
 import { bundleCall, bundleUnload, pluginRemoveFile } from '../util/PluginRuntime';
@@ -70,6 +71,36 @@ const MGR_NAME: string = 'pluginMgr';
  * （那边未导出）。契约见 §24：插件永远收到恰好一个对象参数且必带 extern 键。
  */
 const ACTION_ARGS: string = '[{"extern":{}}]';
+/**
+ * s33 需求 4：宿主兜底「图片画质」用的配置键。**只认这一条键名**，理由是它有双重出处：
+ *  ① 上游 Breeze 的老设置迁移补丁表把它写成插件配置桶的规范键 =
+ *    Breeze/lib/object_box/migration/migration_v1_to_v2.dart:129 `'image.quality': bika.imageQuality`；
+ *  ② 本仓既往排查台账同结论（该台账不随本仓库发布，此处只复述结论本身）：bika 的实际取图域名
+ *    由插件函数 w(fileServer,path,type) 自行改写，排查前必须先问 image.quality 与 network.proxy 两个设置值。
+ * 本机逐枚翻过 11 份插件载荷（_tmp/s2/bundles 9 枚 + s16 ehentai + s10 三枚同名副本），
+ * 只有哔咔一枚真的读它（bundle 偏移 1502：`await y("image.quality","original")` 决定走
+ * img.picacomic.com / s3.picacomic.com / storage.diwodiwo.xyz / storage-b.diwwo.xyz 哪条图床），
+ * 其余插件连这个字符串都不出现 ⇒ 所以本行是**按桶里有没有这个键**决定显示，不给所有插件硬塞一行。
+ */
+const IMAGE_QUALITY_KEY: string = 'image.quality';
+/** 上游该键的默认值（Breeze/lib/config/bika/bika_setting.dart:16 @Default('original')）。 */
+const IMAGE_QUALITY_DEFAULT: string = 'original';
+/**
+ * 兜底档位表（两列一一对应）。★ 诚实口径：除 original 外**没有任何一处权威来源给出过合法档位值**
+ * （上游只有 @Default('original')，插件 bundle 里没有档位枚举，公开资料也只出现 image-quality: original），
+ * 所以这里给的是「按插件内部语义拟定的常见档」+ 一项自由输入，UI 文案里也不承诺其余档位一定被认。
+ * 真正生效的判据在插件自己：bika 只做 `值 !== "original"` 的二选一判断（偏移 1502），
+ * 也就是说除 original 外的任何非空串都落到「压缩图床」那一侧，档位之间不再有差别。
+ */
+const QUALITY_VALUES: string[] = [IMAGE_QUALITY_DEFAULT, 'medium', 'low'];
+const QUALITY_LABELS: string[] = ['原图（默认，走原图床）', '中等（压缩图床）', '较低（压缩图床，更省流量）'];
+/** 自定义输入那一档在菜单里的序号（QUALITY_* 之后的一项）。 */
+const QUALITY_CUSTOM_INDEX: number = 3;
+/**
+ * 上游该键的显示名。i18n 里查不到（上游 UI 标签不来自 strings，`Breeze/lib/i18n` 内无
+ * imageQuality 相关 key）⇒ 标签按插件内部语义自拟，并在注释里留这条依据。
+ */
+const IMAGE_QUALITY_LABEL: string = '图片画质';
 /**
  * s15 第 8 条：rawAction 的内部结果（页面私有；数据层的 RawResult/ActionResult 未导出）。
  * ok = 调用有没有跑通（不含业务成败）；root = 原始返回，交 tryOpenWeb 解析；msg = 可直接 toast 的文案。
@@ -323,6 +354,58 @@ class LoginProbeResult {
 }
 
 /**
+ * s33 需求 4：「图片画质」这一行（宿主兜底档）。**与 PluginVersionRow / PluginLoginRow 同因同治
+ * = 必须是独立 @Component + @Prop**：本页已三处实证 @Builder 形参是按值快照的，
+ * 而本行的 subText 会在「用户改完档位」时变（qualityLabel 是 @State），走 ManageRow 会定格在旧值。
+ *
+ * 只在这里显示**清洗后的档位文案**，不显示任何配置桶原文（值本身只可能是 original/medium/low
+ * 这类档位串或用户自填的短串，仍然走 @Prop 传现算好的 label，不把桶内容直接铺屏）。
+ */
+@Component
+struct PluginQualityRow {
+  @StorageProp('isDark') isDark: boolean = false;
+  /** 副标题：当前档位的中文说明（外层 qualityLabel 现算） */
+  @Prop subText: string = '';
+  onTap: () => void = () => {};
+
+  build() {
+    Row() {
+      Column() {
+        Text(IMAGE_QUALITY_LABEL)
+          .fontSize(15)
+          .fontColor(Theme.text1(this.isDark))
+          .width('100%')
+          .textAlign(TextAlign.Start)
+        if (this.subText.length > 0) {
+          Text(this.subText)
+            .fontSize(12)
+            .fontColor(Theme.text3(this.isDark))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .margin({ top: 3 })
+            .width('100%')
+            .textAlign(TextAlign.Start)
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      SymbolGlyph($r('sys.symbol.chevron_right'))
+        .fontSize(Dim.iconSm)
+        .fontColor([Theme.text3(this.isDark)])
+    }
+    .width('100%')
+    .constraintSize({ minHeight: Dim.menuItemH })
+    .padding({ top: 10, bottom: 10 })
+    .alignItems(VerticalAlign.Center)
+    .clickEffect({ level: ClickEffectLevel.LIGHT })
+    .onClick(() => {
+      this.onTap();
+    })
+  }
+}
+
+/**
  * s17 第 2 条：登录卡那一行的独立 @Component（此前是 this.ManageRow(...)，形参按值快照 ⇒
  * 登录态变了样不重绘，本项目已三处实证；同文件的 PluginVersionRow / PluginUserInfoRow 就是先例）。
  *
@@ -465,6 +548,14 @@ struct PluginSettingsPage {
   @State viewSections: SettingSection[] = [];
   /** 反混淆模式的展示文案（进页读一次、用户改完再刷一次；不直接读 pref 以免 build 里做异步）。 */
   @State jmLabel: string = '自动（推荐）';
+  /**
+   * s33 需求 4：该插件是否真的认「图片画质」这个键（= 值表里存在 image.quality）。
+   * 参与 UI 判定 ⇒ 必须 @State（本页 s11 真机踩过：读私有字段不重渲染）。
+   * 不给所有插件硬塞这一行的理由见 IMAGE_QUALITY_KEY 注释（11 枚载荷里只有哔咔读它）。
+   */
+  @State hasQuality: boolean = false;
+  /** 「图片画质」行的展示文案（同上，在 onBundleChanged 里派生一次，不在 build 里现算）。 */
+  @State qualityLabel: string = '未设置';
   /**
    * s17 第 2 条：插件登录方案里**已保存且非空**的凭据条数（只进 UI 的是这个数，值不上屏）。
    * 参与 UI 判定 ⇒ 必须 @State（s11 真机踩过：读私有字段不重渲染）。
@@ -626,6 +717,32 @@ struct PluginSettingsPage {
     // 键都空 且 ② 可见项里没有一项「键名像账号键且值非空」（accountNameFrom 的二级就是来找它的），
     // 所以卡片没名字时本行收掉的必然只是个空值项，不会把用户填过的账号名藏起来。
     this.viewSections = canTakeOver ? this.dropAccountFields(visible) : visible;
+
+    // s33 需求 4：「图片画质」宿主兜底行的两道判定，都在这一处算完（build 里不现算）。
+    //  ① declared = 插件自己在 scheme 里给了这一项 ⇒ 上面列表已有可点行，绝不再开第二行
+    //     （与要求6「同一页不留两个入口」同一口径）。
+    //  ② 值表里存在这个键才显示本行。值表 = 插件 getSettingsBundle 的 data.values **加**宿主桶
+    //     覆盖（PluginSettings.mergeValues :365），两路任一命中都算：插件自报了但没进 scheme（哔咔
+    //     就是这形态：values 里有 image.quality、scheme 里只有账号/屏蔽/接口线路），或插件压根没自报
+    //     但用户以前存过值。都不命中 ⇒ 该插件不认画质，硬塞一行只会让人以为改了有用。
+    let declared: boolean = false;
+    for (let i = 0; i < this.bundle.sections.length && !declared; i++) {
+      const flds: SettingField[] = this.bundle.sections[i].fields;
+      for (let j = 0; j < flds.length; j++) {
+        if (flds[j].key === IMAGE_QUALITY_KEY) {
+          declared = true;
+          break;
+        }
+      }
+    }
+    const qv: string | undefined = this.bundle.values.get(IMAGE_QUALITY_KEY);
+    // ★ 先把可空值收敛成非空串再判：ArkTS 的类型窄化不穿过中间那枚 boolean（写成
+    //   hasQ ? f(cleanDisplayValue(qv)) : … 会报 10605999 string | undefined 不能喂 string），
+    //   而且清洗只做一次。语义与「未定义 / 清洗后空串 ⇒ 不显示本行」完全等价。
+    const qraw: string = qv === undefined ? '' : cleanDisplayValue(qv);
+    const hasQ: boolean = !declared && qraw.length > 0;
+    this.hasQuality = hasQ;
+    this.qualityLabel = hasQ ? this.qualityLabelOf(qraw) : '未设置';
 
     // 要求5 + 新七条第 4 条：主行「已登录 · 账号名」（账号名跟在登录态后面同一行）；
     // 两级来源都取不到才落「已登录」保底行（绝不回铺原始键）。
@@ -936,6 +1053,11 @@ struct PluginSettingsPage {
     if (err.length > 0) {
       this.toast(err);
       return;
+    }
+    if (field.key === IMAGE_QUALITY_KEY) {
+      const d: FeatureDiag = FeatureDiag.get();
+      d.iqWrites += 1;
+      d.iqLast = value;
     }
     // 本地即时回显（不整页 reload：多数插件 getSettingsBundle 会重发网络请求，很慢）
     this.bundle.values.set(field.key, value);
@@ -1334,6 +1456,101 @@ struct PluginSettingsPage {
     }).catch((e: Error): void => {
       Logger.i('反混淆选择取消：' + e.message);
     });
+  }
+
+  /** 画质档位值 → 展示文案：命中兜底表用中文，否则原样回显（自定义值也要看得见）。 */
+  private qualityLabelOf(v: string): string {
+    if (v.length === 0) {
+      return '未设置';
+    }
+    for (let i = 0; i < QUALITY_VALUES.length; i++) {
+      if (QUALITY_VALUES[i] === v) {
+        return QUALITY_LABELS[i];
+      }
+    }
+    return '自定义：' + v;
+  }
+
+  /**
+   * 画质这一项的 SettingField（宿主合成，不在 bundle.sections 里）。
+   * fnPath 留空 = 让 commitField 走「无自带 setter」那条 ⇒ 落桶 + 补发 onSettingChanged；
+   * persist 必须 true（默认值），false 就不落桶、插件下次读不到。
+   */
+  private qualityField(): SettingField {
+    const f = new SettingField();
+    f.key = IMAGE_QUALITY_KEY;
+    f.kind = 'text';
+    f.label = IMAGE_QUALITY_LABEL;
+    return f;
+  }
+
+  /** 当前画质值（清洗后；未设置 = 空串）。 */
+  private qualityValue(): string {
+    const v: string | undefined = this.bundle.values.get(IMAGE_QUALITY_KEY);
+    return v === undefined ? '' : cleanDisplayValue(v);
+  }
+
+  /**
+   * s33 需求 4：选画质档。形态照 pickJmMode（同一套 showActionMenu + catch 取消）。
+   * 最后一项是「自己填」—— 因为**除 original 外没有任何权威档位表**（依据见 IMAGE_QUALITY_KEY
+   * 与 QUALITY_VALUES 的注释），插件真有别的档位名时用户至少能直接写进去，不必等我们改代码。
+   * 写入走 commit() ⇒ PluginSettings.commitField 三步：先试插件 setter（本键无 fnPath ⇒ 跳过）、
+   * 再落宿主桶（与插件自己 save_plugin_config 同一个 uuid 桶，s19 起两侧对齐）、
+   * 最后补一次通用 onSettingChanged（插件多半没导出，内部忽略）。
+   * ★ 生效时机说明写在这里免得后来人误判：哔咔是**每次拼图片地址时现读**这个键
+   *   （bundle 偏移 1502 的 await y("image.quality","original") 在 w() 函数体内），
+   *   所以改完下一张图就换图床，不需要重启；不像某些插件那样只在 init 读一次。
+   */
+  private pickQuality(): void {
+    const cur: string = this.qualityValue();
+    const labels: string[] = [];
+    for (let i = 0; i < QUALITY_LABELS.length; i++) {
+      labels.push(QUALITY_LABELS[i]);
+    }
+    labels.push('自己填一个值');
+    promptAction.showActionMenu({
+      title: IMAGE_QUALITY_LABEL,
+      buttons: [
+        { text: labels[0], color: Theme.brand },
+        { text: labels[1], color: Theme.brand },
+        { text: labels[2], color: Theme.brand },
+        { text: labels[3], color: Theme.brand }
+      ]
+    }).then((res: promptAction.ActionMenuSuccessResponse): void => {
+      if (res.index === QUALITY_CUSTOM_INDEX) {
+        this.openQualityEditor();
+        return;
+      }
+      if (res.index < 0 || res.index >= QUALITY_VALUES.length) {
+        return;
+      }
+      const v: string = QUALITY_VALUES[res.index];
+      if (v === cur) {
+        this.toast('图片画质：' + this.qualityLabelOf(v) + '（没变）');
+        return;
+      }
+      this.commit(this.qualityField(), v);
+    }).catch((e: Error): void => {
+      Logger.i('画质选择取消：' + e.message);
+    });
+  }
+
+  /**
+   * 自定义画质值。**复用现有的 edit 浮层**（EditTarget.field 是普通 SettingField，
+   * 现造一枚 key/label 齐备的就够用）⇒ 不再新开一层浮层：本页遮罩必须做兄弟层那条约束
+   * （EditOverlay 注释里的 stopPropagation 实测）多一层就多一处坑，且这层的输入/确定/取消
+   * 三条行为与这里要的完全一致。
+   */
+  private openQualityEditor(): void {
+    const f = new SettingField();
+    f.key = IMAGE_QUALITY_KEY;
+    f.kind = 'text';
+    f.label = IMAGE_QUALITY_LABEL + '（插件自定义值）';
+    const t = new EditTarget();
+    t.field = f;
+    t.text = this.qualityValue();
+    t.password = false;
+    this.edit = t;
   }
 
   /** 更新：复用插件商店载荷的 installLatest（要求该行登记过 indexUuid，未登记直接说明）。 */
@@ -1829,7 +2046,16 @@ struct PluginSettingsPage {
               if (t.password && t.text.length === 0) {
                 return;
               }
-              this.commit(t.field, t.text);
+              // s33 需求 4：画质这键**不能留空**。留空不等于「恢复默认」——插件侧是
+              // await y("image.quality","original") 这种取法（偏移 1502），空串取到的是空串不是
+              // 缺省值，而它只做 值 !== "original" 的二选一 ⇒ 空串会被当成「走压缩图床」，
+              // 且空串过不了 hasQuality 的非空判据，这行会自己消失、用户再也改不回来。
+              if (t.field.key === IMAGE_QUALITY_KEY && t.text.trim().length === 0) {
+                this.toast('这里不能留空。想要原图请填 ' + IMAGE_QUALITY_DEFAULT);
+                return;
+              }
+              // 画质档顺手 trim：插件是字符串全等比较，多一个空格就落到压缩图床那侧。
+              this.commit(t.field, t.field.key === IMAGE_QUALITY_KEY ? t.text.trim() : t.text);
             })
         }
         .width('100%')
@@ -1988,6 +2214,16 @@ struct PluginSettingsPage {
                   false, (): void => {
                     this.pickJmMode();
                   })
+                // s33 需求 4：画质兜底行。只在「插件认这个键、但没在设置列表里自报这一项」时出现
+                // （判定与原因见 onBundleChanged 里 declared / hasQ 那段），所以不能无条件渲染。
+                if (this.hasQuality) {
+                  PluginQualityRow({
+                    subText: '当前：' + this.qualityLabel,
+                    onTap: (): void => {
+                      this.pickQuality();
+                    }
+                  })
+                }
                 this.ManageRow('更新', '从插件商店重新拉取最新版本并覆盖当前文件',
                   false, (): void => {
                     this.doUpdate();

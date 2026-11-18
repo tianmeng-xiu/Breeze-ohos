@@ -37,6 +37,7 @@ import { PluginDetail, ComicExtras, DetailStat } from '../data/source/PluginDeta
 import { MangaRepository } from '../data/db/MangaRepository';
 import { ImageCache } from '../data/image/ImageCache';
 import { MangaSummary, ChapterInfo, ReadProgress, SourceInfo } from '../data/model/Models';
+import { TextConvert } from '../util/TextConvert';
 
 /** 章节区一次显示多少条（其余靠「展开全部」）。 */
 const CHAPTER_PREVIEW: number = 20;
@@ -199,6 +200,23 @@ struct ActionBtn {
 @Component
 struct DetailPage {
   @StorageProp('isDark') isDark: boolean = false;
+  /**
+   * 简繁转换版本号（util/TextConvert.bumpRev 在词典就绪或切档后自增）：
+   * 本页 manga / chapters 是异步 load 的，词典到货那一刻它们没变、只有这个数变 ⇒
+   * 由本页观察它，build 重跑，下面各处 cvt(...) 才重新求值。
+   * ⚠ 转换只在显示层：searchBy 的入参、屏蔽词匹配一律用原文（口径见 util/TextConvert 头注释）。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /** 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。 */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      // 本进程还没就绪过词典也没切过档 = 首帧，原样给，连表都不查
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
 
   @State mangaId: string = '';
   @State sourceId: string = '';
@@ -742,7 +760,7 @@ struct DetailPage {
               .height(139)
 
               Column() {
-                Text(this.title)
+                Text(this.cvtShow(this.title))
                   .fontSize(18)
                   .fontWeight(FontWeight.Medium)
                   .fontColor(Theme.text1(this.isDark))
@@ -757,14 +775,15 @@ struct DetailPage {
                 if (this.authorName().length > 0) {
                   if (this.searchable(this.authorName())) {
                     this.SearchChip((): string => {
-                      return this.authorName();
+                      // 显示走转换，搜索入参仍是原文（转换不参与匹配，硬口径）
+                      return this.cvtShow(this.authorName());
                     }, true, 6, 0, (): void => {
                       this.searchBy(this.authorName());
                     })
                   } else {
                     // 点不动就绝不长得像能点（第 3 条硬要求）：本源 id 缺失时退回纯文本档 ——
                     // 与 chip 只差底色、圆角与点击，字号和单行省略保持一致，不留死指示。
-                    Text(this.authorName())
+                    Text(this.cvtShow(this.authorName()))
                       .fontSize(11)
                       .fontColor(Theme.text2(this.isDark))
                       .maxLines(1)
@@ -795,12 +814,13 @@ struct DetailPage {
                       // 空 chip ⇒ 同一条「看着能点、点了没反应」；现在这种项退回纯文本、不给底色。
                       if (this.searchable(t)) {
                         this.SearchChip((): string => {
-                          return t;
+                          // 同上：只有显示文案转换，searchBy 传原文 t
+                          return this.cvtShow(t);
                         }, false, 0, 4, (): void => {
                           this.searchBy(t);
                         })
                       } else {
-                        Text(t)
+                        Text(this.cvtShow(t))
                           .fontSize(11)
                           .fontColor(Theme.text2(this.isDark))
                           .maxLines(99)
@@ -879,7 +899,7 @@ struct DetailPage {
             if (this.manga !== null && this.manga.description.length > 0) {
               this.SectionCard('简介')
               Column() {
-                Text(this.manga.description)
+                Text(this.cvtShow(this.manga.description))
                   .fontSize(14)
                   .fontColor(Theme.text2(this.isDark))
                   .lineHeight(22)
@@ -932,7 +952,7 @@ struct DetailPage {
                 ForEach(this.chapterView, (c: ChapterInfo) => {
                   Column() {
                     Row() {
-                      Text(c.title)
+                      Text(this.cvtShow(c.title))
                         .fontSize(14)
                         .fontColor(Theme.text1(this.isDark))
                         .maxLines(1)
@@ -991,7 +1011,7 @@ struct DetailPage {
                       .width(96)
                       .height(128)
 
-                      Text(r.title)
+                      Text(this.cvtShow(r.title))
                         .fontSize(12)
                         .fontColor(Theme.text1(this.isDark))
                         .maxLines(2)

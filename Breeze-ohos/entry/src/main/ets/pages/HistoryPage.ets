@@ -16,6 +16,7 @@ import { LoadingView, EmptyView, ErrorView } from '../view/common/StateViews';
 import { MangaRepository } from '../data/db/MangaRepository';
 import { MangaSummary, ReadProgress } from '../data/model/Models';
 import { DetailParams } from '../view/detail/DetailParams';
+import { TextConvert } from '../util/TextConvert';
 
 @Component
 struct HistoryRowItem {
@@ -29,6 +30,22 @@ struct HistoryRowItem {
    * 'isDark' cannot be assigned to the 'regular' property 'isDark'，s5h 首编实测）。
    */
   @Prop isDark: boolean = false;
+  /**
+   * 简繁转换版本号：放在**本组件**（渲染标题的这一层）而不是页面层 ——
+   * ForEach 的键不随档位变，父层重跑 build 也不会重建这些行；
+   * 只有本组件自己观察版本号，词典就绪/切档后这一行 Text 才会重算。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /** 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。 */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      // 本进程还没就绪过词典也没切过档 = 首帧，原样给，连表都不查
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
   onTap: () => void = () => {};
 
   build() {
@@ -43,7 +60,7 @@ struct HistoryRowItem {
         .margin({ right: 12 })
 
       Column() {
-        Text(this.title)
+        Text(this.cvtShow(this.title))
           .fontSize(14)
           .fontColor(Theme.text1(this.isDark))
           .maxLines(1)

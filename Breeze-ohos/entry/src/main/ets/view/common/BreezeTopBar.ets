@@ -23,6 +23,7 @@ import { common } from '@kit.AbilityKit';
 import { Theme, Dim } from './Theme';
 import { SafeAreaUtil } from './SafeArea';
 import { SurfaceMaterial } from './Material';
+import { TextConvert } from '../../util/TextConvert';
 
 @Component
 export struct BreezeTopBar {
@@ -59,6 +60,24 @@ export struct BreezeTopBar {
   /** 状态栏避让高度（vp），由 EntryAbility / SafeAreaUtil 写入 */
   @StorageProp('topSafeHeight') topSafe: number = 0;
   @StorageProp('isDark') isDark: boolean = false;
+  /**
+   * 简繁转换版本号：util/TextConvert 在词典就绪或切档后 bumpRev 自增它。
+   * 词典是异步读入的，就绪那一刻 title 这个 @Prop 没变、只有这个数变了 ⇒
+   * 本组件必须观察它（V1 的刷新粒度是组件：观察的状态变量一变，build 整段重跑，
+   * 标题这行才会重新求值）。声明了不用即可生效，与 DetailPage 里
+   * @StorageProp('shelfRevision') 驱动 TabContent 重读是同一套路。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
+
+  /** 显示文案过一遍简繁转换（只改显示，不参与搜索匹配与屏蔽词匹配）。 */
+  private cvtShow(raw: string): string {
+    const rev: number = this.cvtRev;
+    if (rev <= 0) {
+      // 本进程还没就绪过词典也没切过档 = 首帧，原样给，连表都不查
+      return raw;
+    }
+    return TextConvert.getInstance().cvt(raw);
+  }
 
   aboutToAppear(): void {
     // 兜底：若 EntryAbility 还没写入，这里补测一次（幂等，不会覆盖已有正确值）
@@ -116,7 +135,7 @@ export struct BreezeTopBar {
           })
         }
 
-        Text(this.title)
+        Text(this.cvtShow(this.title))
           .fontSize(Dim.topBarTitle)
           .fontWeight(FontWeight.Medium)
           .fontColor(Theme.text1(this.isDark))

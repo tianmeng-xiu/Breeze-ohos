@@ -25,11 +25,12 @@ import { promptAction, router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { BreezeTopBar } from '../view/common/BreezeTopBar';
 import { Theme, Dim } from '../view/common/Theme';
-import { UserSettings, ReadDirection, SettingLabels } from '../util/UserSettings';
+import { UserSettings, ReadDirection, SettingLabels, ChineseConvertMode } from '../util/UserSettings';
 import { CookieJar } from '../data/net/CookieJar';
 import { ImageCache, DiskUsage, CacheUsageText } from '../data/image/ImageCache';
 import { Logger } from '../util/Logger';
 import { ThemeStore, ThemeMode, ThemeModeLabels } from '../util/ThemeStore';
+import { TextConvert } from '../util/TextConvert';
 
 /** UA 输入浮层状态（null = 未打开）。 */
 class UaEditor {
@@ -48,6 +49,13 @@ struct SettingPage {
   /** 当前实际生效的 UA（摘要行展示） */
   @State uaEffective: string = '';
   @State directionLabel: string = SettingLabels.READ_DIRECTION[0];
+  /** 简繁转换档的可读标签（行内摘要用） */
+  @State convertLabel: string = SettingLabels.CHINESE_CONVERT[0];
+  /**
+   * 词典就绪标记（摘要行的第二句用）：切档是异步读词典的，
+   * 读失败或还在途时行内说清楚「词典未就绪」，别让行看起来已经生效。
+   */
+  @StorageProp('textConvertRev') cvtRev: number = 0;
   @State tapToScroll: boolean = false;
   /** Cookie 站点名单（浮层列表的数据源） */
   @State hosts: string[] = [];
@@ -81,7 +89,31 @@ struct SettingPage {
     this.directionLabel = snap.readDirection === ReadDirection.RTL
       ? SettingLabels.READ_DIRECTION[1] : SettingLabels.READ_DIRECTION[0];
     this.tapToScroll = snap.tapToScroll;
+    this.convertLabel = SettingLabels.CHINESE_CONVERT[this.indexOfConvert(snap.chineseConvert)];
     this.hosts = CookieJar.getInstance().knownHosts();
+  }
+
+  /** 档位 → 标签下标（与 SettingLabels.CHINESE_CONVERT 顺序一一对应，非法值落 0 = 关闭） */
+  private indexOfConvert(mode: string): number {
+    if (mode === ChineseConvertMode.SIMPLIFIED) {
+      return 1;
+    }
+    if (mode === ChineseConvertMode.TRADITIONAL) {
+      return 2;
+    }
+    return 0;
+  }
+
+  /** 简繁转换行的摘要：当前档 + 一句口径说明（说明固定，不随档位变）。 */
+  private convertSub(): string {
+    // 必须读一次 cvtRev 登记节点依赖：词典异步就绪时引擎只 bumpRev，isReady() 与 convertLabel
+    // 自己不会触发重绘 —— 不读这行，「词典未就绪」后缀会一直挂着（与各显示处 cvtShow 首行读 rev 同一形态）。
+    const rev: number = this.cvtRev;
+    const ready: boolean = TextConvert.getInstance().isReady() && rev >= 0;
+    if (this.convertLabel !== SettingLabels.CHINESE_CONVERT[0] && !ready) {
+      return this.convertLabel + ' · 词典未就绪';
+    }
+    return this.convertLabel + ' · 仅作用于界面显示，不参与搜索匹配';
   }
 
   /**
@@ -184,6 +216,33 @@ struct SettingPage {
       this.toast(v === ReadDirection.RTL ? '已改为从右到左' : '已改为从左到右');
     }).catch((e: Error): void => {
       Logger.i('阅读方向选择取消：' + e.message);
+    });
+  }
+
+  /**
+   * 简繁转换选择器（三档，文案照抄上游 zh_CN.i18n.json）。
+   * 顺序 = 先落库推副本（UserSettings），再让引擎切档读词典（TextConvert），最后 toast：
+   * 引擎切档是异步的（STPhrases 819 KB），它读完自己 bumpRev，各显示处才重绘成新档。
+   * 取消会 reject，必须 catch（与 pickDirection 同口径）。
+   */
+  private pickConvert(): void {
+    promptAction.showActionMenu({
+      title: '简繁转换',
+      buttons: [
+        { text: '关闭', color: Theme.brand },
+        { text: '简体中文', color: Theme.brand },
+        { text: '繁体中文', color: Theme.brand }
+      ]
+    }).then(async (res: promptAction.ActionMenuSuccessResponse): Promise<void> => {
+      const v: string = res.index === 1 ? ChineseConvertMode.SIMPLIFIED
+        : (res.index === 2 ? ChineseConvertMode.TRADITIONAL : ChineseConvertMode.OFF);
+      await UserSettings.setChineseConvert(v);
+      this.convertLabel = SettingLabels.CHINESE_CONVERT[this.indexOfConvert(v)];
+      const rm = getContext(this).resourceManager;
+      await TextConvert.getInstance().setMode(v, rm);
+      this.toast(v === ChineseConvertMode.OFF ? '已关闭简繁转换' : ('已改为' + this.convertLabel + '显示'));
+    }).catch((e: Error): void => {
+      Logger.i('简繁转换选择取消：' + e.message);
     });
   }
 
@@ -606,6 +665,23 @@ struct SettingPage {
             .backgroundColor(Theme.cardColor(this.isDark))
             .borderRadius(Dim.radius)
             .margin({ left: Dim.pagePadding, right: Dim.pagePadding })
+
+            // 简繁转换（外观组第二张卡）：副标题第二句是固定口径说明，
+            // 摘要走 convertSub() —— 用 getter 传进 ManageRow，别传字符串快照
+            // （@Builder 形参是按值快照，词典异步读完后行内不会自己刷新）。
+            Column() {
+              this.ManageRow('简繁转换',
+                (): string => {
+                  return this.convertSub();
+                },
+                false, (): void => {
+                  this.pickConvert();
+                })
+            }
+            .padding({ left: Dim.pagePadding, right: Dim.pagePadding })
+            .backgroundColor(Theme.cardColor(this.isDark))
+            .borderRadius(Dim.radius)
+            .margin({ left: Dim.pagePadding, right: Dim.pagePadding, top: 10 })
 
             // ---- 阅读 ----
             this.SectionCard('阅读')

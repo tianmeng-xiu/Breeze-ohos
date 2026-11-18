@@ -12,7 +12,7 @@
  * 注意：URL 里的 [ ] 必须写成 %5B%5D，否则部分 CDN/网关会 400。
  */
 import { MangaSummary, ChapterInfo, PageImage, SourceInfo } from '../model/Models';
-import { MangaSource, SourceIds } from './Source';
+import { MangaSource, SearchPageResult, SourceIds } from './Source';
 import { HttpClient } from '../net/HttpClient';
 import { jarr, jbool, jhas, jisEmpty, jobj, jstr, jstrArr, jnum, jparse } from '../../util/JsonUtil';
 import { Logger } from '../../util/Logger';
@@ -98,12 +98,28 @@ export class MangadexSource implements MangaSource {
     }
   }
 
+  /** 旧接口（裸数组）：转调 searchPage。 */
   async search(keyword: string, page: number): Promise<MangaSummary[]> {
+    const r: SearchPageResult = await this.searchPage(keyword, page, '');
+    return r.items;
+  }
+
+  /**
+   * 搜索（带翻页）。MangaDex 的 /manga 列表回包顶层带 `limit` / `offset` / `total`
+   * （实测文档口径 = 与热门同一个结构，本文件 fetchChapters 也读 total:169），
+   * 所以「还有没有下一页」这里能算出**确定答案**，不靠「返回空数组」猜。
+   * externJson 对本源无意义（REST 无游标），收下忽略。
+   */
+  async searchPage(keyword: string, page: number, externJson: string): Promise<SearchPageResult> {
     const kw: string = keyword ? keyword.trim() : '';
+    const p1: number = Math.max(1, Math.floor(page) || 1);
+    const res: SearchPageResult = new SearchPageResult();
+    res.page = p1;
     if (kw.length === 0) {
-      return [];
+      res.hasReachedMax = true;
+      return res;
     }
-    const offset: number = this.offsetOf(page);
+    const offset: number = (p1 - 1) * PAGE_SIZE;
     const url: string = API_BASE + '/manga?limit=' + PAGE_SIZE + '&offset=' + offset +
       '&title=' + encodeURIComponent(kw) +
       '&includes%5B%5D=cover_art&includes%5B%5D=author&includes%5B%5D=artist' +
@@ -114,7 +130,16 @@ export class MangadexSource implements MangaSource {
       if (jisEmpty(root)) {
         throw new Error('返回内容不是合法 JSON');
       }
-      return this.parseList(root);
+      res.items = this.parseList(root);
+      const total: number = jnum(root, 'total', -1);
+      if (total >= 0) {
+        res.pages = Math.ceil(total / PAGE_SIZE);
+        res.hasReachedMax = offset + PAGE_SIZE >= total || res.pages <= p1;
+      } else {
+        // 读不到 total（异常回包）⇒ 退回最弱信号：本页空 = 到底。
+        res.hasReachedMax = res.items.length === 0;
+      }
+      return res;
     } catch (err) {
       throw this.wrap(err, '搜索失败');
     }
@@ -364,9 +389,15 @@ export class MangadexSource implements MangaSource {
     return s.length > 500 ? s.substring(0, 500) + '…' : s;
   }
 
+  /**
+   * ★ s33 就地更正：这里是 **1 基**（第 1 页 = offset 0）。旧写法 `page * PAGE_SIZE` 让
+   * 发现页的 fetchPopular(1) 直接落在 offset=20 ⇒ 内置源的首页一直在跳过前 20 条
+   * （搜索旧路径同缺陷，本轮 searchPage 重写后已正确）。改成与 Source.ets 头注释
+   * 「宿主 1 基」一致的算法，两个方法共用同一口径。
+   */
   private offsetOf(page: number): number {
-    const p: number = page > 0 ? page : 0;
-    return p * PAGE_SIZE;
+    const p: number = page > 1 ? Math.floor(page) : 1;
+    return (p - 1) * PAGE_SIZE;
   }
 
   private wrap(err: Object, prefix: string): Error {

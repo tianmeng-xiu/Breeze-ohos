@@ -59,6 +59,34 @@ ArkTS 侧依赖仅为 OpenHarmony / HarmonyOS SDK 自带的 kit 与 `@ohos/*` �
 不随源码分发。
 
 
+## 2c. 随源码分发的简繁转换词典数据（OpenCC）
+
+设置项「简繁转换」（仅界面显示层）使用 [OpenCC](https://github.com/BYVoid/OpenCC) 的**词库文本**，
+以 TSV 形式放在 `Breeze-ohos/entry/src/main/resources/rawfile/convert/`，由应用运行时读取：
+
+| 文件 | 字节 | 条目 | 许可 |
+| --- | --- | --- | --- |
+| `TSPhrases.tsv` | 8,571 | 468 | **Apache-2.0**（OpenCC） |
+| `TSCharacters.tsv` | 26,233 | 3,221 | **Apache-2.0**（OpenCC） |
+| `STPhrases.tsv` | 839,167 | 40,158 | **Apache-2.0**（OpenCC） |
+| `STCharacters.tsv` | 32,715 | 3,881 | **Apache-2.0**（OpenCC） |
+
+- **来源与许可**：四份文本均取自 OpenCC 仓库 `config/` 下的同名词库（<https://github.com/BYVoid/OpenCC>，
+  **Apache-2.0**）。本项目不改动词库内容语义，只做**为适配转换算法而做的行级裁剪**（见下条），
+  每份文件头两行注释保留了来源名与上游地址。Apache-2.0 与 GPL-3 兼容。
+- **由原词库到这四份 TSV 的转换过程**：转换脚本与全部取证都在开发过程中的临时目录里
+  （不入库，因而不是可复现构建的一部分），做三件事：① 把「一词多译」的行裁成首见译法，
+  使产物成为**一列对一列**的确定映射；② **保留**词组表里那些**能拦住字表误替换**的恒等行
+  （`TSPhrases.tsv` 中 111 条、`STPhrases.tsv` 中 1,579 条，例如「乾隆 → 乾隆」），
+  丢掉那些字表本就不碰的恒等行以省体积；③ 逐行输出 `key<TAB>value`，UTF-8、首行为来源注释。
+- **有意不采用的部分**：OpenCC 的 `TWPhrases`、`TWVariants`、`TWVariantsPhrases` 三张表**未随包分发**。
+  前者是台式用语语义替换表（`U盤 → 隨身碟` 一类），对漫画标题与章节名属于过度本地化；
+  后两枚是字形异体变体转换，随包体积翻倍而收益极小。理由同时写在
+  `Breeze-ohos/entry/src/main/ets/util/TextConvert.ets` 的文件头注释里。
+- **用途边界**：这套词典只在 ArkTS 侧做**显示层**转换，不参与搜索词规范化与屏蔽词匹配；
+  Rust 引擎侧的 `opencc.convert` 路由仍是**有意 passthrough**（原样返回文本），二者互不依赖。
+
+
 ## 3. 随源码分发的第三方插件夹具
 
 `Breeze-ohos/entry/src/main/resources/rawfile/plugins/real.bundle.cjs`（23,496 B）是第三方插件

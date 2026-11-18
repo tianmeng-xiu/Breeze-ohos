@@ -30,6 +30,10 @@ import { SearchEntryParams } from '../view/search/SearchEntryParams';
 import { ImageCache } from '../data/image/ImageCache';
 import { ReaderDiag } from '../view/reader/ReaderView';
 import { PluginIconDiag } from '../view/plugins/PluginManagerView';
+import { TextConvert } from '../util/TextConvert';
+import { FeatureDiag } from '../util/FeatureDiag';
+import { UpdateChecker } from '../util/UpdateChecker';
+import { UserSettings } from '../util/UserSettings';
 
 /** rawfile 路径（不带 rawfile/ 前缀）。real.bundle.cjs 可选：缺则面板第 7 项 SKIP。 */
 const RAW_SELFTEST: string = 'plugins/selftest.bundle.cjs';
@@ -82,6 +86,7 @@ class DiagReport {
   pluginIcons: string = '';
   /** 19 pluginConfig（s16 第 4 条取证：持久化桶名集合，跨插件账号互串判据）。 */
   pluginConfig: string = '';
+  featChain: string = '';
   storageRoot: string = '';
   verdict: string = '';
   items: DiagItem[] = [];
@@ -142,6 +147,8 @@ struct Index {
   private diagIcons: string = '';
   /** 19 pluginConfig 行原文（同上，现算不落盘）。 */
   private diagCfg: string = '';
+  /** 20 featChain 行原文（同上，现算不落盘）：本轮四项新功能的读数口。 */
+  private diagFeat: string = '';
 
   /** 诊断面板显隐（用户 m02396 硬约束：不许压屏幕顶部 ⇒ 改底部弹层 + 可收起）。 */
   @State diagOpen: boolean = true;
@@ -220,6 +227,12 @@ struct Index {
   aboutToAppear(): void {
     // 宿主路由需要 context（preferences/bundleManager）；面板全部异步逻辑由 runDiag 驱动。
     BreezeHost.init(getContext(this) as common.UIAbilityContext);
+    // 简繁转换冷启动预热：读档（off 时不读词典，直接返回）+ 就绪后 bumpRev 让各显示处重绘。
+    // 刻意不 await：首帧不等 IO；catch 只打日志（引擎内部已吞错并留未就绪态）。
+    TextConvert.getInstance().setMode(UserSettings.readChineseConvert(), getContext(this).resourceManager)
+      .catch((e: Object): void => {
+        Logger.ex('简繁转换预热失败', e);
+      });
     try {
       const d: display.Display = display.getDefaultDisplaySync();
       this.winW = px2vp(d.width);
@@ -972,6 +985,31 @@ struct Index {
       this.diagCfg = 'throw: ' + em(e as Object);
       pushFixed(19, 'pluginConfig', 'INFO', 'unavailable: ' + em(e as Object), 200);
     }
+    // ---- 20. featChain（INFO，不计入 verdict）：本轮四项新功能（搜索触底翻页 / 发评论 / 图片画质 / 检查更新）
+    //      的读数口。s32 那轮「竖向到底不切章」全靠手感判，最后才发现是保底接手 ⇒ 这次每项留读数。
+    //      判读法：
+    //        sp=a/b/c/d/e/f = 触底请求/成功追加/某源失败/判定到底/换代丢弃/被闸门挡下（s34 起第六档）。
+    //          翻到底应看到 a>0 且 d>0；**a=0 而 f>0 = 触底事件有进来、但那一刻 moreState 已经不是 more**
+    //          （到底判定或首屏状态把它闸住了 —— s33 那轮 jm 就是这个形态，当时 f 还没有、读不出来）；
+    //          a=0 且 f=0 才是「onReachEnd 压根没触发」；a>0 而 b=0 且 c>0 = 下一页请求全失败；
+    //          e 涨 = 用户在翻页途中改了词（正常，属丢弃不是故障）。
+    //        cm=a/b/c/d/e = 提交/成功/失败/其中「插件未实现」/其中整页重拉。真机 most 图源预期是 c==d>0
+    //          （图源没这功能，属正常）；b>0 且 e=0 = 本地落位成功；b>0 且 e>0 = 插件没回 created 走了重拉（也正常，代价是丢滚动位置）。
+    //        iq=写次数/最近值 = 插件设置页「图片画质」写入。写完后翻下一页看 16 号行的图床域名有没有换。
+    //        tc= 简繁引擎状态（mode/ready/loadMs/rev/cache/四表条数）：rev=0 = 从未就绪也从没切档 ⇒ 各处显示原样，
+    //          切了档却 rev 不涨 = bumpRev 没跑（显示不会变）；loadMs 就是切繁体的那一下卡多久（>300 就该考虑异步分片）；
+    //          转简档下 stP/stC 应为 0（另一档已释放），两边都非 0 = releaseUnused 没生效。
+    //        up= 最近一次检查更新（via/latest/self/log/asset）：没点过 = none。
+    try {
+      const fhint: string = FeatureDiag.hint() + ' | tc=' + TextConvert.getInstance().stats()
+        + ' | up=' + UpdateChecker.lastHintOf();
+      this.diagFeat = fhint;
+      pushFixed(20, 'featChain', 'INFO', fhint, 720);
+    } catch (e) {
+      this.diagFeat = 'throw: ' + em(e as Object);
+      pushFixed(20, 'featChain', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
     // ---- 总判定 + 可复制 JSON。S4 起前缀 S4（判定 12 项：S2 七项 + net + download + unload +
     //      fileChain + jailEscape；pluginIndex/selftest/exports 为 INFO 不计入），如需回退字样可改。
     const verdict: string = fails === 0
@@ -999,6 +1037,7 @@ struct Index {
     report.readerChain = this.diagReader;
     report.pluginIcons = this.diagIcons;
     report.pluginConfig = this.diagCfg;
+    report.featChain = this.diagFeat;
     report.storageRoot = this.diagStorageRoot;
     report.verdict = verdict;
     report.items = items;

@@ -13,7 +13,8 @@
  *       getCommentFeed{comicId,page} ⇒ data.{topItems,items,replyMode,canComment.{comic,reply},
  *                                          paging.hasReachedMax}
  *       loadCommentReplies{comicId,commentId,page} ⇒ data.{items,paging.hasReachedMax}
- *       postComment / postCommentReply（我方 v1 只做「读 + 展示」，发评入口按 canComment 置灰）
+ *       postComment / postCommentReply（本文件末尾两条通道；入参与回包口径逐字抄上游
+ *       comments_cubit.dart:111/119/184/208，见那两个 static 的注释）
  *   - 条目形状：Breeze/lib/page/comments/model/comment_item.dart:41
  *       id / author.{name,avatar.{url,path}} / content / createdAt(字符串) / replyCount / replies[]
  *   - 点赞/收藏 fnPath：collect_comic.dart:399/442/477/947/960/982
@@ -81,6 +82,21 @@ class ToggleFavArg {
   extern: ESObject = JSON.parse('{}');
 }
 
+/** {comicId, content, extern}（上游 comments_cubit.dart:114 core={comicId,content}，extern 恒空对象） */
+class CommentPostArg {
+  comicId: string = '';
+  content: string = '';
+  extern: ESObject = JSON.parse('{}');
+}
+
+/** {comicId, commentId, content, extern}（上游 :122 core + :123 extern = **被回复那条自己的 extern**） */
+class CommentReplyPostArg {
+  comicId: string = '';
+  commentId: string = '';
+  content: string = '';
+  extern: ESObject = JSON.parse('{}');
+}
+
 /** 统计 + 可用性（全部来自插件详情返回体）。 */
 export class DetailStat {
   views: number = -1;
@@ -123,6 +139,30 @@ export class CommentFeed {
   /** 上游 data.replyMode（缺省 'lazy'）：'inline' = 回复已随主帖内联，不必再调 loadCommentReplies */
   replyMode: string = 'lazy';
   /** 非空 = 本次拉取失败/不支持，页面显示它 */
+  error: string = '';
+}
+
+/**
+ * 发评 / 发回复的返回（页面据此决定「本地插哪 / 要不要整页重拉 / 提示什么」）。
+ * ★ 为什么这里**破**「用 string[] 三元组」的旧约定（toggleLike / toggleFavourite 那种）：
+ *   本结果要带 ok + created(对象) + needsRefetch + strategy + targetCommentId + error 六样，
+ *   数组下标写到第六位既读不出含义又极易错位 ⇒ 宁可多声明一个类（字段全给缺省值，绝不 null）。
+ * 字段口径 = 上游 comments_cubit.dart:184-199 + :208-249（_submitCommentMutation /
+ *   _buildMutationAppliedState）与插件契约 CommentMutationContract
+ *   （Breeze/rust/rquickjs_playground/pnpm_demo/types/type.d.ts:216-234）。
+ */
+export class CommentPostResult {
+  /** 插件是否受理了这次提交（契约里的 data.ok；缺键按 false，宁可提示失败也不假装成功） */
+  ok: boolean = false;
+  /** true = 要求放弃本地插入、整页重拉（上游 data.insertHint.needsRefetch） */
+  needsRefetch: boolean = false;
+  /** '' | 'prependAfterTop' | 'prepend'（上游 insertHint.strategy，缺省按 ''走兜底前插） */
+  strategy: string = '';
+  /** 'prepend' 的目标评论 id（上游优先 hint.targetCommentId，回退 data.parentId） */
+  targetCommentId: string = '';
+  /** 插件回的新评论；null = 它没给 ⇒ 无法本地插入，只能重拉 */
+  created: CommentItem | null = null;
+  /** 非空 = 失败/不支持，页面直接显示它（已翻译成人话，不含堆栈） */
   error: string = '';
 }
 
@@ -264,6 +304,66 @@ function readBoolResult(raw: string, key: string, fallback: boolean): boolean {
     return jbool(v, key, fallback);
   }
   return fallback;
+}
+
+/**
+ * 把发评/发回复的**异常**翻成人话。
+ * ★ 未实现该 fnPath 的插件抛的是带 `route not found` 的原文（判定同
+ *   data/cloud/CloudFavoriteSync.ets:202 那条注释），直接甩给用户就是一串英文路由名
+ *   ⇒ 只认这一枚特征换成中文。**故意不放宽到裸 'not found'**：HTTP 404 之类的真故障
+ *   也会含那四个字，误判成「不支持」会把该报的错盖掉。
+ *   其余原样返回（callExt 已把它包成「发表评论失败（postComment）：<原错>」的可读形态，
+ *   不再截断，免得丢掉插件自己写的说明）。
+ */
+function postErrorText(msg: string, what: string): string {
+  if (msg.indexOf('route not found') >= 0) {
+    return '这个图源不支持' + what + '（插件未实现该功能）';
+  }
+  return msg;
+}
+
+/**
+ * 解析发评/发回复回包的 data 段（只吃 data，envelope 由调用方剥）。
+ * 逐字对齐 CommentMutationContract（type.d.ts:216-234）：
+ *   data.{ok, mode, parentId?, created, insertHint.{needsRefetch, strategy?, targetCommentId?}}
+ * 与上游读取顺序一致（comments_cubit.dart:185 先读 needsRefetch，:209 再读 created）。
+ * 插件缺字段一律兜底：created 缺失/形状不对 ⇒ null（页面据此走整页重拉），绝不抛。
+ */
+function parseCommentMutation(data: ESObject): CommentPostResult {
+  const r: CommentPostResult = new CommentPostResult();
+  if (jisEmpty(data)) {
+    r.error = '插件返回为空';
+    return r;
+  }
+  r.ok = jbool(data, 'ok', false);
+  const hint0: ESObject = jobj(data, 'insertHint');
+  const createdRaw0: ESObject = jobj(data, 'created');
+  // ★ 三种口径都要吃（这里比上游**谨慎**、比契约**宽松**，理由写在这）：
+  //   · 上游 _submitCommentMutation **完全不读 data.ok**（comments_cubit.dart:175-199）：
+  //     没抛异常就当成功、直接发「发布成功」提示；
+  //   · 契约 CommentMutationContract 把 ok 列为**必填** ⇒ 显式给了 false 就是真失败；
+  //   · 现实里各家桩实现经常省掉 ok，只给 created / insertHint。若照契约硬判 false，
+  //     就会在插件**已经发成功**的情况下弹「发布失败」——那是最糟的假失败。
+  //   ⇒ 折中：显式 false 才算失败；ok 缺键时改用「有没有成功证据」（回了 created 或回了
+  //     insertHint）来判受理，两者都没有才算失败。
+  if (!jhas(data, 'ok')) {
+    r.ok = !jisEmpty(createdRaw0) || !jisEmpty(hint0) || jstr(data, 'mode', '').length > 0;
+  }
+  if (!jisEmpty(hint0)) {
+    r.needsRefetch = jbool(hint0, 'needsRefetch', false);
+    r.strategy = jstr(hint0, 'strategy', '');
+    r.targetCommentId = jstr(hint0, 'targetCommentId', '');
+  }
+  // 上游 :212 的 parentId 回退口（回复场景里有的插件只在 data 顶层给父 id）
+  if (r.targetCommentId.length === 0) {
+    r.targetCommentId = jstr(data, 'parentId', '');
+  }
+  const createdRaw: ESObject = createdRaw0;
+  if (!jisEmpty(createdRaw)) {
+    // depth 传 0：created 就是刚发的那一条，插件不会带回复，省掉一次无谓递归
+    r.created = parseComment(createdRaw, 0);
+  }
+  return r;
 }
 
 export class PluginDetail {
@@ -472,6 +572,69 @@ export class PluginDetail {
       return ['true', fav ? 'true' : 'false', note];
     } catch (e) {
       return ['false', current ? 'true' : 'false', (e as Error).message];
+    }
+  }
+
+  /**
+   * 发一条整页级评论（需求 3）。入参逐字对齐上游 comments_cubit.dart:111-117：
+   *   fnPath 'postComment'，core {comicId, content}，extern **恒空对象**（整页评论没有上下文要带）。
+   * ★ 与读侧不同，这里**不能**静默兜成空值就完事：提交是有副作用的动作，用户必须知道成没成，
+   *   所以失败一律把原因写进 CommentPostResult.error 交回页面弹提示。
+   * ★ 未实现 postComment 的插件（普查里只有 man-hua-gui 这个 demo 桩实现了它）走
+   *   postErrorText 换成人话，不是 bug 路径。
+   */
+  static async postComment(sourceId: string, comicId: string, content: string): Promise<CommentPostResult> {
+    const r: CommentPostResult = new CommentPostResult();
+    const ad: PluginSourceAdapter | null = PluginDetail.adapterFor(sourceId);
+    if (ad === null) {
+      r.error = '该图源不支持发评论';
+      return r;
+    }
+    const a: CommentPostArg = new CommentPostArg();
+    a.comicId = comicId;
+    a.content = content;
+    try {
+      const o: ESObject = await ad.callExt('发表评论失败', 'postComment', a);
+      const parsed: CommentPostResult = parseCommentMutation(jobj(o, 'data'));
+      return parsed;
+    } catch (e) {
+      r.error = postErrorText((e as Error).message, '发评论');
+      return r;
+    }
+  }
+
+  /**
+   * 回复某条评论（需求 3）。入参逐字对齐上游 comments_cubit.dart:119-125：
+   *   fnPath 'postCommentReply'，core {comicId, commentId: item.id, content}，
+   *   extern = **这条被回复的评论自己的 extern**（上游 :123 原样回传；JM 系拿它当风控上下文，
+   *   少带它轻则插件报错、重则发错楼层）⇒ 所以签名收整条 CommentItem 而不是 id，
+   *   与 replies() 同一个理由（见上面的注释）。
+   * id 为空的条目（插件漏 id）没法回：直接给提示，不打插件。
+   */
+  static async postCommentReply(sourceId: string, comicId: string, item: CommentItem,
+    content: string): Promise<CommentPostResult> {
+    const r: CommentPostResult = new CommentPostResult();
+    if (item.id.length === 0) {
+      r.error = '这条评论缺少标识，无法回复';
+      return r;
+    }
+    const ad: PluginSourceAdapter | null = PluginDetail.adapterFor(sourceId);
+    if (ad === null) {
+      r.error = '该图源不支持回复评论';
+      return r;
+    }
+    const a: CommentReplyPostArg = new CommentReplyPostArg();
+    a.comicId = comicId;
+    a.commentId = item.id;
+    a.content = content;
+    a.extern = item.extern;
+    try {
+      const o: ESObject = await ad.callExt('回复评论失败', 'postCommentReply', a);
+      const parsed: CommentPostResult = parseCommentMutation(jobj(o, 'data'));
+      return parsed;
+    } catch (e) {
+      r.error = postErrorText((e as Error).message, '回复评论');
+      return r;
     }
   }
 

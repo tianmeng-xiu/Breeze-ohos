@@ -11,14 +11,20 @@
  *      取不到回落 FAILED_VERSION（读取中与读取失败两种占位分开），构建号取不到就不显示那一段。
  * 隐藏入口：C13 的「连点版本 5 次开开发者诊断」（AppStorage diagGate）随版本行一起搬到本页，
  *      顶部卡的版本行与「应用」分组的版本行都接它。
+ * 检查更新（s33 需求 5）：「应用」分组首行「检查更新」→ util/UpdateChecker（源 = 本仓库 Releases 的
+ *      latest，日志 = 正文「本次变化」小节）。无新版/失败都只 toast，有新版才开全屏弹层列日志。
+ *      ★ 判定基准是**发版号**（v1.x）不是 versionName（恒 3.0.37，镜像上游用）—— 所以行尾显示的是发版号，
+ *      与上方那行「版本 3.0.37（构建 …）」并列显示，两个号各说各的事，别改成同一个。
  * 仓库跳转：先 ctx.openLink（官方为打开链接准备的入口，@since 12），失败退隐式 Want（viewData +
  *      entity.system.browsable），两级都失败才 toast 并把地址念出来；全程写日志，不静默。
  */
 import { promptAction, router } from '@kit.ArkUI';
 import { bundleManager, common, Want } from '@kit.AbilityKit';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { BreezeTopBar } from '../view/common/BreezeTopBar';
 import { Theme, Dim } from '../view/common/Theme';
 import { Logger } from '../util/Logger';
+import { UpdateChecker, UpdateOutcome } from '../util/UpdateChecker';
 
 /** 仓库地址（与 README、NOTICE 头部一致；点击后用系统浏览器打开）。 */
 const REPO_URL: string = 'https://github.com/tianmeng-xiu/Breeze-ohos';
@@ -67,9 +73,108 @@ struct AboutPage {
   /** C13 隐藏入口：连点计数与时间戳（从「更多」页随版本行一起搬过来） */
   private verTaps: number = 0;
   private verLastTap: number = 0;
+  /** s33 需求 5：检查更新进行中（行内文案与按钮禁用共用） */
+  @State updChecking: boolean = false;
+  /** 更新结果弹层开关（bindContentCover 双绑，弹层内可直接置 false 关闭） */
+  @State updOpen: boolean = false;
+  /**
+   * 检查结果。★ 整体换引用（不逐字段改）：@State 只观察引用变化，
+   * 改 UpdateOutcome 内部字段不会触发弹层重渲染（本仓 @State 数组同理，见 SearchPage）。
+   */
+  @State updResult: UpdateOutcome = new UpdateOutcome();
+  /** 全屏弹层不继承安全区（s5e 真机踩过的坑）⇒ 标题自己让开状态栏 */
+  @StorageProp('topSafeHeight') topSafe: number = 0;
 
   aboutToAppear(): void {
     this.loadVersion();
+  }
+
+  /**
+   * s33 需求 5：检查更新。更新源 = 本仓库 Releases（取 latest），更新日志 = 该版正文的「本次变化」小节。
+   * 判定基准不是 versionName（那是镜像上游的编号、恒 3.0.37），而是发版号 —— 依据见
+   * util/UpdateChecker.ets 头部那段两套编号的说明。
+   */
+  private checkUpdate(): void {
+    if (this.updChecking) {
+      return;
+    }
+    this.updChecking = true;
+    UpdateChecker.check().then((r: UpdateOutcome): void => {
+      this.updChecking = false;
+      this.updResult = r;
+      if (r.error.length > 0) {
+        // 失败只用 toast 说清楚，不占一整屏（多半是没网或被限流）
+        this.toast('检查更新失败：' + r.error);
+        return;
+      }
+      if (r.upToDate) {
+        this.toast('已是最新版本 ' + r.latestTag);
+        return;
+      }
+      this.updOpen = true;
+    }).catch((e: Object): void => {
+      this.updChecking = false;
+      Logger.ex('检查更新异常', e);
+      this.toast('检查更新失败：' + ((e as Error).message ?? String(e)));
+    });
+  }
+
+  /** 更新弹层里的主按钮文案。 */
+  private updActionText(): string {
+    return this.updResult.hasUpdate ? ('去下载 ' + this.updResult.latestTag) : '打开发布页';
+  }
+
+  /** 发布时间 + 命中源（'2026-11-16 · api'），发布日取不到就只留源。 */
+  private updMetaLine(): string {
+    const parts: string[] = [];
+    if (this.updResult.publishedAt.length > 0) {
+      parts.push('发布于 ' + this.updResult.publishedAt);
+    }
+    if (this.updResult.assetSize > 0) {
+      parts.push('安装包 ' + Math.round(this.updResult.assetSize / 1024 / 1024) + ' MB');
+    }
+    parts.push('源 ' + this.updResult.via);
+    return parts.join(' · ');
+  }
+
+  /**
+   * 打开该版发布页。与 openRepo 同一套两级兜底（openLink → 隐式 Want），
+   * 但地址换成回包给的 html_url（拿不到退仓库 releases 列表页）。
+   */
+  private openRelease(): void {
+    const url: string = this.updResult.pageUrl.length > 0
+      ? this.updResult.pageUrl
+      : (REPO_URL + '/releases');
+    const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    ctx.openLink(url).catch((e1: Object): void => {
+      Logger.ex('openLink 打开发布页失败，回退隐式 Want', e1);
+      const want: Want = {
+        action: 'ohos.want.action.viewData',
+        entities: ['entity.system.browsable'],
+        uri: url
+      };
+      ctx.startAbility(want).catch((e2: Object): void => {
+        Logger.ex('隐式 Want 打开发布页也失败', e2);
+        this.toast('没找到可打开链接的浏览器，地址：' + url);
+      });
+    });
+  }
+
+  /** 把发布页地址复制进剪贴板（浏览器打不开时的退路；同 pages/Index.ets 导出诊断 JSON 的写法）。 */
+  private copyReleaseUrl(): void {
+    const url: string = this.updResult.pageUrl.length > 0 ? this.updResult.pageUrl : (REPO_URL + '/releases');
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, url);
+      pasteboard.getSystemPasteboard().setData(data).then((): void => {
+        this.toast('已复制发布页地址');
+      }).catch((e: Object): void => {
+        Logger.ex('剪贴板写入失败', e);
+        this.toast('复制失败，地址：' + url);
+      });
+    } catch (e) {
+      Logger.ex('剪贴板创建数据失败', e);
+      this.toast('复制失败，地址：' + url);
+    }
   }
 
   /** 版本号：DEFAULT flag 已带 versionName 与 versionCode，不必叠 appInfo。 */
@@ -247,6 +352,123 @@ struct AboutPage {
     .alignItems(HorizontalAlign.Start)
   }
 
+  /**
+   * 更新弹层（s33 需求 5）。全屏覆盖层：更新日志条数不定，AlertDialog 撑不住长内容。
+   * 形态参照 view/plugins/PluginManagerView.ets 的 shopSheet（同一个 bindContentCover 先例），
+   * 同样要自己让开状态栏。配色这里跟随页面主题（商店那层写死深色系是它自己的选择，不跟）。
+   */
+  @Builder
+  updSheet() {
+    Column() {
+      Column() {
+        Text('发现新版本')
+          .fontSize(13)
+          .fontColor(Theme.text3(this.isDark))
+        Row() {
+          Text(UpdateChecker.selfTag())
+            .fontSize(16)
+            .fontColor(Theme.text2(this.isDark))
+          Text('→')
+            .fontSize(15)
+            .fontColor(Theme.text3(this.isDark))
+            .margin({ left: 10, right: 10 })
+          Text(this.updResult.latestTag)
+            .fontSize(19)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Theme.brand)
+        }
+        .margin({ top: 6 })
+        .alignItems(VerticalAlign.Center)
+
+        Text(this.updMetaLine())
+          .fontSize(11)
+          .fontColor(Theme.text3(this.isDark))
+          .margin({ top: 6 })
+
+        // 更新日志：正文有「本次变化」小节时逐条列；没这段时是截取的前几行，标出来别装作是正式日志
+        Scroll() {
+          Column() {
+            if (this.updResult.changelog.length === 0) {
+              Text('这个版本没有写更新说明，请到发布页查看。')
+                .fontSize(13)
+                .fontColor(Theme.text3(this.isDark))
+                .width('100%')
+                .margin({ top: 10 })
+            } else {
+              if (!this.updResult.changelogExact) {
+                Text('（以下从发布说明正文截取）')
+                  .fontSize(11)
+                  .fontColor(Theme.warning)
+                  .width('100%')
+                  .margin({ top: 10 })
+              }
+              ForEach(this.updResult.changelog, (line: string, idx: number) => {
+                Row() {
+                  Text('·')
+                    .fontSize(13)
+                    .fontColor(Theme.brand)
+                    .margin({ right: 8 })
+                  Text(line)
+                    .fontSize(13)
+                    .fontColor(Theme.text1(this.isDark))
+                    .lineHeight(20)
+                    .layoutWeight(1)
+                }
+                .width('100%')
+                .alignItems(VerticalAlign.Top)
+                .margin({ top: idx === 0 ? 10 : 8 })
+              }, (line: string, idx: number) => idx + '_' + line.substring(0, 12))
+            }
+          }
+          .width('100%')
+        }
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+        .align(Alignment.Top)
+
+        Button(this.updActionText())
+          .fontSize(15)
+          .height(44)
+          .width('100%')
+          .backgroundColor(Theme.brand)
+          .margin({ top: 14 })
+          .onClick((): void => {
+            this.openRelease();
+          })
+        Row() {
+          Text('复制发布页地址')
+            .fontSize(13)
+            .fontColor(Theme.brand)
+            .clickEffect({ level: ClickEffectLevel.LIGHT })
+            .onClick((): void => {
+              this.copyReleaseUrl();
+            })
+          Blank()
+          Text('关闭')
+            .fontSize(13)
+            .fontColor(Theme.text2(this.isDark))
+            .clickEffect({ level: ClickEffectLevel.LIGHT })
+            .onClick((): void => {
+              this.updOpen = false;
+            })
+        }
+        .width('100%')
+        .margin({ top: 12, bottom: 6 })
+      }
+      .width('88%')
+      .constraintSize({ maxHeight: '72%' })
+      .padding({ left: 20, right: 20, top: 18, bottom: 14 })
+      .backgroundColor(Theme.cardColor(this.isDark))
+      .borderRadius(Dim.radius)
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: this.topSafe + 40 })
+    .justifyContent(FlexAlign.Start)
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor(Theme.scrim)
+  }
+
   build() {
     Column() {
       BreezeTopBar({
@@ -323,6 +545,13 @@ struct AboutPage {
           // ---- 应用：可点的行 ----
           this.SectionCard('应用')
           Column() {
+            // s33 需求 5：检查更新。行尾显示的是**发版号**（v 开头），不是上面那行 versionName ——
+            // 两个号的含义不同（versionName 镜像上游、发版号数本仓库第几次发版），这里并排显示最不容易混。
+            this.InfoRow('检查更新', (): string => {
+              return this.updChecking ? '检查中…' : ('当前 ' + UpdateChecker.selfTag());
+            }, true, (): void => {
+              this.checkUpdate();
+            })
             this.InfoRow('开源仓库', (): string => {
               return REPO_LABEL;
             }, true, (): void => {
@@ -433,5 +662,7 @@ struct AboutPage {
     .width('100%')
     .height('100%')
     .backgroundColor(Theme.background(this.isDark))
+    // s33 需求 5：更新弹层。$$ 双向绑定 = 弹层内的「关闭」能直接把状态写回来
+    .bindContentCover($$this.updOpen, this.updSheet(), ModalTransition.DEFAULT)
   }
 }
