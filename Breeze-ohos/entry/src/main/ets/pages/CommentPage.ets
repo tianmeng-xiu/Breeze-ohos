@@ -757,7 +757,13 @@ struct CommentPage {
           LoadingView({ text: '正在加载评论区…' })
             .layoutWeight(1)
         } else if (this.loadError.length > 0) {
-          ErrorView({ msg: this.loadError })
+          // s37：ErrorView 的 onRetry 默认空函数而「重试」按钮恒画 ⇒ 显式接到本页真实重载入口。
+          ErrorView({
+            msg: this.loadError,
+            onRetry: (): void => {
+              this.reload();
+            }
+          })
             .layoutWeight(1)
         } else if (this.top.length === 0 && this.items.length === 0) {
           Column() {

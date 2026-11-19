@@ -31,7 +31,7 @@ const API_LATEST_MIRROR: string = 'https://v4.gh-proxy.org/https://api.github.co
  * 改法：写成 tag 原文（带 v）。写错或忘改的后果 = 已装最新包的用户仍看到「发现新版本」，
  * 不会崩、不会误装，但会被当成 BUG 反馈 —— 所以它在发版清单里是一条硬步骤。
  */
-const SELF_TAG: string = 'v1.9.0';
+const SELF_TAG: string = 'v1.10.0';
 
 /** 一次检查的产出（所有字段都有默认值，失败路径只填 error）。 */
 export class UpdateOutcome {

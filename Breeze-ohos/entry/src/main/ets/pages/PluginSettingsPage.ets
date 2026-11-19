@@ -56,6 +56,12 @@ import { bundleCall, bundleUnload, pluginRemoveFile } from '../util/PluginRuntim
 import { jstr, jbool, jnum, jparse, jobj, jhas, jisEmpty, jstrArr } from '../util/JsonUtil';
 import { cleanDisplayValue, normalizeDisplayKey } from '../util/DisplayValue';
 import { Logger } from '../util/Logger';
+// s37 需求 2（用户 m00774）：本页原本是全仓**唯一**能把插件运行时的 `[stack-hook]` 原文
+// 整段铺满屏的路径（红队 verify_errtext 第 1 条必修）—— loadErr 由 data/source/PluginSettings.ets:333/:338
+// 直接拼出原文，赋给 loadError → ErrorView.msg → StateViews.ets:72 Text（无 maxLines、不截断）。
+// 这里按「先 errLog 留全文、再 errBriefForScreen 洗上屏」的三行式接线；只改 page 侧，
+// 不动 data/source/PluginSettings.ets 的返回值（那个文件不在本批写域，改了会波及别的调用方）。
+import { errBriefForScreen, errLog, errTextOf } from '../util/ErrText';
 
 /**
  * 「跑完这条 action 就跳登录页」的判定名（struct 内不能用 static，故模块级）。
@@ -941,7 +947,10 @@ struct PluginSettingsPage {
     // 1. 装载（多数入口进来时已装载，这一步是幂等保险；失败就是真装载不了，给错误态）
     const loadErr: string = await PluginSettings.ensureLoaded(this.uuid, this.absPath());
     if (loadErr.length > 0) {
-      this.loadError = loadErr;
+      // s37 需求 2：原文（可能含 bundle 路径 / [stack-hook] / 引擎堆栈）只进日志，屏上收成一句人话。
+      // 必须先记后洗 —— errBriefForScreen 是纯函数，不写日志。
+      errLog('[PluginSettings] ensureLoaded', loadErr);
+      this.loadError = errBriefForScreen(loadErr, '插件装载失败，请回到插件管理页重新导入该插件');
       this.loading = false;
       return;
     }
@@ -952,7 +961,9 @@ struct PluginSettingsPage {
     // 它是给登录卡补状态的第二条腿，不能挡首屏，也不能把 loading 拖着。
     this.probeLoginState(0);
     if (b.error.length > 0) {
-      this.loadError = b.error;
+      // s37 需求 2：同一条 ErrorView 路径的第二个来源（getSettingsBundle 失败），同样先记后洗。
+      errLog('[PluginSettings] getSettingsBundle', b.error);
+      this.loadError = errBriefForScreen(b.error, '插件设置读取失败，请稍后重试或重进本页');
     }
     this.loading = false;
     // 3. 版本 + 插件自报名字（异步补，不挡首屏）
@@ -1051,7 +1062,9 @@ struct PluginSettingsPage {
     const err: string = await PluginSettings.commitField(this.ctx(), this.uuid, field, value);
     this.busyKey = '';
     if (err.length > 0) {
-      this.toast(err);
+      // s37 需求 2：commitField 失败串可能带 em(e) 原文（如 '保存失败：<引擎串>'）⇒ 先记后洗。
+      errLog('[PluginSettings] commitField', err);
+      this.toast(errBriefForScreen(err, '保存失败，请稍后重试'));
       return;
     }
     if (field.key === IMAGE_QUALITY_KEY) {
@@ -1267,7 +1280,10 @@ struct PluginSettingsPage {
       r.msg = msg.length > 0 ? msg : ('已执行：' + action.title);
       return r;
     }).catch((e: Object): RawActionResult => {
-      r.msg = '执行失败：' + (e as Error).message;
+      // s37 需求 2：能力动作失败的 r.msg 会直接 this.toast 上屏 ⇒ 同样先记后洗。
+      const rawAct: string = errTextOf(e);
+      errLog('[PluginSettings] execAction', rawAct);
+      r.msg = errBriefForScreen(rawAct, '执行失败，请稍后重试');
       return r;
     });
   }
@@ -1317,8 +1333,12 @@ struct PluginSettingsPage {
     // requiredNames 刻意不填：eh 没给这个字段（实测 8 份 .cjs 只有 ignoreCookieNames），
     // 新页自己有兜底必需键名单，插件哪天开始下发就自动以插件为准
     router.pushUrl({ url: 'pages/WebLoginPage', params: p })
-      .catch((err: Error): void => {
-        this.toast('打开网页登录失败：' + err.message);
+      .catch((err: Object): void => {
+        // s37 需求 2：同页 toast 也走「先记后洗」。这五处红队列为轻危（只有 toast，不铺满屏），
+        // 但都是把 (e as Error).message 原样拼上去 —— 引擎串会带 bundle 路径与堆栈片段。
+        const raw: string = errTextOf(err);
+        errLog('[PluginSettings] openWebLogin', raw);
+        this.toast(errBriefForScreen(raw, '打开网页登录失败，请稍后重试'));
       });
     return true;
   }
@@ -1348,8 +1368,11 @@ struct PluginSettingsPage {
   private openLogin(): void {
     const p: PluginLoginParams = new PluginLoginParams(this.uuid, this.displayName, this.localFile);
     router.pushUrl({ url: 'pages/PluginLoginPage', params: p })
-      .catch((err: Error): void => {
-        this.toast('打开登录页失败：' + err.message);
+      .catch((err: Object): void => {
+        // s37 需求 2：同 openWebLogin（见该处注释）。
+        const raw: string = errTextOf(err);
+        errLog('[PluginSettings] openLogin', raw);
+        this.toast(errBriefForScreen(raw, '打开登录页失败，请稍后重试'));
       });
   }
 
@@ -1396,7 +1419,10 @@ struct PluginSettingsPage {
         }).catch((_e: Object): void => {});
       }).catch((e: Object): void => {
         this.logoutBusy = false;
-        this.toast('退出失败：' + (e as Error).message);
+        // s37 需求 2：同 openWebLogin（见该处注释）。
+        const raw: string = errTextOf(e);
+        errLog('[PluginSettings] logout', raw);
+        this.toast(errBriefForScreen(raw, '退出失败，请稍后重试'));
       });
     }).catch((_e: Object): void => {});
   }
@@ -1574,7 +1600,10 @@ struct PluginSettingsPage {
       const ok: boolean = jbool(o, 'ok', false);
       const ver: string = jstr(o, 'version', '');
       if (!ok) {
-        this.toast('更新失败：' + jstr(o, 'error', '未知错误'));
+        // s37 需求 2：插件自报的 error 原文只进日志（它可能带 URL / 引擎串）。
+        const rawErr: string = jstr(o, 'error', '未知错误');
+        errLog('[PluginSettings] installLatest', rawErr);
+        this.toast(errBriefForScreen(rawErr, '更新失败，请稍后重试'));
         return;
       }
       // installLatest 落盘不自动装载 ⇒ 重新装载本 uuid 才生效
@@ -1582,7 +1611,10 @@ struct PluginSettingsPage {
       this.toast(ver.length > 0 ? ('已更新到 ' + ver) : '已是最新');
       this.reload();
     } catch (e) {
-      this.toast('更新失败：' + (e as Error).message);
+      // s37 需求 2：同 openWebLogin（见该处注释）。
+      const rawUpd: string = errTextOf(e);
+      errLog('[PluginSettings] update', rawUpd);
+      this.toast(errBriefForScreen(rawUpd, '更新失败，请稍后重试'));
     }
   }
 
@@ -1597,7 +1629,10 @@ struct PluginSettingsPage {
     try {
       await pluginRemoveFile(this.absPath());
     } catch (e) {
-      this.toast('删除文件失败：' + (e as Error).message);
+      // s37 需求 2：同 openWebLogin（见该处注释）。
+      const rawDel: string = errTextOf(e);
+      errLog('[PluginSettings] deleteFile', rawDel);
+      this.toast(errBriefForScreen(rawDel, '删除文件失败，请稍后重试'));
       return;
     }
     await PluginStore.remove(this.ctx(), this.uuid);

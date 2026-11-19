@@ -43,6 +43,7 @@ import { GlassStyle, GlassButton } from '../view/common/GlassStyle';
 import { LastSourceStore } from '../view/search/LastSourceStore';
 import { Logger } from '../util/Logger';
 import { FeatureDiag } from '../util/FeatureDiag';
+import { errBriefForScreen, errLog, errTextOf } from '../util/ErrText';
 
 /** 聚合搜索伪图源 id（chips 行首「全部」）。 */
 const ALL_SOURCES_ID: string = '__all__';
@@ -443,9 +444,10 @@ struct SearchPage {
       out.reached = r.hasReachedMax;
       out.extern = r.extern;
     } catch (e) {
-      const x = e as Error;
-      const m = x.message;
-      out.err = (typeof m === 'string' && m.length > 0) ? m : String(e);
+      // s37 需求 2：单源原始串只进日志，out.err 给一句人话（它会进横幅与全失败的 ErrorView）。
+      const raw: string = errTextOf(e);
+      errLog('[Search] searchOne', raw);
+      out.err = errBriefForScreen(raw, '加载失败');
       out.reached = true;
     }
     return out;
@@ -592,9 +594,10 @@ struct SearchPage {
       out.reached = r.hasReachedMax;
       out.extern = r.extern;
     } catch (e) {
-      const x = e as Error;
-      const m = x.message;
-      out.err = (typeof m === 'string' && m.length > 0) ? m : String(e);
+      // s37 需求 2：与 searchOne 同口径（原始串进日志，屏上一句人话）。
+      const raw: string = errTextOf(e);
+      errLog('[Search] searchOnePage', raw);
+      out.err = errBriefForScreen(raw, '加载失败');
       out.reached = true;
     }
     return out;

@@ -99,6 +99,12 @@ class ImageExternArg {
 
 /** 从 unknown 异常提取 message 原文（同 Index.ets:86 已验证写法）。 */
 function errText(e: Object): string {
+  // s37 红队取证：`throw undefined` / `throw null` 时 `e as Error` 仍是空值，下读 `.message`
+  // 会在 catch 里**二次抛** TypeError 把原错误顶掉。同病四份（本文件 / PluginSettings.ets:177 em /
+  // ImageCache.ets:110 errBrief / PluginLoginPage.ets:393 errText），四份必须一起改，否则造新分叉。
+  if (e === null || e === undefined) {
+    return String(e);
+  }
   const x = e as Error;
   const m = x.message;
   if (typeof m === 'string' && m.length > 0) {

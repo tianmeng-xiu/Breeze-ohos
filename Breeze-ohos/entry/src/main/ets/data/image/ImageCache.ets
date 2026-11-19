@@ -28,7 +28,7 @@ import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { Logger } from '../../util/Logger';
 import { HttpClient } from '../net/HttpClient';
-import { BytesChannels } from './BytesChannel';
+import { BytesChannels, PluginImageChannel } from './BytesChannel';
 import { deobfuscatePixelMap, isGifBytes } from './JmDeobfuscate';
 import { PLUGIN_SOURCE_PREFIX, PluginSourceAdapter } from '../source/PluginSourceAdapter';
 
@@ -41,6 +41,19 @@ const CACHE_DIR_NAME: string = 'breeze_img';
 const DISK_EXT: string = '.img';
 /** 异步统计的批大小：每批最多 64 个 stat，批与批之间让出一帧。 */
 const STAT_BATCH: number = 64;
+/**
+ * s37 A3：纯黑探针（readPixelsToArea 抽中心 16x16）走哪一档时序。**只有两档，两档都保住
+ * 「纯黑页不落盘」这条保护**（判黑仍然是写盘的唯一前置，变的只是写盘发生在哪一刻）：
+ *   true（现役）= 异步档：解码一完就把位图交回调用方上屏，探针在后台跑，探针回来后再补落盘 /
+ *                  补黑页自愈删除。翻页关键路径上少一跳原生调用与一次事件循环往返。
+ *   false        = 旧串行档（已验收行为，留作一行退回的兜底）：先 await 探针、再决定落不落盘、
+ *                  最后才把位图交回去。
+ * 刻意**没有**「完全不探」这一档：探针同时是「纯黑页不落盘」的判据来源（站方防盗链回的黑图占位
+ * 一旦被写进磁盘就会被永久钉住，之后每次进来都命中缓存、插件通道再也不会被叫起来第二遍），
+ * 关掉探针而不换别的判据 = 把黑图钉进磁盘。要真省掉这次取样，只能同时接受「网络页一律不落盘」
+ * （整个磁盘缓存命中率归零），那是产品决定，不在本批自作主张。
+ */
+const PROBE_ASYNC: boolean = true;
 /**
  * 占用统计的三段时限（替代原单一 USAGE_TIMEOUT_MS=20000：那一个值同时管「列举」和
  * 「几万次 stat」，文件一多必输，且到点只能抛错 ⇒ 用户看到的就是「持续失败」）：
@@ -95,6 +108,11 @@ function withTimeout<T>(p: Promise<T>, ms: number, tag: string): Promise<T> {
  * （不写成 BusinessError 专用：withTimeout 抛的是普通 Error，直接取 code 会拼出 undefined。）
  */
 function errBrief(err: Object): string {
+  // s37 红队取证：空值前置，防 `throw undefined/null` 在 catch 内二次抛（同病四份，见
+  // data/source/PluginSourceAdapter.ets:101 errText 注释）。本函数的结果进诊断面板字段。
+  if (err === null || err === undefined) {
+    return String(err);
+  }
   const be = err as BusinessError;
   let msg: string = '';
   if (typeof be.message === 'string') {
@@ -262,6 +280,56 @@ export class CacheUsageText {
   }
 }
 
+/**
+ * s37 A2：一次取页链路的入参打包。
+ * 为什么需要这个类：loadPage 的「定键前段」（通道判定 + intent + 缓存键 + 内存命中）与
+ * 「重活后段」（读盘 → 取字节 → 解码 → 反混淆 → 探针 → 落盘）之间必须插一道同键在途合并闸门，
+ * 而后段有 8 个入参、要能被多条调用共用。ArkTS 严格模式不许裸对象字面量当结构体用
+ * （10605038），所以显式声明具名类，字段就是那 8 个入参。
+ * ch 单独带过来：它是模块级单例的快照，leader 进门时读到的通道，后段必须用同一份，
+ * 不能在异步中段重读（那期间 BytesChannels.register 理论上可换实现）。
+ */
+class LoadCtx {
+  /** 缓存键（pageKey 的结果，内存/磁盘两侧同一条式） */
+  key: string = '';
+  /** 原始图片地址 */
+  url: string = '';
+  /** 图源 id（插件源形如 plugin:<uuid>；封面/头像那条路为空串） */
+  sourceId: string = '';
+  /** 章节 id（反混淆意图与反混淆执行都要用） */
+  chapterId: string = '';
+  /** 该页在插件页表里的 extern JSON 串，空串 = 没有 */
+  ext: string = '';
+  /** sourceId 带 plugin: 前缀（决定用哪条 LRU 桶与哪把键式） */
+  isPlugin: boolean = false;
+  /** 反混淆意图（''/force/detect），同时是缓存键的一段 */
+  intent: string = '';
+  /** 进门时快照的取字节通道（null = 未接线） */
+  ch: PluginImageChannel | null = null;
+}
+
+/**
+ * s37 A3 异步档的「探针回来后要收的尾」上下文（同一理由：闭包要捕获的量必须显式成型，
+ * 且 ArkTS 不许裸对象字面量）。probed/blackPages/lastBlack 三档计数、落盘、黑页自愈
+ * 全部搬进这里延后做，判据本身一条没改。
+ */
+class ProbeTail {
+  pm: image.PixelMap;
+  bytes: ArrayBuffer;
+  path: string;
+  /** true = 本次字节来自网络（宿主 HTTP）；false = 磁盘命中或插件通道 */
+  fromNet: boolean;
+  url: string;
+
+  constructor(pm: image.PixelMap, bytes: ArrayBuffer, path: string, fromNet: boolean, url: string) {
+    this.pm = pm;
+    this.bytes = bytes;
+    this.path = path;
+    this.fromNet = fromNet;
+    this.url = url;
+  }
+}
+
 export class ImageCache {
   private static instance: ImageCache | null = null;
   private mem: Map<string, image.PixelMap> = new Map();
@@ -291,6 +359,28 @@ export class ImageCache {
   private usagePromise: Promise<DiskUsage> | null = null;
   /** 统计代数：新一轮开始或 clear() 取消都抬它，walkUsage 每批之间对照自查退出。 */
   private usageGen: number = 0;
+
+  /**
+   * s37 A2：**同键在途合并**（单飞闸门）。同一把缓存键已经有取图在跑时，后来者直接复用那条
+   * promise，不再发第二条「读文件 → 取字节 → 解码」整链。
+   *
+   * 为什么必须有（本批卡顿的直接来源）：三条腿互不认识 —— ① 行组件 aboutToAppear→load()，
+   * 纵向档活组件约 10 枚；② 预取一次窗口 9 条；③ 封面/详情那条 load()。全仓原先没有任何一处
+   * 并发闸，而 ReaderView 侧的 ReaderDiag.inFlight 只给预取判重、行 load 不查、缓存层不知情
+   * （那边注释自证「ImageCache 没有在途去重」）。最坏约 19 条完整链路同时在途，每条都带同步
+   * 整文件 IO 与一次解码 ⇒ 事件循环被排满 = 用户说的「多图同时加载时卡顿」。
+   *
+   * 为什么合并在 pageKey 之后、而不是在 loadPage 入口：键需要 intent（一次 await 桥调用），
+   * 入口处的 url+ext 不足以定键（哨兵 url 图源整章 url 逐字节相同）。所以后来者仍会付一次
+   * deobfIntent 的代价，省掉的是后面整条 IO + 解码 + 探针 —— 正是贵的那一段。
+   * 合并点之后的一切都在 leader 那一条里跑完，follower 只 await 结果（成功同样只解一次码）。
+   *
+   * 范式抄本文件已有的 usagePromise（diskUsageAsync 的单飞闸门）：登记 → await → finally 里
+   * 「只清自己这一条」。这里不加代数：键是内容键，没有 clear() 那种「旧结果作废」的语义。
+   */
+  private pageInFlight: Map<string, Promise<image.PixelMap>> = new Map<string, Promise<image.PixelMap>>();
+  /** 在途表的容量闸门：到量就不再登记（退化成旧行为「多发一条」，绝不会因此少发或挂死） */
+  private static readonly PAGE_INFLIGHT_MAX: number = 128;
 
   static getInstance(): ImageCache {
     if (ImageCache.instance === null) {
@@ -423,6 +513,59 @@ export class ImageCache {
       return hit;
     }
 
+    // ---- s37 A2：同键在途合并闸门（为什么放这里、为什么不能更靠前见 pageInFlight 字段注释）----
+    // 粒度边界 = 「定键 + 内存命中」之后、「读盘 → 取字节 → 解码 → 反混淆 → 探针 → 落盘」之前，
+    // 也就是把贵的整段收进 leader 一条链路里跑，follower 只 await 同一个结果。
+    const ctx: LoadCtx = new LoadCtx();
+    ctx.key = key;
+    ctx.url = url;
+    ctx.sourceId = sourceId;
+    ctx.chapterId = chapterId;
+    ctx.ext = ext;
+    ctx.isPlugin = isPlugin;
+    ctx.intent = intent;
+    ctx.ch = ch;
+
+    const running: Promise<image.PixelMap> | undefined = this.pageInFlight.get(key);
+    if (running !== undefined) {
+      // 合并出口：这一次调用没有发起任何 IO，只是搭了 leader 那条顺风车。
+      // ★ 必须单独计一档，否则「五档互斥出口相加 == pageCalls」当场不闭合（leader 只替自己
+      //   那一笔记出口，follower 既不进 pf/hf/df 也不进 pfail —— 恒等式会差 follower 的条数）。
+      ImageCache.pageMerged++;
+      return await running;
+    }
+    if (this.pageInFlight.size >= ImageCache.PAGE_INFLIGHT_MAX) {
+      // 病态形态（同键在途表都满了）：退回旧行为直接跑一条，不登记、不合并，
+      // 最坏 = 改造前，绝不会因为这道闸少发或挂死。
+      return await this.runLoad(ctx);
+    }
+    const p: Promise<image.PixelMap> = this.runLoad(ctx);
+    this.pageInFlight.set(key, p);
+    try {
+      return await p;
+    } finally {
+      // 照搬 usagePromise 那条单飞闸门的收尾：只摘自己这一条（cancel 或新一轮已换过键值时不误删）
+      if (this.pageInFlight.get(key) === p) {
+        this.pageInFlight.delete(key);
+      }
+    }
+  }
+
+  /**
+   * 一条**完整**的取图链路（读盘 → 插件/宿主取字节 → 解码 → 反混淆 → 黑页探针 → 落盘 → 进内存）。
+   * s37 A2 起它是 loadPage 的私有后段：同键在途时整段只跑一次，入口段（通道/intent/定键/内存命中）
+   * 仍在 loadPage 里每次照跑。除探针时序（见 PROBE_ASYNC）外，本方法体的行为与改造前逐条相同。
+   */
+  private async runLoad(ctx: LoadCtx): Promise<image.PixelMap> {
+    const key: string = ctx.key;
+    const url: string = ctx.url;
+    const sourceId: string = ctx.sourceId;
+    const chapterId: string = ctx.chapterId;
+    const ext: string = ctx.ext;
+    const isPlugin: boolean = ctx.isPlugin;
+    const intent: string = ctx.intent;
+    const ch: PluginImageChannel | null = ctx.ch;
+
     const name: string = await this.hashName(key);
     const path: string = this.cacheRoot + '/' + name + DISK_EXT;
 
@@ -505,41 +648,60 @@ export class ImageCache {
     // ⇒ 更像 ②。但没有现场计数不能定案，所以这里对**已上屏的 PixelMap** 抽中心小块自己量一遍。
     // 刻意用 readPixelsToArea（@since 12）只取中心 16x16：整幅 readPixelsToBuffer 每张页图要多拷几 MB，
     // 为一个诊断指标不值当。
-    const blk: number = await ImageCache.probeBlack(pm);
-    ImageCache.probed++;
-    // s15 补：-1（取样失败）此前也混进 probed 分母 ⇒ blk=0/14 分不清「14 张全有内容」
-    // 和「14 张全部取样失败」这两种相反结论。单列 u 档（imageHint 的 blk=a/b/u）。
-    if (blk === -1) {
-      ImageCache.probeUnknown++;
-    }
-    let blackPage: boolean = false;
-    if (blk === 1) {
-      ImageCache.blackPages++;
-      blackPage = true;
-      const bi: image.ImageInfo = pm.getImageInfoSync();
-      ImageCache.lastBlack = bi.size.width + 'x' + bi.size.height;
-      ImageCache.lastBlackHost = hostOf(url);
-      ImageCache.lastBlackBytes = buf.byteLength;
-      Logger.w('页图像素近乎全黑：' + bi.size.width + 'x' + bi.size.height
-        + ' bytes=' + buf.byteLength + ' host=' + hostOf(url));
-    }
-    // 纯黑页一律不落盘（连原始字节一起跳）：磁盘存的虽然是人家的原字节，但一张「解码成功、
-    // 尺寸正常、像素全黑」的页最像**站方防盗链回的黑图占位**。写盘 = 把这张占位永久钉住，
-    // 之后每次进来都命中缓存、插件通道再也不会被叫起来第二遍 ⇒ 用户看到的是「永远黑」。
     //
-    // 现场依据（1252x1900 那张截图逐行 luma 量算）：黑区上下两条邻居页图**渲染正常**，
-    // 只有中间这一张是纯黑 ⇒ 同一插件、同一解码档位下邻居能出画 ⇒ 不是渲染档位问题，
-    // 是这一张的位图本身就是黑的（站方按页返回的占位）。所以修法在「别把它钉住」这一侧。
-    if (fromNet && !blackPage) {
-      this.writeFile(path, buf);
-    }
-    // s12/s13 的旧包把黑页写进过磁盘 ⇒ 升到本版后那些文件仍会命中并画黑。这里反向自愈一次：
-    // 黑页 + 本次是磁盘命中 ⇒ 删掉这个缓存文件（本次仍显示黑，下一次进来就重新走取图）。
-    // 刻意不当场重取：重取要在同一次调用里把「取图 → 解码 → 再判黑」整条链跑第二遍，
-    // 换来的是「第一次看到黑也白等一轮」，不值当；删文件已足够让下一次恢复。
-    if (blackPage && !fromNet) {
-      this.deleteFile(path);
-      Logger.w('黑页缓存已删除，下次重取：' + hostOf(url));
+    // s37 A3：这一步的**时序**改由 PROBE_ASYNC 分两档，判据与落盘条件一个字都没动 ——
+    // 两档都是「判黑成功才允许写盘」，变的只是这次调用是等探针回来才返回，还是先把位图交回
+    // 上屏、探针在后台跑完再补落盘 / 补自愈。异步档去掉的是翻页关键路径上唯一一次纯开销
+    //（readPixelsToArea 原生调用 + 一次事件循环往返，它不产出任何上屏结果）。
+    if (PROBE_ASYNC) {
+      const tail: ProbeTail = new ProbeTail(pm, buf, path, fromNet, url);
+      // catch 也按 -1（取样失败）收尾，与串行档保持同一行为：probeBand 内部本就把异常吞成 -1，
+      // 所以串行档在「取样失败」时是**照样写盘**的（blackPage 仍为 false）。异步档若在这里改成
+      // 不写盘，一旦本机 readPixelsToArea 系统性不可用，就等于悄悄把整个磁盘缓存废掉 ——
+      // 两档必须在同一批样本上给同一个写盘决定，只有时刻不同。
+      ImageCache.probeBlack(pm).then((blk: number): void => {
+        this.finishProbe(tail, blk);
+      }).catch((err: Object): void => {
+        ImageCache.lastProbeErr = errBrief(err);
+        this.finishProbe(tail, -1);
+      });
+    } else {
+      const blk: number = await ImageCache.probeBlack(pm);
+      ImageCache.probed++;
+      // s15 补：-1（取样失败）此前也混进 probed 分母 ⇒ blk=0/14 分不清「14 张全有内容」
+      // 和「14 张全部取样失败」这两种相反结论。单列 u 档（imageHint 的 blk=a/b/u）。
+      if (blk === -1) {
+        ImageCache.probeUnknown++;
+      }
+      let blackPage: boolean = false;
+      if (blk === 1) {
+        ImageCache.blackPages++;
+        blackPage = true;
+        const bi: image.ImageInfo = pm.getImageInfoSync();
+        ImageCache.lastBlack = bi.size.width + 'x' + bi.size.height;
+        ImageCache.lastBlackHost = hostOf(url);
+        ImageCache.lastBlackBytes = buf.byteLength;
+        Logger.w('页图像素近乎全黑：' + bi.size.width + 'x' + bi.size.height
+          + ' bytes=' + buf.byteLength + ' host=' + hostOf(url));
+      }
+      // 纯黑页一律不落盘（连原始字节一起跳）：磁盘存的虽然是人家的原字节，但一张「解码成功、
+      // 尺寸正常、像素全黑」的页最像**站方防盗链回的黑图占位**。写盘 = 把这张占位永久钉住，
+      // 之后每次进来都命中缓存、插件通道再也不会被叫起来第二遍 ⇒ 用户看到的是「永远黑」。
+      //
+      // 现场依据（1252x1900 那张截图逐行 luma 量算）：黑区上下两条邻居页图**渲染正常**，
+      // 只有中间这一张是纯黑 ⇒ 同一插件、同一解码档位下邻居能出画 ⇒ 不是渲染档位问题，
+      // 是这一张的位图本身就是黑的（站方按页返回的占位）。所以修法在「别把它钉住」这一侧。
+      if (fromNet && !blackPage) {
+        this.writeFile(path, buf);
+      }
+      // s12/s13 的旧包把黑页写进过磁盘 ⇒ 升到本版后那些文件仍会命中并画黑。这里反向自愈一次：
+      // 黑页 + 本次是磁盘命中 ⇒ 删掉这个缓存文件（本次仍显示黑，下一次进来就重新走取图）。
+      // 刻意不当场重取：重取要在同一次调用里把「取图 → 解码 → 再判黑」整条链跑第二遍，
+      // 换来的是「第一次看到黑也白等一轮」，不值当；删文件已足够让下一次恢复。
+      if (blackPage && !fromNet) {
+        this.deleteFile(path);
+        Logger.w('黑页缓存已删除，下次重取：' + hostOf(url));
+      }
     }
     // s15 第 1 条：出口侧唯一权威 —— 这张最终上屏的图，字节到底来自哪条通道。
     // 只在成功返回处累加，失败那次只涨 pageCalls/pageFailed，不污染三档分布。
@@ -552,6 +714,42 @@ export class ImageCache {
     }
     this.memPut(key, pm, isPlugin);
     return pm;
+  }
+
+  /**
+   * s37 A3 异步档的收尾：探针回来后补做串行档在调用内做的那三件事（计数 / 落盘 / 黑页自愈）。
+   * 与串行档的 else 分支逐条同判据，**唯一差别是执行时刻**（延后到探针落地）。
+   * 之所以必须整体延后而不是「先无条件写盘、判黑后再删」：那会让一张黑图在磁盘上存在过几百毫秒，
+   * 期间任何一次同键调用都可能把它当健康缓存读进内存 —— 保护强度弱于现状，不做。
+   */
+  private finishProbe(tail: ProbeTail, blk: number): void {
+    ImageCache.probed++;
+    if (blk === -1) {
+      ImageCache.probeUnknown++;
+    }
+    const blackPage: boolean = blk === 1;
+    if (blackPage) {
+      ImageCache.blackPages++;
+      try {
+        const bi: image.ImageInfo = tail.pm.getImageInfoSync();
+        ImageCache.lastBlack = bi.size.width + 'x' + bi.size.height;
+      } catch (err) {
+        // 延后期间位图可能已被消费侧归还并释放（retain/unpin 那条生命周期）：尺寸拿不到就只丢
+        // lastBlack 这一条取证字段，落盘/自愈判定与它无关，不能因此跳过。
+        ImageCache.lastProbeErr = errBrief(err);
+      }
+      ImageCache.lastBlackHost = hostOf(tail.url);
+      ImageCache.lastBlackBytes = tail.bytes.byteLength;
+      Logger.w('页图像素近乎全黑（异步档）：bytes=' + tail.bytes.byteLength
+        + ' host=' + hostOf(tail.url));
+    }
+    if (tail.fromNet && !blackPage) {
+      this.writeFile(tail.path, tail.bytes);
+    }
+    if (blackPage && !tail.fromNet) {
+      this.deleteFile(tail.path);
+      Logger.w('黑页缓存已删除，下次重取：' + hostOf(tail.url));
+    }
   }
 
   /** 诊断面板用：反混淆生效次数 / 跳过次数 / 最后一次状态。 */
@@ -607,7 +805,7 @@ export class ImageCache {
    * 这组计数换成**互斥出口**口径：一次 loadPage 只可能落在下面六个出口里的一个，
    * 于是有一条例程可自查的恒等式（不必再靠现场猜）：
    *
-   *   pageFromPlugin + pageFromHost + pageFromDisk + pageFromMem + pageFailed == pageCalls
+   *   pageFromPlugin + pageFromHost + pageFromDisk + pageFromMem + pageMerged + pageFailed == pageCalls
    *
    * （派工书原话是「pf+hf+df == pageCalls」，那条只在这一次既没命中内存、又没失败时成立；
    *   内存命中与失败出口各占一档才能把它写成无条件恒等式。对不上账 = 有第七条出口，
@@ -649,6 +847,20 @@ export class ImageCache {
   static pageFromMem: number = 0;
   /** 出口 5：这次没拿到图（缓存未就绪、下载失败、解码失败、解码返回空） */
   static pageFailed: number = 0;
+  /**
+   * 出口 6（s37 A2 新增）：同键已经有链路在跑，本次调用只是等它的结果，一条 IO 都没发。
+   * 为什么必须单列一档（不列就等于自毁恒等式）：leader 只替**自己那一笔**记出口，follower
+   * 既不进 pf/hf/df/mf 也不进 pfail ⇒ 少这一档，恒等式当场差 follower 的条数，
+   * imageChainBalanced() 会在第一次并发展开时变红，看起来像「有第七条未知出口」。
+   *
+   * 读法：mg 就是「省掉了多少条完整链路」的直接读数，健康形态是快翻时 mg 明显大于 0；
+   * mg 恒 0 说明闸门没生效（键算不一致，或三条腿压根没并发过）。
+   *
+   * ★ 一条语义变化必须写清（不是回归，但下游读 pfail 时要换口径）：合并前 N 条同键调用各自
+   * 失败会各记一笔 pageFailed，合并后只有 leader 那一笔记一笔 ⇒ **pfail 从「失败调用数」变成
+   * 「失败链路数」**。恒等式照旧成立（pageCalls 仍逐笔计，follower 全落在 mg）。
+   */
+  static pageMerged: number = 0;
   /**
    * 是插件图源、但 BytesChannels 还没接线（install 晚于第一次取页）的次数。
    * 这一档刻意不进上面六个出口之外的第七档，只是把「为什么会走宿主」的原因写清楚：
@@ -849,6 +1061,9 @@ export class ImageCache {
       + (ImageCache.pagePluginNoChannel > 0 ? ' pnc=' + ImageCache.pagePluginNoChannel : '')
       + ' pc=' + ImageCache.pageCalls
       + ' pfail=' + ImageCache.pageFailed
+      // s37 A2：mg = 同键在途合并省掉的完整链路条数（恒等式第六档，不显示出来这条账在面板上读不全）。
+      // 读法见 pageMerged 字段注释：健康形态是快翻时 mg 明显 > 0；mg 恒 0 = 闸门没生效。
+      + ' mg=' + ImageCache.pageMerged
       + (ImageCache.channelNull > 0 ? ' cn=' + ImageCache.channelNull : '')
       + (ImageCache.lastPageIntentLen > 0 ? ' pil=' + ImageCache.lastPageIntentLen : '')
       + (ImageCache.lastProbeErr.length > 0 ? ' pkb=' + ImageCache.lastProbeErr : '')
@@ -865,10 +1080,10 @@ export class ImageCache {
       + PluginSourceAdapter.externHint();
   }
 
-  /** 恒等式自查（离线桩与诊断面板都可用）：五档互斥出口相加必须等于调用总数。 */
+  /** 恒等式自查（离线桩与诊断面板都可用）：六档互斥出口相加必须等于调用总数。 */
   static imageChainBalanced(): boolean {
     return ImageCache.pageFromPlugin + ImageCache.pageFromHost + ImageCache.pageFromDisk
-      + ImageCache.pageFromMem + ImageCache.pageFailed === ImageCache.pageCalls;
+      + ImageCache.pageFromMem + ImageCache.pageMerged + ImageCache.pageFailed === ImageCache.pageCalls;
   }
 
   // ------------------------------------------------------------ 尺寸预探（s16 第 2 条）

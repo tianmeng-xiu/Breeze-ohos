@@ -95,7 +95,10 @@ function briefForScreen(msg: string, fallback: string): string {
     return fallback;
   }
   const cut: number = s.indexOf(FULL_OPEN_PAREN);
-  if (cut > 0) {
+  // ★ s37 红队取证后改 `> 0` → `>= 0`（与 util/ErrText.ets:171、view/reader/ReaderView.ets:1064 同步）：
+  //   括号在**句首**时 indexOf 返回 0，`> 0` 不成立 ⇒ 整串原样放行，屏上出现全角左括号。
+  //   改后句首括号被砍成空串，由紧随的空判接住 → 回兜底句。
+  if (cut >= 0) {
     s = s.substring(0, cut).trim();
   }
   if (s.length === 0 || s.length > BRIEF_MAX) {
@@ -388,6 +391,11 @@ function loginErrLogTag(tag: string, raw: string): string {
  * 形态同 data/image/ImageCache.ets:97 errBrief（带 code 就写 code，没有就只写 message）。
  */
 function errText(err: Object): string {
+  // s37 红队取证：空值前置，防 `throw undefined/null` 在 catch 内二次抛 TypeError
+  //（同病四份，见 data/source/PluginSourceAdapter.ets:101 errText 注释）。
+  if (err === null || err === undefined) {
+    return String(err);
+  }
   const be: BusinessError = err as BusinessError;
   let msg: string = '';
   if (typeof be.message === 'string') {

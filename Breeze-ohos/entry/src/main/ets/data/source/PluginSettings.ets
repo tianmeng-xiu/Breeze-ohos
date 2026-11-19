@@ -175,6 +175,11 @@ class ActionResult {
 
 /** 从 unknown 异常提取 message 原文（同 Index.ets:86 已验证写法）。 */
 function em(e: Object): string {
+  // s37 红队取证：空值前置，防 `throw undefined/null` 在 catch 内二次抛（同病四份，见
+  // PluginSourceAdapter.ets:101 errText 注释）。本函数喂 PluginSettingsPage 的 loadError 上屏路径。
+  if (e === null || e === undefined) {
+    return String(e);
+  }
   const x = e as Error;
   const m = x.message;
   if (typeof m === 'string' && m.length > 0) {

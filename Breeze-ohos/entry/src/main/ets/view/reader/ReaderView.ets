@@ -401,6 +401,36 @@ export class ReaderDiag {
   /** s16 第 2 条（丙）：预取发起的取页次数（不与页组件记账重叠，专门用来和 16 号行 pageCalls 对账） */
   static prefetchTotal: number = 0;
   /**
+   * s37 A1：预取腿**当前在途**的取页条数（发起 +1，then/catch 落地 -1）。
+   * 为什么单独数一条：3(a) 的根因是三条腿互不认识 —— 行组件 aboutToAppear 一批（纵向档活组件≈10）、
+   * 预取 for 循环一批（PREFETCH_AHEAD=6 + BEHIND=2 = 一次 9 条，循环内不 await）、封面腿一条，
+   * 全仓没有任何并发闸 ⇒ 最坏≈19 条同时在跑，每条链上还有三处同步整文件 IO。本字段只数**预取这一腿**，
+   * 因为它是唯一一条「自己可以决定发几条」的腿（行组件那批由 LazyForEach 活组件数决定，动它等于动渲染）。
+   * 与 ReaderDiag.inFlight 的区别：那张表是**页身份集合**（行 load 也会登记，用来给预取判重），
+   * 只回答「这一页有没有人取」；本字段回答「预取此刻占了几条通道」= 闸门读它。
+   */
+  static prefetchLive: number = 0;
+  /** s37 A1：prefetchLive 达到过的最大值（进 17 号行 pre= 的后半档，见该处读法）。 */
+  static prefetchLivePeak: number = 0;
+  /** s37 A1：闸门触发（因在途已满而放弃本轮剩余预取）的**轮数**，不是放弃的条数。 */
+  static prefetchGated: number = 0;
+  /**
+   * s37 B1：出页那一次 router.back() 是谁发的 —— a = 浮层 onAppear 落地时发的（正常档），
+   * t = 兜底 timer 到点才发的（拥塞档）。两档相加 = 走过的退场次数。
+   * 为什么必须由**消费侧**发这一档（ReaderPage 自己也能记，但那边没有输出通道）：
+   * 诊断行的行号是证据链锚点，ReaderPage 不在面板上占行，且 Index.ets 我只读不能加 pushFixed。
+   * 真机读法：t 明显 > 0 = 浮层落地被拥塞拖过 32 ms，正是 3(b)「退场动画卡顿/丢失」的直接读数。
+   */
+  static exitAppear: number = 0;
+  static exitTimer: number = 0;
+  /**
+   * s37 B1：router.back() 在 dispatchExit 里**抛异常**的次数（第三条腿，恒 0 才健康）。
+   * 非 0 的含义很硬 = 框架拒绝了我们发的那一发退页，此时代码会自动退化成"再排一拍兜底重发"，
+   * 用户侧表现是返回慢一拍；持续非 0 就是「B1 的 onAppear 发页路线在本机不成立」的定案证据，
+   * 应把出页退回纯计时器档（不必回滚整批，只把 onHeroLayerAppear 首行改成 return）。
+   */
+  static exitFail: number = 0;
+  /**
    * s16 第 2 条（乙，lead 追加 D2）：**解码前**就量到真实比、并因此让首次布局直接落真高的行数。
    * 这是 D2 那条「行高不得从窄骨架跳到真实比」的直接证据计数 —— 它只在消费侧数得到：
    * ImageCache 那边只知道「预探了几次、读到几次字节」（16 号行 sz=命中/读字节/调用），
@@ -513,6 +543,76 @@ export class ReaderDiag {
   static viewportW: number = 0;
   static viewportH: number = 0;
 
+  // ---------------- s36 批次：追加链闸门普查 + 横向边界探针（纯观测，零行为变更） ----------------
+  // 背景：s32 那批六枚计数只覆盖到「过了首道闸之后」，tryAppendNextChapter 的九条 return 里
+  // 七条不留读数 ⇒ 真机 call=0 时读不出去在哪一条。本批按「一道闸一枚计数」补齐（先例 = §86 spBlocked）。
+  // ★ 判读速记（s36b 更正，勿再写回旧版）：**绝不可**用「gb 向量里不是 0 的那一格 = 卡住的位置」——
+  //   apThresh（章中每帧跨页必中）与 apLast（末章正常态）本来就是常态大数，健康会话也一直涨，照旧口径
+  //   会把正常滚动判成「卡在阈值闸」。正确读法 = ① 取**两次回传的差值**；② 只看嫌疑格
+  //   busy/empty/nochap/tailnext/tailmi/backoff/stale/err 的增量；③ 同时看 rsn = 最后一次 return 的短标签。
+  // gapA / atE / n / pi = 那一刻的原始量（用来验证「阈值闸在贴底时是否真的关死」这条假设）。
+  static apNotWeb: number = 0;
+  static apBusy: number = 0;
+  static apEmpty: number = 0;
+  static apNoChap: number = 0;
+  static apLast: number = 0;
+  static apTailNext: number = 0;
+  static apTailMi: number = 0;
+  static apThresh: number = 0;
+  static apBackoff: number = 0;
+  static apStale: number = 0;
+  static apErr: number = 0;
+  /** 最后一次 return 的短标签（last 值，非计数）：notweb/busy/empty/nochap/last/tailnext/tailmi/thresh/backoff，
+   *  另加 appendFromBottom 首道闸四档 abNotWeb/abLoad/abBusy/abEmpty */
+  static apReason: string = '';
+  /** 闸门快照（last 值）：cells 长度 / pageIndex / 距流末格差 / isAtEnd 0|1 / 当前章下标 / chapters 长度 */
+  static apN: number = 0;
+  static apPi: number = 0;
+  static apGapA: number = 0;
+  static apAtEnd: number = 0;
+  static apCurCh: number = 0;
+  static apChapterCount: number = 0;
+  /** 末格身份快照（last 值）：末格 chIdx / 章内页码 / 章总页数（用于甄别 tailnext 与 tailmi 两种卡法） */
+  static apTailCh: number = 0;
+  static apTailPg: number = 0;
+  static apTailTotal: number = 0;
+  /** 驱动器归因计数：五次调用 appendFromBottom / tryAppendNextChapter 各自的次数 */
+  static drvSidx: number = 0;
+  static drvReach: number = 0;
+  static drvStop: number = 0;
+  static drvSmooth: number = 0;
+  static drvRetry: number = 0;
+  /** 补拍链（原先整条零读数）：装轮次数 / 轮次用尽次数 / timer 里 isAtEnd 真支推进次数 */
+  static retryArm: number = 0;
+  static retryExhaust: number = 0;
+  static retryPoke: number = 0;
+  /** onWebtoonScrollStop 进入次数（该方法原先零计数 = 观测盲区） */
+  static stopHits: number = 0;
+  /** 只记**纵向档**的最后一行实测高（noteRowH 里 vertical 为真才写）：行/屏比 rps= 的分母 */
+  static rowHLastVert: number = 0;
+  // ---- 横向档 Swiper 边界探针（本机 SDK 已核实：swiper.d.ts 里 onContentWillScroll :2198 @since 15、
+  //      onContentDidScroll :2142 @since 12、onGestureSwipe :2063、onScrollStateChanged :2003 全部存在，
+  //      档位 26.0.0 可用；类型名是全局 ambient，**千万不要 import**）。
+  //      ★ s36b：`cwsTotal` / `gsTotal` 是**不带末页闸门**的总数，其余四枚（cwsHits/cwsNeg/cwsPos/gsHits）
+  //      以及 cdsHits/sscHits 仍是「已在末页才累加」—— 后者只为避免逐帧回调把计数灌爆，代价是
+  //      「末页组全 0」时分不清框架静默与用户没推 ⇒ 判读一律拿 total 当分母做差。
+  static swChanges: number = 0;
+  static swCtrl: number = 0;
+  /** s36b：不带末页闸门的总数（判「框架对 clamp 静默」的对照分母）。
+   *  读法 = cwsTotal > cwsHits ⇒ 用户在**非末页**处推过且框架确实发了回调；
+   *  此时末页组仍为 0 ⇒ 正面证明「框架对 clamp 静默」，而不是「用户没推」。 */
+  static cwsTotal: number = 0;
+  static gsTotal: number = 0;
+  static cwsHits: number = 0;
+  static cwsNeg: number = 0;
+  static cwsPos: number = 0;
+  static cwsLastCur: number = 0;
+  static cwsLastComing: number = 0;
+  static cwsLastOffset: number = 0;
+  static gsHits: number = 0;
+  static cdsHits: number = 0;
+  static sscHits: number = 0;
+
   /**
    * 把一次实测高写进「这一页」的那一侧（isRow=true 组件侧 / false 行盒侧），两侧齐了就更新 gap。
    * 空 pageKey 直接忽略（父组件没传 pageNo 的调用点属「没有这一页」，不是「高为 0」）。
@@ -564,6 +664,9 @@ export class ReaderDiag {
       return;
     }
     ReaderDiag.rowHLast = h;
+    if (vertical) {
+      ReaderDiag.rowHLastVert = h;
+    }
     if (vertical && h > ReaderDiag.rowHMax) {
       ReaderDiag.rowHMax = h;
     }
@@ -737,6 +840,39 @@ export class ReaderDiag {
       ReaderDiag.seamlessFail += 1;
     } else if (what === 'fallback') {
       ReaderDiag.seamlessFallback += 1;
+    } else if (what === 'apNotWeb') {
+      ReaderDiag.apNotWeb += 1;
+      ReaderDiag.apReason = 'notweb';
+    } else if (what === 'apBusy') {
+      ReaderDiag.apBusy += 1;
+      ReaderDiag.apReason = 'busy';
+    } else if (what === 'apEmpty') {
+      ReaderDiag.apEmpty += 1;
+      ReaderDiag.apReason = 'empty';
+    } else if (what === 'apNoChap') {
+      ReaderDiag.apNoChap += 1;
+      ReaderDiag.apReason = 'nochap';
+    } else if (what === 'apLast') {
+      ReaderDiag.apLast += 1;
+      ReaderDiag.apReason = 'last';
+    } else if (what === 'apTailNext') {
+      ReaderDiag.apTailNext += 1;
+      ReaderDiag.apReason = 'tailnext';
+    } else if (what === 'apTailMi') {
+      ReaderDiag.apTailMi += 1;
+      ReaderDiag.apReason = 'tailmi';
+    } else if (what === 'apThresh') {
+      ReaderDiag.apThresh += 1;
+      ReaderDiag.apReason = 'thresh';
+    } else if (what === 'apBackoff') {
+      ReaderDiag.apBackoff += 1;
+      ReaderDiag.apReason = 'backoff';
+    } else if (what === 'apStale') {
+      ReaderDiag.apStale += 1;
+      ReaderDiag.apReason = 'stale';
+    } else if (what === 'apErr') {
+      ReaderDiag.apErr += 1;
+      ReaderDiag.apReason = 'err';
     }
   }
 
@@ -749,7 +885,14 @@ export class ReaderDiag {
 
 
   static pageHint(): string {
-    return 'shown=' + ReaderDiag.pageShown + ' pending=' + ReaderDiag.pagePending +
+    return 'shown=' + ReaderDiag.pageShown +
+      // s27 判代 + 回归两用：tap= 下沉后热区收到的点按总数（无此字段 = 包早于 s27；点过画面却恒 0 = 热区搬完没接住事件）。
+      // s34 tapBox= 中心热区实测尺寸（宽x高，vp）：判代 + 「自适应在这台机器上到底算成多大」的读数。
+      // ★ s36b 前移到这里：本行与 chapterHint 共用 720 cap，长会话从行尾截 ——
+      //   这两枚是判代字段，必须排在前面才不会被截掉。
+      ' tap=' + ReaderDiag.tapHits +
+      ' tapBox=' + ReaderDiag.tapBoxW.toFixed(0) + 'x' + ReaderDiag.tapBoxH.toFixed(0) +
+      ' pending=' + ReaderDiag.pagePending +
       ' failed=' + ReaderDiag.pageFailed + ' ratio=' + ReaderDiag.lastShownRatio +
       ' size=' + ReaderDiag.lastShownSize +
       // s16 第 2 条诊断四枚扩展位，判读口径见 _tmp/s16/ACCEPT.md 第五段（不在这里重复）：
@@ -758,9 +901,20 @@ export class ReaderDiag {
       // pre = 预取发起的取页次数（16 号行 pageCalls 里混着「行组件取页」与「预取取页」两条来源，
       // 没有 pre 那两行对不上账：pageCalls 里属于本文件的部分 ≈ shown + failed + pending）；
       // probe = 解码前就量到真比的行数（分母在 16 号行 sz= 里，这里只给分子，见字段注释）。
+      // ★ s37 A1 扩充 pre= 一档为三档 pre=总数/在途峰值/闸门轮数（复用既有槽位，不新开字段：
+      //   17 号行 = chapterHint + ' | ' + pageHint 共用 720 硬截断，多开一枚新字段就多挤一分）。
+      //   第一档语义一字未动（仍是 prefetchTotal），后两档是新增读数：
+      //   峰值 = 预取腿同时在途的最大条数（改前无闸，理论上限 = PREFETCH_AHEAD+PREFETCH_BEHIND+1 = 9；
+      //   闸门上限 = PREFETCH_LIVE_MAX = 3 ⇒ 峰值读到 4 以上即闸门失效，须查递减漏点）；
+      //   闸门轮数 > 0 = 闸门真的拦过东西。
       ' peak=' + ReaderDiag.pendingPeak + ' retry=' + ReaderDiag.retryTotal +
-      ' hit=' + ReaderDiag.sizeHits + ' pre=' + ReaderDiag.prefetchTotal +
+      ' hit=' + ReaderDiag.sizeHits + ' pre=' + ReaderDiag.prefetchTotal
+      + '/' + ReaderDiag.prefetchLivePeak + '/' + ReaderDiag.prefetchGated +
       ' probe=' + ReaderDiag.sizeProbeHits +
+      // s37 B1：出页发车的来源三档 ex=onAppear数/兜底timer数/发页抛异常数（a 占绝大多数 = B1 生效；
+      // t 明显 > 0 = 浮层落地被拖过 32 ms，正是 3(b) 的直接证据；末位非 0 = onAppear 里发页被框架拒绝）。
+      // 插在 probe= 之后而不是行尾：17 号行超长时从尾部截断，行尾那批 vw/vh/sw/... 被截掉的代价比这条小。
+      ' ex=' + ReaderDiag.exitAppear + '/' + ReaderDiag.exitTimer + '/' + ReaderDiag.exitFail +
       // s17 新增 bare = 本进程见过的「占位行裸底色高度」最大值（vp）：黑区的直接量纲，
       // 行高按各档真实口径取（纵向 = 宽/真比或窄骨架，横向 = 阅读区高）。
       // 期望恒 = 2 x SKELETON_FILL_INSET = 12；-1 = 本进程没渲染过占位行；大于 12 = 黑区回归。
@@ -783,10 +937,27 @@ export class ReaderDiag {
       ' gap=' + ReaderDiag.rowGapMax.toFixed(0) + '@p' + ReaderDiag.rowGapKey +
       ' pairN=' + ReaderDiag.rowPairCount +
       ' vw=' + ReaderDiag.viewportW.toFixed(0) + ' vh=' + ReaderDiag.viewportH.toFixed(0) +
-      // s27 判代 + 回归两用：tap= 下沉后热区收到的点按总数（无此字段 = 包早于 s27；点过画面却恒 0 = 热区搬完没接住事件）。
-      // s34 tapBox= 中心热区实测尺寸（宽x高，vp）：判代 + 「自适应在这台机器上到底算成多大」的读数。
-      ' tap=' + ReaderDiag.tapHits +
-      ' tapBox=' + ReaderDiag.tapBoxW.toFixed(0) + 'x' + ReaderDiag.tapBoxH.toFixed(0);
+      // ---- s36 批次（纯探针）：横向档 Swiper「末页又被推一下」有无可观测回调 ----
+      // sw = onChange 次数 / swiperController.showNext+showPrevious 次数（后者驱动的翻页不喂
+      //      content 类回调，所以用户硬滑 ≈ swChanges - swCtrl）；末页时 cws/gs/cds/ssc 任一 > 0
+      //      即证「本 SDK 有可观测边界回调」，全 0 而 gs 也 0 = 维持现有「不可观测、靠热区入口」口径。
+      // cws = 不带闸门总数/末页命中/offset<0/offset>0（swiper.d.ts:2349 注释：offset
+      //      负 = 往 index 增大方向）；gs = 不带闸门总数/末页命中。ci = 最近一次 currentIndex/comingIndex；of = 最近 offset。
+      // ★ s36b 判据（cwsTotal / gsTotal 是不带末页闸门总数，故可证伪）：
+      //   cwsTotal > cwsHits 而 cwsHits == 0 ⇒ 用户在非末页推过、框架发了回调，末页组却为 0
+      //     = 正面证明「框架对 clamp 静默」；
+      //   cwsTotal == 0 ⇒ 本回调在本机压根没被喂过（另案，先查绑定与 API 档位）。
+      // cds/ssc = onContentDidScroll / onScrollStateChanged 末页命中次数（仍是带闸门的，无总数）。
+      // rps = 行/屏比（vh / 纵向档最后一行实测高）：> 1 说明该章单页不足一屏，贴底判定的意义随之改变。
+      ' sw=' + ReaderDiag.swChanges + '/' + ReaderDiag.swCtrl +
+      ' cws=' + ReaderDiag.cwsTotal + '/' + ReaderDiag.cwsHits + '/' + ReaderDiag.cwsNeg + '/' + ReaderDiag.cwsPos +
+      ' ci=' + ReaderDiag.cwsLastCur + '/' + ReaderDiag.cwsLastComing +
+      ' of=' + ReaderDiag.cwsLastOffset.toFixed(1) +
+      ' gs=' + ReaderDiag.gsTotal + '/' + ReaderDiag.gsHits +
+      ' cds=' + ReaderDiag.cdsHits +
+      ' ssc=' + ReaderDiag.sscHits +
+      ' rps=' + (ReaderDiag.rowHLastVert > 0
+        ? (ReaderDiag.viewportH / ReaderDiag.rowHLastVert).toFixed(1) : '0');
   }
 
   /** 诊断面板用的一行文本（章） */
@@ -800,7 +971,39 @@ export class ReaderDiag {
       ' ae=' + ReaderDiag.seamlessAtEndFalse + ' call=' + ReaderDiag.seamlessAppendCalls +
       ' pg=' + ReaderDiag.seamlessAppendedPages + ' fail=' + ReaderDiag.seamlessFail +
       ' fb=' + ReaderDiag.seamlessFallback +
-      ' auto=' + (ReaderDiag.autoMode.length === 0 ? '-' : ReaderDiag.autoMode);
+      ' auto=' + (ReaderDiag.autoMode.length === 0 ? '-' : ReaderDiag.autoMode) +
+      // ---- s36 批次（纯探针）：tryAppendNextChapter 九条 return 逐道闸普查 ----
+      // gb = 十一道闸的计数向量，顺序 = apNotWeb/apBusy/apEmpty/apNoChap/apLast/apTailNext/
+      //      apTailMi/apThresh/apBackoff/apStale/apErr。
+      // ★ 判读铁律（s36b 更正）：apThresh（章中每帧跨页必中）与 apLast（末章正常态）**本来就是
+      //   常态大数**，健康会话也会一直涨 —— 绝不可用「不是 0 的那一格」找卡住处，那会把正常滚动
+      //   误判成「卡在阈值闸」。正确读法 = ① 取**两次回传的差值**；② 只看嫌疑格
+      //   busy/empty/nochap/tailnext/tailmi/backoff/stale/err 的增量；③ 同时看 rsn= 的短标签。
+      // rsn = 最后一次 return 的短标签（含 appendFromBottom 首道闸四档 abNotWeb/abLoad/abBusy/abEmpty）。
+      // n/pi/gapA/atE = 那一刻的 cells 长度 / pageIndex / 距流末格差 / isAtEnd（验证「阈值闸在贴底时
+      // 是否真的关死」这条假设）；cw/chs = 当前章下标 / chapters 长度；tail = 末格 chIdx/章内页码/章总页数。
+      // drv = 五个驱动器调用次数，**顺序 = sidx/reach/stop/smooth/retry**（stop 是第三位，不是第二位）。
+      //   ★ drvReach ≤ re=：reach 之后还要过 240ms 触摸闸与 isAtEnd 闸才 +1，所以它**不该**等于 st=。
+      //   st= 与 drv 第三位（stop）同源同闸，二者恒等属**冗余**、不构成交叉校验。
+      //   五位量纲不同（帧/次/次/次/次），**不可相加**。
+      // ★ 判代键 = gb= 与 sw=（s35 包内二者均不存在）。
+      // rt = 补拍链（arm/exhaust/poke，原先零读数）；st = onWebtoonScrollStop 进入次数。
+      ' gb=' + ReaderDiag.apNotWeb + '/' + ReaderDiag.apBusy + '/' + ReaderDiag.apEmpty + '/' +
+      ReaderDiag.apNoChap + '/' + ReaderDiag.apLast + '/' + ReaderDiag.apTailNext + '/' +
+      ReaderDiag.apTailMi + '/' + ReaderDiag.apThresh + '/' + ReaderDiag.apBackoff + '/' +
+      ReaderDiag.apStale + '/' + ReaderDiag.apErr +
+      ' rsn=' + (ReaderDiag.apReason.length === 0 ? '-' : ReaderDiag.apReason) +
+      ' n=' + ReaderDiag.apN +
+      ' pi=' + ReaderDiag.apPi +
+      ' gapA=' + ReaderDiag.apGapA +
+      ' atE=' + ReaderDiag.apAtEnd +
+      ' cw=' + ReaderDiag.apCurCh +
+      ' chs=' + ReaderDiag.apChapterCount +
+      ' tail=' + ReaderDiag.apTailCh + '/' + ReaderDiag.apTailPg + '/' + ReaderDiag.apTailTotal +
+      ' drv=' + ReaderDiag.drvSidx + '/' + ReaderDiag.drvReach + '/' + ReaderDiag.drvStop + '/' +
+      ReaderDiag.drvSmooth + '/' + ReaderDiag.drvRetry +
+      ' rt=' + ReaderDiag.retryArm + '/' + ReaderDiag.retryExhaust + '/' + ReaderDiag.retryPoke +
+      ' st=' + ReaderDiag.stopHits;
   }
 }
 
@@ -858,7 +1061,11 @@ function briefForScreen(msg: string, fallback: string): string {
     return fallback;
   }
   const cut: number = s.indexOf(FULL_OPEN_PAREN);
-  if (cut > 0) {
+  // ★ s37 红队取证后改 `> 0` → `>= 0`（与 util/ErrText.ets:171、pages/PluginLoginPage.ets:98 同步）：
+  //   括号在**句首**时 indexOf 返回 0，`> 0` 不成立 ⇒ 整串原样放行，直接违反「屏上不得含全角左括号」
+  //   这条验收判据。复现（红队实跑）：briefForScreen('（内部）章节不可用','FB') 旧版原样返回带括号串。
+  //   改成 >= 0 后句首括号被砍成空串，由紧随的空判接住 → 回兜底句。
+  if (cut >= 0) {
     s = s.substring(0, cut).trim();
   }
   if (s.length === 0 || s.length > BRIEF_MAX) {
@@ -881,7 +1088,11 @@ function looksTechnical(s: string): boolean {
   if (s.indexOf('@ohos.') >= 0 || s.indexOf('@hms.') >= 0 || s.indexOf('@kit.') >= 0) {
     return true;
   }
-  const marks: string[] = ['.ets', '.ts', '.js', '.dart', '.so', '.json', '/data/', '/storage/'];
+  // s37 红队取证后补 'http','HTTP'（此前只 8 项，与 util/ErrText.ets:138 及
+  // pages/PluginLoginPage.ets:123 漂移）：阅读页原来会把这三种串**原样上屏** ——
+  // `请求失败 HTTP 404` / `HTTP 500 服务器错误` / `返回 http 协议异常`；ErrText 侧已全洗成定死人话。
+  // 登录页 s16 第 1 条那条「屏上不能出现 http 字样」的验收判据当时没回灌到阅读器，这里补上。
+  const marks: string[] = ['.ets', '.ts', '.js', '.dart', '.so', '.json', '/data/', '/storage/', 'http', 'HTTP'];
   for (let i = 0; i < marks.length; i++) {
     if (s.indexOf(marks[i]) >= 0) {
       return true;
@@ -1940,6 +2151,18 @@ export struct ReaderView {
   private static readonly PREFETCH_AHEAD: number = 6;
   private static readonly PREFETCH_BEHIND: number = 2;
   /**
+   * s37 A1：预取腿同时允许的在途条数上限（活体闸门）。
+   * 为什么是 3（不是 9、不是 1）：3(a) 卡顿的现场形态是**三条腿互不认识地同时发车** ——
+   * 行组件那批由 LazyForEach 活组件数决定（纵向档约 10 个，动它等于动渲染，本批不动），
+   * 预取这条 for 循环内不 await ⇒ 一次 9 条，封面腿再叠 1 条 ⇒ 最坏约 19 条在途，
+   * 每条链上还有三处同步整文件 IO（readFile/writeFile/deleteFile）。
+   * 3 = 与 PREFETCH_BEHIND 同量级、且明显小于「一次扇出 9」：快翻时 3 条足够覆盖「正在翻的那一页
+   * 之后紧接着的两页」，再多的预取只是在拥塞期跟可见页抢同一条通道（预取的收益前提是"闲时预取"，
+   * 拥塞时它反而在推迟可见页）。刻意不做成可配置：闸门值一旦可配，就要连带解释"配大了谁兜底"。
+   * 闸门只管预取这条腿 ⇒ 退化面只有 17 号行 pre= 的后两档，不碰黑段修复、不碰自愈、不碰行 load。
+   */
+  private static readonly PREFETCH_LIVE_MAX: number = 3;
+  /**
    * LazyForEach 的 cachedCount（s16 第 2 条丙同一折算口径，取代原先的 3）：
    * 按上面一行 452 到 556 vp 折，4 行一侧 ≈ 1.8 到 2.2 屏，与上游 2 屏缓存量级一致，
    * 两侧合计约 4 屏；活组件数 = 可见 2 行加两侧各 4 = 约 10 个，位图数仍在 ImageCache
@@ -2231,6 +2454,7 @@ export struct ReaderView {
       // 推的东西全在闸门里，重复调用无副作用，所以这里只加一道时间节流。
       if (now - this.lastSmoothEndPokeAt >= ReaderView.SMOOTH_END_POKE_MS) {
         this.lastSmoothEndPokeAt = now;
+        ReaderDiag.drvSmooth += 1;
         this.appendFromBottom();
         this.webtoonFallbackSwitch();
       }
@@ -2998,6 +3222,7 @@ export struct ReaderView {
     // s31 第 2 条 A：这条只覆盖「跨页那一帧」。人停在最后一屏不再跨页时它一次都不响，
     // 于是最该接下一章的位置反而永远问不到 ⇒ 另加 onReachEnd 这条腿（两者共用同一批闸门，
     // appendFromBottom 只多一道节流与封顶），不会重复发请求。
+    ReaderDiag.drvSidx += 1;
     this.tryAppendNextChapter();
   }
 
@@ -3029,6 +3254,7 @@ export struct ReaderView {
       return;
     }
     this.touchRecheckRounds = 0;
+    ReaderDiag.drvReach += 1;
     this.appendFromBottom();
   }
 
@@ -3042,7 +3268,9 @@ export struct ReaderView {
     if (!this.isWebtoon() || this.loading || this.pageCount() === 0) {
       return;
     }
+    ReaderDiag.stopHits += 1;
     this.touchRecheckRounds = 0;
+    ReaderDiag.drvStop += 1;
     this.appendFromBottom();
     this.webtoonFallbackSwitch();
   }
@@ -3114,9 +3342,11 @@ export struct ReaderView {
       return;
     }
     if (this.touchRecheckRounds >= ReaderView.WEBTOON_RECHECK_MAX_ROUNDS) {
+      ReaderDiag.retryExhaust += 1;
       return;
     }
     this.touchRecheckRounds = this.touchRecheckRounds + 1;
+    ReaderDiag.retryArm += 1;
     this.touchBottomRetryTimer = setTimeout((): void => {
       this.touchBottomRetryTimer = -1;
       if (!this.isWebtoon() || this.loading || this.pageCount() === 0) {
@@ -3127,6 +3357,8 @@ export struct ReaderView {
         return;
       }
       if (this.webtoonScroller.isAtEnd()) {
+        ReaderDiag.retryPoke += 1;
+        ReaderDiag.drvRetry += 1;
         this.appendFromBottom();
         this.webtoonFallbackSwitch();
         return;
@@ -3155,6 +3387,8 @@ export struct ReaderView {
    */
   private appendFromBottom(): void {
     if (!this.isWebtoon() || this.loading || this.seamlessAppending || this.pageCount() === 0) {
+      // s36 纯探针：四种子原因合到一枚 last 标签（不新增四个计数，避免面板膨胀）
+      ReaderDiag.apReason = this.isWebtoon() ? (this.loading ? 'abLoad' : (this.seamlessAppending ? 'abBusy' : 'abEmpty')) : 'abNotWeb';
       return;
     }
     const last: PageRef = this.cells[this.cells.length - 1];
@@ -3180,14 +3414,20 @@ export struct ReaderView {
    * 直接走内存/磁盘命中，不再临到眼前才发请求。窗口口径与折算见 PREFETCH_AHEAD 注释。
    * 四条刻意的约束：
    * ① 只在 isReady() 为真时发（数据层没就绪时 loadPage 会直接记一次 pageFailed，那是假失败）；
-   * ② 跳过 ReaderDiag.isInFlight 的地址 —— ImageCache 目前没有「在途去重」（那是 cache-fix 那条
-   *   并行改的事，不属我写域），不去重就会出现「行组件正在取 + 预取又取同一条」的真重复请求，
-   *   把 16 号行 imageChain 的 pageCalls 打成对不上账的数；
+   * ② 跳过 ReaderDiag.isInFlight 的地址 —— 这条判重管的是**页身份**（同一页正在被行组件取就不必再发），
+   *   s37 A2 起 ImageCache 内部另有一层**同键**在途合并（16 号行 mg= 读数）；两层不重复也不互替：
+   *   判重省的是「明知在途还发一次」，合并兜的是「同一页在 ImageCache 内部同键撞车」，
+   *   且合并只在键算得一致时生效（哨兵地址图源的键含 intent），判重按 url 判在哨兵源上仍会整章废，
+   *   所以 ② 一个字都不能撤。
    * ③ 结果整个吞掉：预取的产物只有「缓存里多了一条」这一个作用，成功不必提，失败也不许冒泡
    *   到界面（行自己的 load 会给出唯一的失败口径，两处上屏 = 用户看到两次报错）；
+   *   s37 A1 起两条回调还要各调一次 onPrefetchSettled() 回退闸门计数（成功失败都得退，否则闸门只涨不落）。
    * ④ 记 prefetchTotal（诊断 17 号行的 pre= 字段）：ImageCache 没有「只预取不计数」的入口，
    *   loadPage 每次进来都在入口自增 pageCalls，所以 pre= 是把 16 号行 pageCalls 与真实
    *   用户可见取图量对回去的唯一换算项。
+   * ⑤ s37 A1 新增：在途满 PREFETCH_LIVE_MAX 就整轮 break（拥塞时不再扇出）。第一档 pre 的语义
+   *   一字未动，闸门拦掉的条数**不进** prefetchTotal（它是"发起数"，没发起就不该计），
+   *   所以闸门生效后 pageCalls 会比改前小 —— 与 16 号行对账时按"发起数"读，不要按"窗口页数"读。
    */
   /** 第 index 页（0 起）的取图入参；越界或该图源没给 = 空串（ImageCache 空串不参与键） */
   private extAt(index: number): string {
@@ -3272,6 +3512,31 @@ export struct ReaderView {
     return pageSizeKey(this.chapterIdAt(index), this.pageNoAt(index));
   }
 
+  /**
+   * s37 A1：预取一条链路收尾（成功与失败都走这里，所以两条回调各调一次、闸门必然回退）。
+   * 递减后不做「补发」：本轮没发出去的预取，下一次翻页回调（prefetchAround 有四个调用点）
+   * 会重新按窗口算一遍 —— 补发等于在本轮里再造一次扇出，与闸门目的相反。
+   */
+  private onPrefetchSettled(): void {
+    if (ReaderDiag.prefetchLive > 0) {
+      ReaderDiag.prefetchLive -= 1;
+    }
+  }
+
+  private prefetchOne(url: string, chapterId: string, ext: string): void {
+    ReaderDiag.prefetchLive += 1;
+    if (ReaderDiag.prefetchLive > ReaderDiag.prefetchLivePeak) {
+      ReaderDiag.prefetchLivePeak = ReaderDiag.prefetchLive;
+    }
+    ImageCache.getInstance().loadPage(url, this.sourceId, chapterId, ext)
+      .then((): void => {
+        this.onPrefetchSettled();
+      })
+      .catch((): void => {
+        this.onPrefetchSettled();
+      });
+  }
+
   private prefetchAround(index: number): void {
     const n: number = this.pageCount();
     if (n === 0 || !ImageCache.getInstance().isReady()) {
@@ -3286,6 +3551,13 @@ export struct ReaderView {
       to = n - 1;
     }
     for (let i = from; i <= to; i++) {
+      // s37 A1 活体闸门：放在循环最前面（不是在 isInFlight 判重之后）—— 语义是「本轮到此为止」
+      // 而不是「这一条跳过」：拥塞时后面的页同样要等，逐条 continue 只会把 9 次判重的开销白花。
+      // 用 break 不用 return：保持函数出口单一（循环之外将来若加收尾逻辑不会被绕过）。
+      if (ReaderDiag.prefetchLive >= ReaderView.PREFETCH_LIVE_MAX) {
+        ReaderDiag.prefetchGated += 1;
+        break;
+      }
       const u: string = this.urlAt(i);
       // 判重按页身份（与行内 load 同一个键）：按 url 判在哨兵地址图源上会把整章当成一条在途，
       // 预取整章静默全废。身份一律走 pageKeyAt —— 无缝转场后邻章的格子混在同一条流里，
@@ -3295,9 +3567,7 @@ export struct ReaderView {
         continue;
       }
       ReaderDiag.prefetchTotal += 1;
-      ImageCache.getInstance().loadPage(u, this.sourceId, this.chapterIdAt(i), this.extAt(i))
-        .then((): void => {})
-        .catch((): void => {});
+      this.prefetchOne(u, this.chapterIdAt(i), this.extAt(i));
     }
   }
 
@@ -3540,22 +3810,37 @@ export struct ReaderView {
    * 追加成功后**不改 pageIndex、不改进度、不停自动阅读**，只补一轮预取。
    */
   private tryAppendNextChapter(): void {
+    // s36 纯探针：进闸前的原始量与贴底判定，只写 last 值，不参与任何控制流
+    ReaderDiag.apN = this.cells.length;
+    ReaderDiag.apPi = this.pageIndex;
+    ReaderDiag.apGapA = this.cells.length - 1 - this.pageIndex;
+    ReaderDiag.apAtEnd = this.webtoonScroller.isAtEnd() ? 1 : 0;
+    ReaderDiag.apCurCh = this.chapterIndex;
+    ReaderDiag.apChapterCount = this.chapters.length;
     if (!this.isWebtoon() || this.seamlessAppending) {
+      ReaderDiag.noteSeamless(this.isWebtoon() ? 'apBusy' : 'apNotWeb', 0);
       return;
     }
     const n: number = this.cells.length;
     if (n === 0 || this.chapterIndex < 0) {
+      ReaderDiag.noteSeamless(n === 0 ? 'apEmpty' : 'apNoChap', 0);
       return;
     }
     const nextIdx: number = this.chapterIndex + 1;
     if (nextIdx >= this.chapters.length) {
+      ReaderDiag.noteSeamless('apLast', 0);
       return;
     }
     const cur: PageRef = this.cells[n - 1];
+    ReaderDiag.apTailCh = cur.chIdx;
+    ReaderDiag.apTailPg = cur.pageNo;
+    ReaderDiag.apTailTotal = cur.pageTotal;
     if (cur.chIdx >= nextIdx) {
+      ReaderDiag.noteSeamless('apTailNext', 0);
       return;
     }
     if (cur.chIdx !== this.chapterIndex) {
+      ReaderDiag.noteSeamless('apTailMi', 0);
       return;
     }
     // ★ s32 第 3 条修正（审计⑤）：原先这道阈值闸写成「cur.pageTotal - 末格页码 >= AHEAD」，
@@ -3563,11 +3848,13 @@ export struct ReaderView {
     // 结果是「进章第 2 页就预拉邻章」，弱网下跨一百多页能发两百次请求（阈值形同虚设）。
     // 正确量纲 = 「当前读到的那一页距这条流的末尾还有几格」，与 pageIndex 挂钩而不是与流末格挂钩。
     if (n - 1 - this.pageIndex >= ReaderView.SEAMLESS_APPEND_AHEAD) {
+      ReaderDiag.noteSeamless('apThresh', 0);
       return;
     }
     // s32 第 3 条：失败退避（原先失败即忘，见 lastSeamlessFailAt）
     const nowMs: number = Date.now();
     if (this.lastSeamlessFailAt > 0 && nowMs - this.lastSeamlessFailAt < ReaderView.SEAMLESS_FAIL_BACKOFF_MS) {
+      ReaderDiag.noteSeamless('apBackoff', 0);
       return;
     }
     ReaderDiag.noteSeamless('call', 0);
@@ -3581,6 +3868,7 @@ export struct ReaderView {
       }
       // 二次确认：异步回来的这一刻用户可能已经通过 TOC 切了章，那这批格子就是过期的
       if (this.chapterIndex !== cur.chIdx || this.cells.length !== n) {
+        ReaderDiag.noteSeamless('apStale', 0);
         return;
       }
       this.lastSeamlessFailAt = 0;
@@ -3590,6 +3878,7 @@ export struct ReaderView {
       // onScrollIndex 才有机会被取，这里补一次让它更早进内存（幂等，isInFlight 会去重）
       this.prefetchAround(this.pageIndex);
     }).catch((): void => {
+      ReaderDiag.noteSeamless('apErr', 0);
       this.seamlessAppending = false;
     });
   }
@@ -3616,12 +3905,14 @@ export struct ReaderView {
   private prevPage(): void {
     if (this.pageIndex > 0) {
       this.swiperController.showPrevious();
+      ReaderDiag.swCtrl += 1;
     }
   }
 
   private nextPage(): void {
     if (this.pageIndex < this.pageCount() - 1) {
       this.swiperController.showNext();
+      ReaderDiag.swCtrl += 1;
       return;
     }
     // s31 第 2 条 B：已在最后一页还往「继续」那一侧点 = 意图明确 ⇒ 真接下一章。
@@ -4048,6 +4339,7 @@ export struct ReaderView {
           .scale({ x: this.zoomScale, y: this.zoomScale })
           .translate({ x: this.offsetX, y: this.offsetY })
           .onChange((index: number) => {
+            ReaderDiag.swChanges += 1;
             this.pageIndex = index;
             // 横向档同样预取（它是一页一屏，窗口 6 页 = 6 屏，比纵向档更该预取）
             this.prefetchAround(index);
@@ -4055,6 +4347,50 @@ export struct ReaderView {
             this.offsetX = 0;
             this.offsetY = 0;
             this.saveProgress();
+          })
+          // ---- s36 纯探针：横向档被 clamp 的那一下到底有没有可观测回调（只观测，不改变行为）----
+          // 设计约束（本机 SDK 已核实 swiper.d.ts）：① 回调必须恒 return true —— 返回 false 是
+          // 「本帧禁止滚动」的逐帧闸门，会改变被观测行为本身；② 只在「已在末页」时累加，
+          // 否则逐帧回调会把计数灌爆；③ swiperController.showNext/showPrevious 驱动的翻页
+          // **不会**喂这些回调（swiper.d.ts fakeDrag 段 NOTE），所以另记 swCtrl 做分母，
+          // 用户硬滑 ≈ swChanges − swCtrl。
+          .onContentWillScroll((result: SwiperContentWillScrollResult): boolean => {
+            // s36b 1b：不带闸门的总数，必须在闸门之前、回调最顶部（判「框架对 clamp 静默」的分母）。
+            ReaderDiag.cwsTotal += 1;
+            const n: number = this.pageCount();
+            if (n > 0 && this.pageIndex >= n - 1) {
+              ReaderDiag.cwsHits += 1;
+              ReaderDiag.cwsLastCur = result.currentIndex;
+              ReaderDiag.cwsLastComing = result.comingIndex;
+              ReaderDiag.cwsLastOffset = result.offset;
+              if (result.offset < 0) {
+                ReaderDiag.cwsNeg += 1;
+              } else if (result.offset > 0) {
+                ReaderDiag.cwsPos += 1;
+              }
+            }
+            return true;
+          })
+          .onGestureSwipe((_index: number, _extraInfo: SwiperAnimationEvent): void => {
+            // s36b 1b：不带闸门的总数（方法体第一行）。
+            ReaderDiag.gsTotal += 1;
+            const n: number = this.pageCount();
+            if (n > 0 && this.pageIndex >= n - 1) {
+              ReaderDiag.gsHits += 1;
+            }
+          })
+          .onContentDidScroll((_selectedIndex: number, _index: number, _position: number,
+            _mainAxisLength: number): void => {
+            const n: number = this.pageCount();
+            if (n > 0 && this.pageIndex >= n - 1) {
+              ReaderDiag.cdsHits += 1;
+            }
+          })
+          .onScrollStateChanged((_state: ScrollState): void => {
+            const n: number = this.pageCount();
+            if (n > 0 && this.pageIndex >= n - 1) {
+              ReaderDiag.sscHits += 1;
+            }
           })
         }
       }

@@ -38,6 +38,7 @@ import { PLUGIN_SOURCE_PREFIX, PluginSourceAdapter } from './PluginSourceAdapter
 import { MangaSummary, newMangaSummary } from '../model/Models';
 import { jstr, jbool, jint, jarr, jobj, jhas, jisEmpty, jparse } from '../../util/JsonUtil';
 import { bundleCall } from '../../util/PluginRuntime';
+import { errBriefForScreen, errLog, errTextOf } from '../../util/ErrText';
 import { Logger } from '../../util/Logger';
 
 /**
@@ -464,7 +465,10 @@ export class PluginDetail {
     try {
       o = await ad.callExt('评论区加载失败', 'getCommentFeed', a);
     } catch (e) {
-      feed.error = (e as Error).message;
+      // s37 需求 2：原始串只进日志，error 给一句人话（页面直接把它铺到 ErrorView 上）。
+      const raw: string = errTextOf(e);
+      errLog('[PluginDetail] comments', raw);
+      feed.error = errBriefForScreen(raw, '评论区加载失败，请稍后重试');
       return feed;
     }
     const data: ESObject = jobj(o, 'data');

@@ -38,6 +38,7 @@ import { MangaRepository } from '../data/db/MangaRepository';
 import { ImageCache } from '../data/image/ImageCache';
 import { MangaSummary, ChapterInfo, ReadProgress, SourceInfo } from '../data/model/Models';
 import { TextConvert } from '../util/TextConvert';
+import { errBriefForScreen, errLog, errTextOf } from '../util/ErrText';
 
 /** 章节区一次显示多少条（其余靠「展开全部」）。 */
 const CHAPTER_PREVIEW: number = 20;
@@ -315,7 +316,10 @@ struct DetailPage {
     try {
       m = await src.fetchDetail(this.mangaId);
     } catch (e) {
-      this.loadError = (e as Error).message;
+      // s37 需求 2：原始串（含 stack-hook / bundle: / fn: / args:）只进日志，屏上给一句人话。
+      const raw: string = errTextOf(e);
+      errLog('[Detail] fetchDetail', raw);
+      this.loadError = errBriefForScreen(raw, '作品详情加载失败，请稍后重试');
     }
     if (m !== null) {
       // 插件常不回填 sourceId ⇒ 以调用方传的为准（书架/进度都按它键控）
@@ -360,7 +364,7 @@ struct DetailPage {
     this.loadCover();
 
     if (m === null && this.loadError.length === 0) {
-      this.loadError = '该图源未返回作品信息';
+      this.loadError = '没有找到这部作品，该图源可能已下架';
     }
     this.loading = false;
   }
@@ -742,7 +746,14 @@ struct DetailPage {
         LoadingView({ text: '正在加载作品信息…' })
           .layoutWeight(1)
       } else if (this.loadError.length > 0 && this.manga === null) {
-        ErrorView({ msg: this.loadError })
+        // s37：StateViews.ErrorView 的 onRetry 默认是空函数而「重试」按钮恒画 ⇒ 必须显式传，
+        // 否则用户点重试毫无反应（用户截图里那枚蓝按钮就是这个缺陷）。
+        ErrorView({
+          msg: this.loadError,
+          onRetry: (): void => {
+            this.reload();
+          }
+        })
           .layoutWeight(1)
       } else {
         Scroll() {
