@@ -1,6 +1,6 @@
 # Breeze-ohos
 
-> ## ⚠ 先说明一件事：上游官方已支持 HarmonyOS NEXT
+> ## ⚠ 上游官方已支持 HarmonyOS NEXT
 >
 > **上游 Breeze 自 v3.1.0（2026-11-21 发布）起官方支持 HarmonyOS NEXT，并直接发布鸿蒙 HAP 安装包**（`Breeze-ohos-arm64-v3.1.0.hap`，即上游把自家 Flutter 代码编译到 OHOS 产出的官方包）。**本项目与那个官方包不是同一个东西**：
 >
