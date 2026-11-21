@@ -62,6 +62,93 @@ class SourceOutcome {
 }
 
 /**
+ * s39 需求 1（用户原话「报错不够简洁，例如域名无法解析在同一报错界面上产生了多次」）：
+ * 一组「同一句原因 + 命中它的那些源名」。类承载，避开 ArkTS 裸对象字面量限制。
+ */
+class ErrReasonGroup {
+  reason: string = '';
+  names: string[] = [];
+}
+
+/** 同因源名最多并列这么多个，再多折叠成「等 N 个源」（partialMsg 只有两行余量）。 */
+const ERR_GROUP_NAME_MAX: number = 3;
+
+/**
+ * s39：把各源的失败按**原因文本**分组后拼成一句话。
+ * 为什么必须做 = 多源并行搜索下同因失败极其常见（断网时所有源都卡在同一步），旧写法
+ * `errs.push(o.name + '：' + o.err)` + `join('；')` 会把同一句人话**逐源复制 N 遍**，
+ * 铺满 ErrorView（Text 无 maxLines）与 partialMsg（maxLines(2) + 截 120 字），
+ * 重复本身还会把「到底哪些源失败了」挤出可视区。
+ * 分组口径 = 上屏文案逐字相同（:450 / :600 两处已经过 errBriefForScreen，同一档位出来的
+ * 就是同一个定死串，所以「同句 = 同因」在这里成立）。首次出现次序保持，观感稳定。
+ * 呈现：单源组 = `源名：原因`（与旧版一致）；多源组 = `原因（源1、源2、源3 等 5 个源）`
+ * —— 原因只出现一次。括号用全角：本串**不经** errBriefForScreen，不会被「砍括号」那步截断。
+ */
+function groupFailures(fails: SourceOutcome[]): string {
+  const groups: ErrReasonGroup[] = [];
+  for (let i = 0; i < fails.length; i++) {
+    const reason: string = fails[i].err;
+    let hit: ErrReasonGroup | null = null;
+    for (let k = 0; k < groups.length; k++) {
+      if (groups[k].reason === reason) {
+        hit = groups[k];
+        break;
+      }
+    }
+    if (hit === null) {
+      const g: ErrReasonGroup = new ErrReasonGroup();
+      g.reason = reason;
+      groups.push(g);
+      hit = g;
+    }
+    hit.names.push(fails[i].name);
+  }
+  const parts: string[] = [];
+  for (let i = 0; i < groups.length; i++) {
+    const g: ErrReasonGroup = groups[i];
+    if (g.names.length === 1) {
+      parts.push(g.names[0] + '：' + g.reason);
+      continue;
+    }
+    let who: string = g.names.slice(0, ERR_GROUP_NAME_MAX).join('、');
+    if (g.names.length > ERR_GROUP_NAME_MAX) {
+      who = who + ' 等 ' + g.names.length + ' 个源';
+    }
+    parts.push(g.reason + '（' + who + '）');
+  }
+  return parts.join('；');
+}
+
+/**
+ * s39：截断时不把闭括号截破（红队指出 slice(0,160/120) 会落在某组括号内部，留下半个括号
+ * 像坏掉的句子）。策略 = 截点若落在「（…」里，整组退回去，宁少一组源名也不留半括号。
+ * 退回去就空了（只有一组且超长）时退回旧口径整段截断 —— 那种情况信息比半个括号重要。
+ */
+function capFailures(s: string, cap: number): string {
+  if (s.length <= cap) {
+    return s;
+  }
+  const cut: string = s.slice(0, cap);
+  const lastOpen: number = cut.lastIndexOf('（');
+  const lastClose: number = cut.lastIndexOf('）');
+  if (lastOpen > lastClose) {
+    let kept: string = cut.slice(0, lastOpen);
+    if (kept.length > 0 && kept.charAt(kept.length - 1) === '；') {
+      kept = kept.slice(0, kept.length - 1);
+    }
+    if (kept.length > 0) {
+      return kept + '…';
+    }
+  }
+  // 退回整段截断时也别留个尾部分隔号（'…；' 这种尾巴读起来像没写完）
+  let tail: string = cut;
+  if (tail.length > 0 && tail.charAt(tail.length - 1) === '；') {
+    tail = tail.slice(0, tail.length - 1);
+  }
+  return tail + '…';
+}
+
+/**
  * s33 需求 2：每个源各自的翻页状态。
  * ★ 为什么按源存而不是全局存一个页码：聚合搜索是 N 个源拼成一列（doSearch 并发聚合），
  *   各源页数与游标互不相干，全局页码会让第二页只有「最后一个源」在推进、其余源重复第 1 页。
@@ -665,7 +752,9 @@ struct SearchPage {
       }
       const outs: SourceOutcome[] = await Promise.all(jobs);
       const merged: MangaSummary[] = [];
-      const errs: string[] = [];
+      // s39：errs: string[] → fails: SourceOutcome[]。旧数组存的是「源名：原因」拼好的串，
+      // 拼完就没法再按原因归并了；改存原始出参，交给 groupFailures 在聚合那一步分组。
+      const fails: SourceOutcome[] = [];
       const pgs: SourcePaging[] = [];
       let okCount: number = 0;
       for (let i = 0; i < outs.length; i++) {
@@ -681,7 +770,7 @@ struct SearchPage {
         p.extern = o.extern;
         pgs.push(p);
         if (o.err.length > 0) {
-          errs.push(o.name + '：' + o.err);
+          fails.push(o);
         } else {
           okCount++;
           for (let k = 0; k < o.items.length; k++) {
@@ -690,13 +779,15 @@ struct SearchPage {
         }
       }
       this.pagings = pgs;
-      if (merged.length === 0 && errs.length > 0 && okCount === 0) {
-        // 全失败 ⇒ ErrorView，文案带失败源（截断防爆行）
-        const j: string = errs.join('；');
+      if (merged.length === 0 && fails.length > 0 && okCount === 0) {
+        // 全失败 ⇒ ErrorView，文案带失败源（s39：同因先归并再截断，防爆行）
+        const j: string = groupFailures(fails);
         this.animContent((): void => {
           this.items = [];
           this.moreState = '';
-          this.errorMsg = '搜索失败（' + j.slice(0, 160) + '）';
+          // s39：外层由「搜索失败（…）」改成「搜索失败：」—— 分组后内层自带一组全角括号
+          // （原因（源1、源2 等 N 个源）），再套一层就成了括号套括号，读起来像坏掉的句子。
+          this.errorMsg = '搜索失败：' + capFailures(j, 160);
         });
       } else {
         let anyOpen: boolean = false;
@@ -711,7 +802,7 @@ struct SearchPage {
         }
         this.animContent((): void => {
           this.items = merged;
-          this.partialMsg = errs.length > 0 ? ('部分源失败：' + errs.join('；').slice(0, 120)) : '';
+          this.partialMsg = fails.length > 0 ? ('部分源失败：' + capFailures(groupFailures(fails), 120)) : '';
           // 底部行只在有结果时出现（空结果走 EmptyView，那已经是「没有更多」的意思）
           // 同理 s34：失败源存在时最终要给 'fail'（那一行带「重新加载」按钮），别报「没有更多了」。
           //   jm 首屏超时、pic 出结果的组合在真机很常见，旧写法这时底部只有「继续下滑加载更多」

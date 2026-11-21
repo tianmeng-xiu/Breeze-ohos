@@ -912,9 +912,9 @@ export struct PluginManagerView {
     if (iconPatched.length > 0) {
       await this.persistIconBackfill(iconPatched);
     }
-    if (this.lastError.length > 0) {
-      this.toast('插件目录读取失败：' + this.lastError);
-    }
+    // s39 需求 1：这里原来还弹一枚 toast（'插件目录读取失败：' + lastError），与 build 里
+    // :1442 那行常驻红字是**同一句话在同一屏上出现两次**（一次飘一次常驻）。常驻那行是更该留的
+    // 形态（不转瞬即逝、可逐字读），所以删 toast，只留常驻行。lastError 本身照旧写、照旧清。
   }
 
   /**

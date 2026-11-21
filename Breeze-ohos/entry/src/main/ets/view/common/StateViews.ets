@@ -74,6 +74,11 @@ export struct ErrorView {
         .fontColor(Theme.text2(this.isDark))
         .textAlign(TextAlign.Center)
         .padding({ left: 32, right: 32 })
+        // s39 需求 1：这里原先没有任何行数上限，聚合出来的长报错会把整屏铺满、把「重试」
+        // 按钮顶出可视区（用户截图那种形态）。四行 = 一句定死文案（最长 21 字）外加两三组
+        // 原因绰绰有余，再多就是没用的重复，超出部分省略号收尾。
+        .maxLines(4)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
       Button('重试')
         .fontSize(14)
         .fontColor(Theme.white)

@@ -219,7 +219,12 @@ const NET_WORDS: string[] = [
   'offline', 'connection reset', 'socket hang up', 'econnreset', 'refused to connect', 'eof',
   'broken pipe', 'proxy', 'ssl', 'tls', 'certificate', 'handshake', 'http2', 'too many redirects',
   '网络', '超时', '连接', '断网', '离线', '重定向', '代理', '证书', '域名解析', '解析域名',
-  '请求已取消', '请求取消'
+  '请求已取消', '请求取消',
+  // ★ s39 与 util/ErrText.ets 的 NET_WORDS 同步补（用户反馈「域名无法解析在同一报错界面上
+  //   产生了多次」）：下面三条收窄纪律照旧成立，补的都是完整短语，不收裸词。
+  '域名无法解析', '无法解析该域名', '无法解析地址', '地址解析失败',
+  'no such host', 'name or service not known', 'nodename nor servname',
+  'failed to lookup address', 'network is unreachable', 'no route to host'
 ];
 // 三处刻意收窄（探针实测出来的假阳，别改回宽口径）：
 // - 不收裸「解析」：插件自撰文案「解析响应失败 / 返回体解析失败」是解析坏数据，不是 DNS，

@@ -307,7 +307,9 @@ struct DetailPage {
     }
     const src: MangaSource | null = SourceManager.getInstance().get(this.sourceId);
     if (src === null) {
-      this.loadError = '该图源已不可用（可能插件被停用或删除）';
+      // s39：改成不带全角括号的短句，与 util 里各档定死文案同一形态（纪律 = 上屏短句不带括号，
+      // 免得将来被哪一步「砍括号」逻辑截成半句；这条原本不经 util 所以不违规，只是形态不统一）。
+      this.loadError = '该图源已不可用，可能插件被停用或已删除，请换一个图源';
       this.loading = false;
       return;
     }

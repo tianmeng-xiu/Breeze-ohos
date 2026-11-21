@@ -113,7 +113,17 @@ const NET_WORDS: string[] = [
   'offline', 'connection reset', 'socket hang up', 'econnreset', 'refused to connect', 'eof',
   'broken pipe', 'proxy', 'ssl', 'tls', 'certificate', 'handshake', 'http2', 'too many redirects',
   '网络', '超时', '连接', '断网', '离线', '重定向', '代理', '证书', '域名解析', '解析域名',
-  '请求已取消', '请求取消'
+  '请求已取消', '请求取消',
+  // ★ s39 补（用户反馈「域名无法解析在同一报错界面上产生了多次」）：上面两枚中文词是
+  //   「域名解析 / 解析域名」这一种**固定词序**，插件与 Rust 侧的「域名无法解析」这类
+  //   变体一律不中 ⇒ 落到 unknown，再被 briefForScreen 当「短且干净的中文」原样放行上屏；
+  //   多源并行时同一句就被逐源复制 N 遍。补的都是**完整短语**，不收裸「无法解析」/裸
+  //   「解析」—— 那两条会把「JSON 解析失败」「设置数据解析失败」这类业务文案误报成网络问题
+  //   （假阳教训的原始出处见 pages/PluginLoginPage.ets :224-228 同源注释）。
+  //   ★ 必须与 PluginLoginPage.ets 那份拷贝一起改（见那边同名注释），否则两份分叉。
+  '域名无法解析', '无法解析该域名', '无法解析地址', '地址解析失败',
+  'no such host', 'name or service not known', 'nodename nor servname',
+  'failed to lookup address', 'network is unreachable', 'no route to host'
 ];
 
 /** 需要安全验证（人机校验），排在网络之前：滑块挂时文案若说网络会误导用户去查路由器。 */
