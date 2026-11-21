@@ -4,9 +4,10 @@
 >
 > **上游 Breeze 自 v3.1.0（2026-11-21 发布）起官方支持 HarmonyOS NEXT，并直接发布鸿蒙 HAP 安装包**（`Breeze-ohos-arm64-v3.1.0.hap`，即上游把自家 Flutter 代码编译到 OHOS 产出的官方包）。**本项目与那个官方包不是同一个东西**：
 >
-> - 上游官方包 = Flutter 编译到 OHOS；本项目 = ArkTS（ArkUI）+ Rust 插件引擎的**全原生重写**，两边代码与产物互不相干。
+> - 上游官方包 = 把上游自家 Flutter 代码编译到 OHOS 产出的 HAP（据上游 `docs/ohos_build.md`：`flutter build hap --target-platform ohos-arm64`）；本项目 = 从 UI 到插件引擎的 **ArkTS（ArkUI）+ Rust 原生重写**，两边代码与产物互不相干。
 > - 包名不同（上游 `com.zephyr.breeze.ohos` / 本项目 `com.breeze.ohos`），**可在同一台设备共存安装**，但数据互不相通。
-> - 若你只是想要「上游 Breeze 的鸿蒙版」，装上游官方那枚即可；**本项目存在的意义是原生形态** —— 不背 Flutter 运行时、能力覆盖与取舍不同（差在哪见下文[应用侧与上游 Breeze 的对照](#应用侧与上游-breeze-的对照)）。
+> - 那枚官方包**未签名、仅 arm64、最低 HarmonyOS 5.0.5(17)**，按上游自己的说法需要用目标设备信任的证书与 profile 自签后才能装到零售机，**OpenHarmony 测试证书装不上零售机**。本项目的包同样未签名，安装方式见[装到设备](#装到设备)。
+> - 若你只想要「上游 Breeze 的鸿蒙版」，去上游 Releases 拿那枚即可；**本项目存在的意义是原生形态** —— 不背 Flutter 运行时，能力覆盖与取舍不同（逐项差在哪见下文[应用侧与上游 Breeze 的对照](#应用侧与上游-breeze-的对照)）。
 
 HarmonyOS / OpenHarmony 原生漫画阅读器：ArkTS（ArkUI）应用 + Rust 编写的 QuickJS 插件引擎，从 Flutter 版 [Breeze](https://github.com/breeze-project-org/Breeze) 移植而来。插件 ABI、宿主桥接路由、设置页数据契约、配置桶格式等接口事实由上游行为逆向得出，在 ArkTS 与 Rust 里重新实现，未复制上游任何 Dart 源码。
 
