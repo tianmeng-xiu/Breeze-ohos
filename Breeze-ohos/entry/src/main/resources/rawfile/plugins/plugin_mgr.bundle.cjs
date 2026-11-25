@@ -37,18 +37,46 @@
  *       结果缓存在模块态；force 参数可强制重取：fetchIndex(["1"])
  *   checkUpdates(listJson)          -> {ok,results:[{uuid,local,latest,hasUpdate,assetUrl,err}],indexVia}
  *       listJson = JSON.stringify([{uuid,version},...])；只查清单里出现的 uuid。
- *   installLatest(uuid)             -> {ok,uuid,name,version,asset,bytes,sha256,savedTo,via,err,attempts,writeMode,sizeOnDisk,sizeOk}
+ *   installLatest(uuid)             -> {ok,uuid,name,version,asset,bytes,sha256,savedTo,via,err,attempts,writeMode,sizeOnDisk,sizeOk,verWarn}
+ *       verWarn = 'declared-X>got-Y'：实拿内容低于索引声明版本时非空（v1.3.0），ArkTS 侧拼进 toast 明示；
+ *       version 一律 = 胜出字节自身版本（实际内容口径，绝不用清单值冒充）。
  *       下载有序回退（v1.2.0）：npm CDN（registry latest -> release tag -> latest 别名）-> npm tarball
  *       -> release 资产代理 -> release 资产直链 -> npm CDN(清单声明版本)；release 取不到（含 404 =
  *       该仓库压根没有 Release）不再截断链路，继续往 npm 系走；
  *       落盘 <root>/plugins/<uuid前段>-<tag>.bundle.cjs，只下载不装载（装载/登记归 ArkTS）。
  * 超时红线：Rust CALL_TIMEOUT 30s ⇒ 所有多源循环共用一个 26s 预算（DL_BUDGET_MS），
  * 预算耗尽立即停止换源并在 err 里标 'budget-exhausted'，绝不让 fnPath 超时被 Rust 掐死。
+ *
+ * v1.2.0 -> v1.3.0 修的是真机「商店卡片显示 0.1.1、点下去实际装到 0.0.7」（用户 2026-11-25 report 主诉）：
+ *   根因（已取证）：v1.2.0 把 GitHub releases/latest 的 tag 当作「版本 + 下载 URL」的唯一权威 ——
+ *   ① installLatest 候选首位 pushCdn(tag,'npm-rel') 用 GitHub tag 去拼 npm CDN 路径；② checkUpdates 的
+ *   row.latest 也用 tag。可插件作者的真实发布渠道是 npm（线上索引 17 枚有 npmName 的里面，npm
+ *   dist-tags.latest == 索引 version 的有 15 枚，唯一不等的是 e-hentai 且差值方向 = npm 更新），
+ *   而 GitHub release 停在半年前 ⇒ tag=0.0.7 时打 npm 拿到 npm 上那个老 0.0.7，比 tag 新得多的 0.1.1
+ *   反而永远不会被选中。全量审查 25 枚 = 6 枚被锁旧版 + 1 枚显示低估（详见
+ *   _tmp/s41takeover/jmaudit/JM_VERSION_AUDIT.md；deretame/* 名下 15 枚 GitHub 与索引无一枚一致）。
+ *   上游 Breeze 根本不是这个口径（本轮逐文件核过，判定 = 上游有更优且现成可对齐的口径）：
+ *     · 装哪个版本  Breeze/lib/plugin/plugin_install_service.dart:46  cloudVersion = item.manifest.version.trim()
+ *                   ⇒ 索引 version，不查任何 latest，链路里压根没有 GitHub tag 这个变量
+ *     · 下载 URL    Breeze/lib/plugin/utils/plugin_cloud_download_utils.dart:155
+ *                   'npm/$npmName@$cloudVersion/dist/$npmName.bundle$ext' ⇒ npm CDN 主渠道，
+ *                   全挂才 fetchReleaseData(updateUrl) 读 asset 的 browser_download_url（从不自己拼 releases/download/<tag>/）
+ *     · 有无新版本  Breeze/lib/plugin/utils/plugin_update_channel_utils.dart:126-134 ⇒ npmName 非空即
+ *                   fetchNpmLatestVersion（npmmirror → data.jsdelivr → registry.npmjs 读 dist-tags.latest），
+ *                   只有 npmName 为空才退 updateUrl 的 tag_name
+ *   v1.3.0 四条改动：一、npmLatest 提到 releaseLatest 之前，版本权威 = maxsemver(npmTag, 索引 version, GitHub tag)；
+ *   二、候选序改 npm 权威序（bestVer → npmTag → 索引 version → latest 别名 → release tag → tarball → release 资产），
+ *   bestVer 在 npm 侧不可用时自然落回 GitHub tag ⇒ 无 npmName 的 8 枚行为逐字节不变；
+ *   三、releaseLatest(repo, npmVer) 在已拿到 npm/索引版本时跳过 releases/latest 那次 API 往返（真机 gh-proxy
+ *   不通时这 10s 正是「下载失败」本身），改为用胜出版本自拼 asset 兜底；
+ *   四、checkUpdates 同口径（npmName 非空先查 npm，tag 仅在 npm 不可用时报出），新增 verWarn 出口字段。
+ *   刻意保留：SEED 兜底路径照旧查 release（离线快照里压根没有 npmName 字段，:90-110）；
+ *             pickAsset 只吃 .cjs 不吃 .cjs.br（运行时没有 brotli 解码能力，上游有）；sha256 自算保留（上游 lib/ 零命中，我方更严）。
  */
 'use strict';
 (function () {
-  var SRC = 'plugin-mgr-0003';
-  var VERSION = '1.2.0';
+  var SRC = 'plugin-mgr-0004';
+  var VERSION = '1.3.0';
 
   // —— 端点（全部照抄上游 Flutter 在用的、且本机 curl 逐条实测过的那批）——
   var INDEX_URL = 'https://raw.githubusercontent.com/breeze-project-org/Breeze-plugin-list/main/plugins_data.json';
@@ -84,8 +112,10 @@
   var CHECK_MAX = 12;
 
   // —— 内嵌索引快照：2026-11-09 抓自 Breeze-plugin-list/plugins_data.json（权威 21 条逐字）——
-  // 注意 manifest.version 是「清单声明版本」，可能比 release tag 新（例 JmComic 清单 0.1.0 / 实际 release v0.0.7）
-  // ⇒ 安装与「有无更新」一律以 releases/latest 的 tag 为准，SEED 只当离线兜底与仓库映射表用。
+  // 注意 manifest.version 是「清单声明版本」，可能比 release tag 新（例 JmComic 清单 0.1.1 / 实际 release v0.0.7，
+  // 而 npm dist-tags.latest = 0.1.1 = 清单值 ⇒ 作者真实发布渠道是 npm，GitHub release 才是掉队的那一个）
+  // ⇒ v1.3.0 起口径反转：安装与「有无更新」以 maxsemver(npm latest, 清单 version, release tag) 为准，
+  //   release tag 退居兜底（无 npmName 的条目照旧只能靠它）；SEED 仍只当离线兜底与仓库映射表用。
   var SEED = [
     { repo: "deretame/Breeze-plugin-JmComic", name: "禁漫天堂", uuid: "bf99008d-010b-4f17-ac7c-61a9b57dc3d9", version: "0.1.0", npmName: "breeze-plugin-jm-comic", describe: "禁漫天堂插件", home: "https://github.com/deretame/Breeze-plugin-JmComic" },
     { repo: "deretame/Breeze-plugin-ManHuaGui", name: "漫画柜", uuid: "1f03ebc7-997d-494a-abb5-a06d60094f44", version: "0.1.0", npmName: "breeze-plugin-man-hua-gui", describe: "漫画柜（看漫画）繁体版源站插件", home: "https://github.com/deretame/Breeze-plugin-ManHuaGui" },
@@ -125,6 +155,17 @@
     var pa = semverParts(a), pb = semverParts(b);
     for (var i = 0; i < 3; i++) { if (pa[i] < pb[i]) return true; if (pa[i] > pb[i]) return false; }
     return false;
+  }
+  // 多路版本号取最大（v1.3.0）：npm dist-tags.latest / 索引 version / GitHub release tag 三路对拍。
+  // 上游同款自研实现见 Breeze/lib/plugin/utils/plugin_version_utils.dart（剥 v 前缀 + 分段比较，不用 pub_semver）。
+  function semverMax(list) {
+    var best = '';
+    for (var i = 0; i < list.length; i++) {
+      var v = stripV(list[i]);
+      if (!v) continue;
+      if (!best || semverLt(best, v)) best = v;
+    }
+    return best;
   }
   function safeName(s) {
     return String(s || '').toLowerCase()
@@ -294,8 +335,27 @@
     return { ok: true, total: items.length, via: via, err: via === 'seed' ? err : '', items: items };
   }
 
-  /** releases/latest：API 类 ⇒ 走 GH_API_MIRRORS（v1.0.0 漏的就是这一步）。 */
-  async function releaseLatest(repo) {
+  /**
+   * release 资产通路：API 类 ⇒ 走 GH_API_MIRRORS（v1.0.0 漏的就是这一步）。
+   * v1.3.0：第二参 npmVer 非空 ⇒ 版本已由 npm/索引侧定下，releases/latest 那次 API 往返对结果毫无贡献，
+   * 直接返回 skipped 并用它自拼 asset 兜底 —— 真机 gh-proxy.org 家族不通时（v1.0.0 那次 HTTP 403 即此域），
+   * 这次往返要吃掉 3×2.5s + 直连 ≈ 10s，而 installLatest 总预算只有 DL_BUDGET_MS=26s。
+   * 自拼 URL 的格式与真实 asset 实测一致（v0.0.7 的 asset 名 = 插件 npm 包名去掉 "breeze-plugin-" 前缀）。
+   * tag 权威仍是本函数默认行为：SEED 兜底路径没有 npmName，只能靠它。
+   */
+  async function releaseLatest(repo, npmVer) {
+    var nv = stripV(npmVer || '');
+    if (nv) {
+      var sn = String(repo).split('/');
+      var rn = String(sn[sn.length - 1] || '').toLowerCase();
+      if (rn.indexOf('breeze-plugin-') === 0) rn = rn.slice('breeze-plugin-'.length);
+      var guessed = rn ? ('https://github.com/' + repo + '/releases/download/v' + nv + '/' + rn + '.bundle.cjs') : '';
+      return {
+        ok: !!guessed, skipped: 'npm-authoritative', tag: nv,
+        assets: guessed ? [{ name: rn + '.bundle.cjs', url: guessed }] : [],
+        via: '', tries: [], status: 0
+      };
+    }
     var api = 'https://api.github.com/repos/' + repo + '/releases/latest';
     var cands = [];
     for (var i = 0; i < GH_API_MIRRORS.length; i++) cands.push({ label: 'rel-api' + (i + 1), url: GH_API_MIRRORS[i] + api });
@@ -372,7 +432,25 @@
         var ent = byUuid[uuid];
         if (!ent) { row.err = 'not-in-index'; results.push(row); continue; }
         if (Date.now() > deadline) { row.err = 'budget-exhausted'; results.push(row); continue; }
-        var r = await releaseLatest(repoOf(ent));
+        // v1.3.0：npm 优先（对齐上游 plugin_update_channel_utils.dart:126-134 —— npmName 非空就不碰 release）。
+        // v1.2.0 及以前是 release tag 优先，而 tag 常落后作者真实渠道半年 ⇒ row.latest 报旧版，
+        // 「可更新」角标对那 6 枚受害者永远不亮（例：索引/npm 都是 0.1.1，tag 还是 0.0.7）。
+        // assetUrl 仍只在 release 通路上有值，且不再为它单独花一次 API —— 它是第 4 位兜底，
+        // 真用到时 installLatest 自己会重查。
+        if (ent.npmName) {
+          var np = await npmLatest(ent.npmName, 1);
+          if (np.ok && np.tag) {
+            row.latest = semverMax([np.tag, ent.version]);
+            row.hasUpdate = !row.local || semverLt(row.local, row.latest);
+            results.push(row);
+            continue;
+          }
+          row.err = 'npm:' + (np.err || 'npm-fail');
+        }
+        // 传 '' 而非 ent.version：这条腿必打真查询 ⇒ row.assetUrl 保持 v1.2.0 的「来自真查询的真资产名」语义。
+        // （v1.3.0 初稿在这里传了索引版本 ⇒ assetUrl 变成按索引拼的猜测值，可能指向不存在的资产；
+        //   它虽零消费方，但把未证实的 URL 放进载荷是净退化 ⇒ 恢复真查。装版本链不受此影响。）
+        var r = await releaseLatest(repoOf(ent), '');
         var as = r.ok ? pickAsset(r.assets) : null;
         if (as) row.assetUrl = as.url;
         if (r.ok && r.tag) {
@@ -381,21 +459,7 @@
           results.push(row);
           continue;
         }
-        // v1.2.0：仓库没有 Release（9/21 条如此）不等于「查不到更新」⇒ 退到 npm dist-tags.latest。
-        // 只花一次 registry 请求（maxSources=1），预算快到底就不再花。
-        if (ent.npmName && Date.now() < deadline - 3000) {
-          var np = await npmLatest(ent.npmName, 1);
-          if (np.ok && np.tag) {
-            row.latest = np.tag;
-            row.hasUpdate = !row.local || semverLt(row.local, np.tag);
-            results.push(row);
-            continue;
-          }
-          row.err = (r.err || 'no-release') + '&' + (np.err || 'npm-fail');
-          results.push(row);
-          continue;
-        }
-        row.err = r.err || (r.status === 404 ? 'no-release-404' : 'no-release');
+        row.err = (row.err ? row.err + '&' : '') + (r.err || (r.status === 404 ? 'no-release-404' : 'no-release'));
         results.push(row);
       }
     }
@@ -409,7 +473,7 @@
     uuid = String(uuid || '');
     var out = {
       ok: false, uuid: uuid, name: '', version: '', asset: '', bytes: 0, sha256: '',
-      savedTo: '', via: '', err: '', attempts: [], writeMode: '', sizeOnDisk: 0, sizeOk: false
+      savedTo: '', via: '', err: '', attempts: [], writeMode: '', sizeOnDisk: 0, sizeOk: false, verWarn: ''
     };
     var root = pluginRoot();
     if (!root) { out.err = 'no-storage-root'; return out; }
@@ -422,20 +486,7 @@
     var repo = repoOf(ent);
     if (!repo) { out.err = 'no-repo'; return out; }
 
-    // v1.2.0：release 只是「拿 tag + 资产」的一条路，失败不再 return（SEED 里 9 条压根没有 Release）。
-    var relStatus = 0;
-    var tag = '';
-    var asset = null;
-    var r = await releaseLatest(repo);
-    if (r.ok && r.tag) {
-      tag = r.tag;
-      asset = pickAsset(r.assets);
-    } else {
-      relStatus = r.status || 0;
-    }
-    out.asset = asset ? asset.name : '';
-
-    // npm 侧解析：先 registry 拿准确 latest，拿不到也还有 CDN 的 latest 别名兜底
+    // npm 侧解析先跑（v1.3.0：顺序反转）。先拿版本号，release 那条路才有可能被整段跳过。
     var npmTag = '';
     var npmTarball = '';
     var npmTries = [];
@@ -444,10 +495,32 @@
       npmTries = np.tries || [];
       if (np.ok) { npmTag = np.tag; npmTarball = np.tarball; }
     }
+    // 权威版本 = max(npm dist-tags.latest, 索引声明版本, GitHub release tag)。
+    // 上游用「索引 version」这一个值就够（plugin_install_service.dart:46），我方额外把 npm latest 与
+    // release tag 也拉进来对拍，是为了兼容索引自身滞后的那枚（线上 25 枚实测：e-hentai 索引 0.1.8 < npm 0.1.9）。
+    var bestVer = semverMax([npmTag, ent.version]);
+    // v1.2.0：release 只是「拿 tag + 资产」的一条路，失败不再 return（SEED 里 9 条压根没有 Release）。
+    var relStatus = 0;
+    var tag = '';
+    var asset = null;
+    // 有 npmName ⇒ bestVer 已经拿得出来，release API 对版本毫无贡献 ⇒ 传 bestVer 走 skipped（省 10s 预算）。
+    // 无 npmName ⇒ 照旧查 releases/latest，GitHub tag 是这类插件唯一的版本来源，行为与 v1.2.0 逐字节一致。
+    var r = await releaseLatest(repo, ent.npmName ? bestVer : '');
+    if (r.ok && r.tag) {
+      tag = r.tag;
+      asset = pickAsset(r.assets);
+    } else {
+      relStatus = r.status || 0;
+    }
+    if (!bestVer) bestVer = stripV(tag || '');
+    out.asset = asset ? asset.name : '';
 
-    // 候选顺序：npm CDN（registry latest -> release tag -> latest 别名）-> npm tarball ->
-    // release 资产代理 -> release 直链 -> npm CDN(清单声明版本)。同一版本多源重复是故意的：
-    // jsdelivr 系两个镜像互为备份（v1.0.0 的教训 = 单源不通就整体失败）。
+    // 候选顺序（v1.3.0 反转为 npm 权威序）：bestVer -> npm registry latest -> 索引声明版本 -> latest 别名
+    //   -> release tag 版本（兜住 npm 上只有旧版号的仓库）-> npm tarball -> release 资产代理 -> 直链。
+    // 与上游同构：plugin_cloud_download_utils.dart:155 就是 npm CDN 主渠道、GitHub release 只兜底。
+    // v1.2.0 把 pushCdn(tag) 放首位，等于拿半年前的 tag 去 npm 取包 ⇒ 装到旧版（本次缺陷的病灶）。
+    // 同一版本多源重复是故意的：jsdelivr 系两个镜像互为备份（v1.0.0 的教训 = 单源不通就整体失败）。
+    // bestVer == tag 时（线上 8 枚无 npmName 的插件即如此）去重后候选集与顺序与 v1.2.0 逐字节一致。
     var cands = [];
     var seen = {};
     var push = function (label, url, ver) {
@@ -458,26 +531,89 @@
     var pushCdn = function (ver, label) {
       if (!ent.npmName || !ver) return;
       var ap = 'npm/' + ent.npmName + '@' + ver + '/dist/' + ent.npmName + '.bundle.cjs';
-      for (var c = 0; c < NPM_CDN.length; c++) push(label + (c + 1), NPM_CDN[c] + ap, ver === 'latest' ? (npmTag || tag || stripV(ent.version || '')) : ver);
+      // 'latest' 别名命中时无法从 URL 知道版本，而它的内容恒等于 npm dist-tags.latest ⇒ registry 已知时
+      // 用 npmTag 标注最准（v1.2.0 那里塞的是 GitHub tag，会把半年前的 tag 冒充成实际内容版本）；
+      // registry 失败（npmTag 空）才退回 bestVer，最后才 tag —— 都是推测，但已无更优信息。
+      for (var c = 0; c < NPM_CDN.length; c++) push(label + (c + 1), NPM_CDN[c] + ap, ver === 'latest' ? (npmTag || bestVer || tag) : ver);
     };
-    // release tag 放最前 = 与 checkUpdates 报给用户的 latest 同一口径（12 条有 Release 的老路子不变）
-    pushCdn(tag, 'npm-rel');
+    pushCdn(bestVer, 'npm-best');
     pushCdn(npmTag, 'npm-latest-tag');
+    pushCdn(stripV(ent.version || ''), 'npm-indexver');
     pushCdn('latest', 'npm-alias');
-    if (npmTarball) push('npm-tarball', npmTarball, npmTag);
+    pushCdn(tag, 'npm-rel');
+    if (npmTarball) push('npm-tarball', npmTarball, npmTag || bestVer);
     if (asset && asset.url) {
       for (var p = 0; p < GH_FILE_MIRRORS.length; p++) push('rel-mirror' + (p + 1), GH_FILE_MIRRORS[p] + asset.url, tag);
       push('rel-direct', asset.url, tag);
     }
-    pushCdn(stripV(ent.version || ''), 'npm-seedver');
     if (!cands.length) {
       out.err = 'no-candidate(relStatus=' + relStatus + '; npm=' + (ent.npmName ? 'yes' : 'none') + ')';
       out.attempts = npmTries;
       return out;
     }
 
+    // v1.3.0 补刀：本轮为省 10s 跳过过 releases/latest ⇒ 手里那个 tag 是「猜的」，不是 GitHub 的真 tag。
+    // 两种情况下必须去捞真 tag + 真资产再试一轮：
+    //   ① 首轮全挂 —— 否则连 v1.2.0 能救回的仓库也不再能救（自拼 asset 名可能猜不中）；
+    //   ② 首轮拿到的版本低于 bestVer（降级）—— 对齐上游 plugin_cloud_download_utils.dart:176-190 的兜底方向：
+    //      npm 供不出声明的版本时上游就去 GitHub 的真实资产；我方若不补就会被 npm 上的旧版号锁住（IT 用例 4 实测到）。
+    // 快路径（bestVer 一次命中且不低于 bestVer）不触发 ⇒ 常见路径零额外请求；r.skipped 置空保证最多补查一次。
+    async function relRescue(why) {
+      if (!r.skipped || Date.now() > deadline - 4000) return null;
+      var rr = await releaseLatest(repo, '');
+      r.skipped = '';
+      out.attempts = out.attempts.concat(rr.tries || []);
+      if (!rr.ok || !rr.tag) {
+        relStatus = rr.status || relStatus;
+        return null;
+      }
+      var a2 = pickAsset(rr.assets);
+      var cs = [];
+      var sn = {};
+      var pu = function (label, url, ver) {
+        if (!url || sn[url] || seen[url]) return; // 首轮试过的 URL 不重试
+        sn[url] = 1;
+        cs.push({ label: why + '-' + label, url: url, ver: ver || '' });
+      };
+      if (ent.npmName) {
+        var apx = 'npm/' + ent.npmName + '@' + rr.tag + '/dist/' + ent.npmName + '.bundle.cjs';
+        for (var cx = 0; cx < NPM_CDN.length; cx++) pu('npm-tag' + (cx + 1), NPM_CDN[cx] + apx, rr.tag);
+      }
+      if (a2 && a2.url) {
+        for (var px = 0; px < GH_FILE_MIRRORS.length; px++) pu('mirror' + (px + 1), GH_FILE_MIRRORS[px] + a2.url, rr.tag);
+        pu('direct', a2.url, rr.tag);
+      }
+      if (!cs.length) return null;
+      return { cs: cs, tag: rr.tag, asset: a2 };
+    }
+    function takeRescue(res, gr) {
+      out.attempts = out.attempts.concat(gr.tries || []);
+      if (!(gr.ok && gr.buf)) return;
+      g = gr;
+      tag = res.tag;
+      asset = res.asset;
+      if (res.asset && res.asset.name) out.asset = res.asset.name;
+      relStatus = 200;
+    }
     var g = await tryEach(cands, DL_SOURCE_MS, false, deadline);
     out.attempts = npmTries.concat(g.tries || []);
+    if (!g.ok || !g.buf) {
+      var res1 = await relRescue('rel-recover');
+      if (res1) takeRescue(res1, await tryEach(res1.cs, DL_SOURCE_MS, false, deadline));
+    }
+    // 拿到了但低于 bestVer ⇒ 用真 tag 再试一轮，能拿更高就拿更高
+    var gotVer = g.ok ? (g.ver || '') : '';
+    if (g.ok && g.buf && bestVer && gotVer && semverLt(gotVer, bestVer)) {
+      var res2 = await relRescue('rel-up');
+      if (res2) {
+        var gd = await tryEach(res2.cs, DL_SOURCE_MS, false, deadline);
+        out.attempts = out.attempts.concat(gd.tries || []);
+        if (gd.ok && gd.buf && gd.ver && semverLt(gotVer, gd.ver)) {
+          g = gd; tag = res2.tag; asset = res2.asset;
+          if (res2.asset && res2.asset.name) out.asset = res2.asset.name;
+        }
+      }
+    }
     if (!g.ok || !g.buf) {
       var why = g.err === 'budget-exhausted' ? 'all-sources-timeout' : (g.err || 'all-sources-failed');
       out.err = why + '(relStatus=' + relStatus + '; ' + lastSummary(g.tries) + ')';
@@ -489,7 +625,10 @@
     if (g.ver) tag = g.ver;
     if (!tag && npmTag) tag = npmTag;
     if (!tag) tag = stripV(ent.version || '');
-    out.version = tag;
+    out.version = tag; // 实际内容口径（绝不用 bestVer 冒充）：落盘名 / PluginRecord.version / 后续 hasUpdate 比较全用它
+    // v1.3.0：实际内容低于索引声明版本 ⇒ 留一行可诊断告警（索引滞后于 GitHub 时 bestVer 高于索引声明 ⇒ 不误报）
+    var declaredVer = stripV(ent.version || '');
+    if (declaredVer && semverLt(tag, declaredVer)) out.verWarn = 'declared-' + declaredVer + '>got-' + tag;
     try {
       // crypto.sha256 真机验证过的入参形态是 Uint8Array/string（bridge_crypto.rs 只吃原始二进制）
       // ⇒ 裸 ArrayBuffer 先包成视图。

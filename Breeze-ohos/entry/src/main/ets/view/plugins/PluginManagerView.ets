@@ -1182,7 +1182,8 @@ export struct PluginManagerView {
         this.rows = [];
         await this.refresh();
         this.toast('已下载 ' + jstr(o, 'name', it.name) + ' v' + jstr(o, 'version', '')
-          + '（' + Math.round(jnum(o, 'bytes', 0) / 1024) + 'KB via ' + jstr(o, 'via', '') + '），已自动装载');
+          + '（' + Math.round(jnum(o, 'bytes', 0) / 1024) + 'KB via ' + jstr(o, 'via', '') + '），已自动装载'
+          + this.verWarnNote(o));
       } else {
         this.toast('下载失败: ' + this.maskPaths(jstr(o, 'err', 'unknown')));
       }
@@ -1335,17 +1336,36 @@ export struct PluginManagerView {
       this.rows = [];
       this.busy = false;
       await this.refresh();
+      const warnNote: string = this.verWarnNote(o);
       if (!inMem) {
-        this.toast('已更新到 v' + jstr(o, 'version', '') + '（refresh 里自动装载）');
+        this.toast('已更新到 v' + jstr(o, 'version', '') + '（refresh 里自动装载）' + warnNote);
       } else if (reloaded) {
-        this.toast('更新完成并已重载图源');
+        this.toast('更新完成并已重载图源' + warnNote);
       } else {
-        this.toast('更新已落盘，图源重载失败，下次自动装载生效');
+        this.toast('更新已落盘，图源重载失败，下次自动装载生效' + warnNote);
       }
     } catch (e) {
       this.busy = false;
       this.toast('更新失败: ' + this.errBrief(e as Object));
     }
+  }
+
+  /**
+   * v1.3.0：商店载荷 installLatest 在「实拿内容低于索引声明版本」时回 verWarn = 'declared-X>got-Y'。
+   * 这里翻成用户话并附版本号，让「装到旧版」不再静默（v1.2.0 及以前四处都知道是旧版却无一处报错）。
+   * verWarn 缺失/为空 ⇒ 返回空串，文案与改前逐字一致。
+   */
+  private verWarnNote(o: ESObject): string {
+    const w: string = jstr(o, 'verWarn', '');
+    if (w.length === 0) {
+      return '';
+    }
+    const gt: number = w.indexOf('>got-');
+    if (gt < 0) {
+      return '（注意：清单标注的版本取不到，已装实际可取的版本）';
+    }
+    return '（注意：清单标注 ' + w.slice('declared-'.length, gt) + ' 取不到，实际装的是 '
+      + w.slice(gt + '>got-'.length) + '）';
   }
 
   private baseName(p: string): string {

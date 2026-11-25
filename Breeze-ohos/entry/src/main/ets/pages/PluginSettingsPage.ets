@@ -1608,7 +1608,15 @@ struct PluginSettingsPage {
       }
       // installLatest 落盘不自动装载 ⇒ 重新装载本 uuid 才生效
       await PluginSourceRegistry.reloadOne(this.ctx(), this.uuid);
-      this.toast(ver.length > 0 ? ('已更新到 ' + ver) : '已是最新');
+      // v1.3.0：verWarn = 'declared-X>got-Y' ⇒ 实拿低于清单声明时明示，不再静默
+      const vw: string = jstr(o, 'verWarn', '');
+      let vwNote: string = '';
+      if (vw.length > 0) {
+        const gt: number = vw.indexOf('>got-');
+        vwNote = gt < 0 ? '（清单标注的版本取不到，已装实际可取的版本）'
+          : '（注意：清单标注 ' + vw.slice('declared-'.length, gt) + ' 取不到，实际装的是 ' + vw.slice(gt + '>got-'.length) + '）';
+      }
+      this.toast((ver.length > 0 ? ('已更新到 ' + ver) : '已是最新') + vwNote);
       this.reload();
     } catch (e) {
       // s37 需求 2：同 openWebLogin（见该处注释）。
