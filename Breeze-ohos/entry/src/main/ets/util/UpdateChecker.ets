@@ -5,7 +5,7 @@
  * ★★ 版本号是两套编号，这里必须讲清楚，否则判「有没有新版」必错：
  *   - versionName（AppScope/app.json5 = 3.0.37）是**对齐上游 Breeze 的镜像版本号**，全程恒 3.0.37，
  *     不随本仓库发版递增（本仓台账：versionName 恒 3.0.37）。它回答「移植自上游哪一版」。
- *   - Release tag（v1.0.0 … v1.12.0）是**本仓库自己的发版编号**，每发一次 Release 加一。
+ *   - Release tag（v1.0.0 … v1.13.0）是**本仓库自己的发版编号**，每发一次 Release 加一。
  *     它回答「我装的是第几次发版」。
  *   ⇒ 拿 versionName 去和 tag 比大小是错的（3.0.37 永远大于 1.x ⇒ 永远显示「已最新」）。
  *     本文件的基准用 SELF_TAG（下面那枚常量），**每次发 Release 必须同步改这一行**（发版清单里已列）。
@@ -31,7 +31,7 @@ const API_LATEST_MIRROR: string = 'https://v4.gh-proxy.org/https://api.github.co
  * 改法：写成 tag 原文（带 v）。写错或忘改的后果 = 已装最新包的用户仍看到「发现新版本」，
  * 不会崩、不会误装，但会被当成 BUG 反馈 —— 所以它在发版清单里是一条硬步骤。
  */
-const SELF_TAG: string = 'v1.12.0';
+const SELF_TAG: string = 'v1.13.0';
 
 /** 一次检查的产出（所有字段都有默认值，失败路径只填 error）。 */
 export class UpdateOutcome {

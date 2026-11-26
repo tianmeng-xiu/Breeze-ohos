@@ -34,6 +34,7 @@ import { jparse, jstr, jobj, jarr, jisEmpty, jhas } from '../../util/JsonUtil';
 import { PluginStore } from '../../util/PluginStore';
 import { Logger } from '../../util/Logger';
 import { BreezeHost } from '../../util/BreezeHost';
+import { PluginInit } from '../../util/PluginInit';
 
 /**
  * 调用形态分三类，别一把梭（都有上游实证）：
@@ -338,6 +339,9 @@ export class PluginSettings {
         return '装载插件失败：bundleLoadFromPath 返回 "' + ret + '"';
       }
       Logger.i('插件设置页装载：' + uuid);
+      // 设置页这条装载是同名 bundleLoadFromPath = 整体替换语义（bundleList 失败时也会走到这里），
+      // 插件内存态可能已被洗掉 ⇒ rearm 补跑一次 init
+      PluginInit.rearm(uuid);
       return '';
     } catch (e) {
       return '装载插件失败：' + em(e as Object);

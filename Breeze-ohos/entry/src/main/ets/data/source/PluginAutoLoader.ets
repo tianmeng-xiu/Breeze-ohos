@@ -21,6 +21,7 @@ import { PluginStore, PluginRecord } from "../../util/PluginStore";
 import { jparse, jstr } from "../../util/JsonUtil";
 import { deriveLocalUuid } from "../../util/PluginUuid";
 import { Logger } from "../../util/Logger";
+import { PluginInit } from "../../util/PluginInit";
 import { PluginSourceRegistry } from "./PluginSourceRegistry";
 
 /** getInfo 本地超时（同 PluginManagerView 口径：三方 getInfo 可能自发网络请求，3.5s 后不等）。 */
@@ -96,6 +97,10 @@ export class PluginAutoLoader {
       PluginSourceRegistry.registerOne(context, uuid, name, localFile);
       if (!inMem) {
         bumpSourceEpoch();
+        // P1b：走到这里说明是真·新装载（!inMem 且 bundleLoadFromPath 已返回 "ok"，非 ok 在上面就 throw 了）。
+        // 后台补发一次插件导出的 init —— 同步入队、不 await：init 内部可能自发网络请求，
+        // 接进启动链会拖垮启动。已在内存的分支保持 no-op（见文件头硬约束 2）。
+        PluginInit.mark(uuid);
       }
       return true;
     } catch (e) {

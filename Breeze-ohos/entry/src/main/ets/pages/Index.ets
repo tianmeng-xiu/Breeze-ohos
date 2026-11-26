@@ -19,7 +19,7 @@ import {
 } from '../util/PluginRuntime';
 import { BreezeHost, HostRegistrar } from '../util/BreezeHost';
 import { Logger } from '../util/Logger';
-import { jparse, jstr, jint, jnum, jbool, jhas, jobj, jarr } from '../util/JsonUtil';
+import { jparse, jstr, jint, jnum, jbool, jhas, jobj, jarr, jstrArr, jisEmpty } from '../util/JsonUtil';
 import qjs from 'libbreeze_qjs_ohos.so';
 import deviceInfo from '@ohos.deviceInfo';
 import { common } from '@kit.AbilityKit';
@@ -34,6 +34,9 @@ import { TextConvert } from '../util/TextConvert';
 import { FeatureDiag } from '../util/FeatureDiag';
 import { UpdateChecker } from '../util/UpdateChecker';
 import { UserSettings } from '../util/UserSettings';
+import { PluginStore, PluginRecord } from '../util/PluginStore';
+import { deriveLocalUuid } from '../util/PluginUuid';
+import { PluginInit } from '../util/PluginInit';
 
 /** rawfile 路径（不带 rawfile/ 前缀）。real.bundle.cjs 可选：缺则面板第 7 项 SKIP。 */
 const RAW_SELFTEST: string = 'plugins/selftest.bundle.cjs';
@@ -87,6 +90,12 @@ class DiagReport {
   /** 19 pluginConfig（s16 第 4 条取证：持久化桶名集合，跨插件账号互串判据）。 */
   pluginConfig: string = '';
   featChain: string = '';
+  /** 21 jmRuntime（s44 P1 探针）：JM dumpRuntimeInfo 摘要，判「端点池是否从未建立」。 */
+  jmRuntime: string = '';
+  /** 22 pluginInit（s46 P1b）：新装载后补发 init 的三态计数行原文。 */
+  pluginInit: string = '';
+  /** 23 pluginCfgKeys（s46 P2）：持久化桶键名清单（只有键名与长度，无值）。 */
+  pluginCfgKeys: string = '';
   storageRoot: string = '';
   verdict: string = '';
   items: DiagItem[] = [];
@@ -98,6 +107,96 @@ function cut(s: string, n: number): string {
     return '';
   }
   return s.length <= n ? s : s.slice(0, n) + '…';
+}
+
+/**
+ * s44 P1 探针（纯观测，不参与 verdict）：JM 插件的持久文件名前缀 = 索引 uuid 前 8 位。
+ * 装机实测 = `bf99008d-0.1.1.bundle.cjs`（装载名 `local-bf99008d-0-1-1`）。
+ */
+const JM_FILE_PREFIX: string = 'bf99008d';
+/** JM bundle 内硬编码常量 JM_FALLBACK_API_BASE 的域名（未建立端点池时恒打这枚）。 */
+const JM_FALLBACK_API: string = 'www.cdnhjk.net';
+
+/** `https://host/path` -> `host`（诊断行只放域名，放全 URL 会吃满预算）。 */
+function shortHost(u: string): string {
+  let s: string = u;
+  if (s.startsWith('https://')) {
+    s = s.slice(8);
+  } else if (s.startsWith('http://')) {
+    s = s.slice(7);
+  }
+  const slash: number = s.indexOf('/');
+  return slash >= 0 ? s.slice(0, slash) : s;
+}
+
+/** 探针数组按 status 分档计数（`ok` 是插件侧 `status` 字段的三档之一，其余归 other）。 */
+function probeTally(arr: ESObject[]): string {
+  let okN: number = 0;
+  let degN: number = 0;
+  let deadN: number = 0;
+  let otherN: number = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const st: string = jstr(arr[i], 'status', '?');
+    if (st === 'ok') {
+      okN++;
+    } else if (st === 'degraded') {
+      degN++;
+    } else if (st === 'dead') {
+      deadN++;
+    } else {
+      otherN++;
+    }
+  }
+  return 'ok' + okN + '/deg' + degN + '/dead' + deadN + (otherN > 0 ? '/other' + otherN : '');
+}
+
+/** 探针数组取前 n 枚摘要：`域名#状态[/httpStatus][@延迟ms]`。 */
+function probeSample(arr: ESObject[], n: number): string {
+  const parts: string[] = [];
+  for (let i = 0; i < arr.length && parts.length < n; i++) {
+    const one: string = shortHost(jstr(arr[i], 'baseUrl', '?')) + '#' + jstr(arr[i], 'status', '?');
+    const hs: string = jstr(arr[i], 'httpStatus', '');
+    const lat: string = jstr(arr[i], 'latencyMs', '');
+    parts.push(one + (hs.length > 0 ? '/' + hs : '') + (lat.length > 0 ? '@' + lat + 'ms' : ''));
+  }
+  return parts.join(',');
+}
+
+/**
+ * dumpRuntimeInfo 原文 -> 一行摘要。**判读四条件：**
+ * `apiPool=0` ∧ `probes=0` ∧ `imgProbes=0` ∧ `api=www.cdnhjk.net` 同成立 ⇒ 插件 `init`
+ * 从未被调用（JM 端点缓存的唯一写点在 init 引导链内，与网络通不通无关）。
+ * 0.0.7 的 dumpRuntimeInfo 是 stub（只回 pluginName/now）⇒ 单列 `stub=1`，不与上面混判。
+ */
+function jmProbeHint(raw: string): string {
+  const root: ESObject = jparse(raw);
+  let d: ESObject = jobj(root, 'data');
+  if (jisEmpty(d) && jhas(root, 'apiBaseUrl')) {
+    d = root;
+  }
+  if (!jhas(d, 'apiBaseUrl')) {
+    return 'stub=1 api=none（装机代次是 0.0.7 stub，dumpRuntimeInfo 无字段可判） raw=' + cut(raw, 90);
+  }
+  const api: string = jstr(d, 'apiBaseUrl', '');
+  const img: string = jstr(d, 'imageBaseUrl', '');
+  const apiPool: string[] = jstrArr(d, 'apiPool');
+  const imgPool: string[] = jstrArr(d, 'imagePool');
+  const probes: ESObject[] = jarr(d, 'probes');
+  const imgProbes: ESObject[] = jarr(d, 'imageProbes');
+  const neverInit: boolean = apiPool.length === 0 && probes.length === 0
+    && imgProbes.length === 0 && api.indexOf(JM_FALLBACK_API) >= 0;
+  const poolHosts: string[] = [];
+  for (let i = 0; i < apiPool.length; i++) {
+    poolHosts.push(shortHost(apiPool[i]));
+  }
+  let s: string = 'api=' + shortHost(api) + ' img=' + shortHost(img)
+    + ' apiPool=' + apiPool.length + (poolHosts.length > 0 ? '(' + cut(poolHosts.join(','), 60) + ')' : '')
+    + ' imgPool=' + imgPool.length
+    + ' probes=' + probes.length + (probes.length > 0 ? '[' + probeTally(probes) + ' ' + cut(probeSample(probes, 3), 120) + ']' : '')
+    + ' imgProbes=' + imgProbes.length + (imgProbes.length > 0 ? '[' + probeTally(imgProbes) + ']' : '')
+    + ' tmo=' + jstr(d, 'probeTimeoutMs', '?');
+  s += ' | VERDICT=' + (neverInit ? 'never-init（端点池从未建立，恒打回退域）' : 'init-ran（池/探针有读数，改判 reason）');
+  return s;
 }
 
 /** 从 unknown 异常提取 message 原文（面板要显示原文，不加工）。typeof 判定规避 ArkTS 严格模式对 string===undefined 比较的告警。 */
@@ -149,6 +248,12 @@ struct Index {
   private diagCfg: string = '';
   /** 20 featChain 行原文（同上，现算不落盘）：本轮四项新功能的读数口。 */
   private diagFeat: string = '';
+  /** 21 jmRuntime 行原文（s44 P1 探针）：dumpRuntimeInfo 摘要，现算不落盘。 */
+  private diagJm: string = '';
+  /** 22 pluginInit 行原文（s46 P1b）：PluginInit.hint() 摘要，现算不落盘。 */
+  private diagInit: string = '';
+  /** 23 pluginCfgKeys 行原文（s46 P2）：BreezeHost.configBucketKeysHint()，现算不落盘。 */
+  private diagKeys: string = '';
 
   /** 诊断面板显隐（用户 m02396 硬约束：不许压屏幕顶部 ⇒ 改底部弹层 + 可收起）。 */
   @State diagOpen: boolean = true;
@@ -1010,6 +1115,108 @@ struct Index {
       pushFixed(20, 'featChain', 'INFO', 'unavailable: ' + em(e as Object), 200);
     }
 
+    // ---- 21. jmRuntime（s44 P1 探针，INFO 不计入 verdict）：直调 JM 插件自己导出的
+    //      dumpRuntimeInfo，读它进程里的端点池状态。为什么需要这一行：JM 的 API 域名不是常量，
+    //      端点缓存 `runtime:endpoints` 的**唯一写点**在插件 `init` 的引导链里（bundle 内普查 =
+    //      定义 + 唯一调用两处），而我方宿主装载链只调 getInfo、从不调 init ⇒ 冷启动缓存必空 ⇒
+    //      业务恒退回硬编码 JM_FALLBACK_API_BASE = www.cdnhjk.net，且 hostPool=[] 让 failover
+    //      的 `length<=1` 闸门永不放行 ⇒ 登录与排行榜同时死（两者共用同一个 base）。
+    //      判读四条件：apiPool=0 ∧ probes=0 ∧ imgProbes=0 ∧ api=www.cdnhjk.net 同成立 ⇒ 坐实
+    //      「init 从未被调用」，与网络通不通无关；probes 非空 ⇒ 该结论翻转，改看 probes 的 reason。
+    //      纯观测：不发请求（dumpRuntimeInfo 只投影已缓存的探针结果）、不改任何插件状态。
+    try {
+      const ctx21: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      const recs21: PluginRecord[] = await PluginStore.loadAll(ctx21);
+      let jmFile: string = '';
+      let jmUuid: string = '';
+      let jmName: string = '';
+      for (let i = 0; i < recs21.length; i++) {
+        if (recs21[i].localFile.startsWith(JM_FILE_PREFIX)) {
+          jmFile = recs21[i].localFile;
+          // 装载名必须用清单里的 uuid（启动链 autoLoadAll 用的就是它，:223）；
+          // 清单缺件才退回 deriveLocalUuid —— 两者规则同源，但已装载件以清单为准。
+          jmUuid = recs21[i].uuid;
+          jmName = recs21[i].name;
+        }
+      }
+      if (jmFile.length === 0) {
+        // 清单没有 ⇒ 目录里可能有手放的件，装载名走 deriveLocalUuid 同一套规则。
+        const scanRoot: ESObject = jparse(await pluginScanDir('plugins'));
+        const scanArr: ESObject[] = Array.isArray(scanRoot) ? (scanRoot as ESObject[]) : [];
+        for (let i = 0; i < scanArr.length; i++) {
+          const nm: string = jstr(scanArr[i], 'name', '');
+          if (nm.startsWith(JM_FILE_PREFIX)) {
+            jmFile = nm;
+            jmUuid = deriveLocalUuid(nm);
+          }
+        }
+      }
+      if (jmFile.length === 0) {
+        this.diagJm = 'not installed（清单与 plugins 目录都没有 ' + JM_FILE_PREFIX + ' 前缀的件）';
+        pushFixed(21, 'jmRuntime', 'SKIP', this.diagJm, 200);
+      } else if (!bundleOk) {
+        this.diagJm = 'skipped: engine not ready file=' + jmFile;
+        pushFixed(21, 'jmRuntime', 'SKIP', this.diagJm, 200);
+      } else {
+        // 装载刻意**不走 PluginAutoLoader.loadOne**：那函数无条件调 registerOne，传空 name 会把
+        // 图源显示名覆盖成文件名（「禁漫天堂」→「bf99008d-0.1.1」）直到下次重启 ⇒ 探针不能有这
+        // 种副作用。这里只做引擎侧装载（启动链本来就会做同一件事），不碰图源注册表。
+        this.diagJm = 'file=' + jmFile + ' name=' + jmUuid + (jmName.length > 0 ? '(' + jmName + ')' : '') + ' ';
+        let inMem: boolean = false;
+        try {
+          const lst21: string[] = await bundleList();
+          for (let i = 0; i < lst21.length; i++) {
+            if (lst21[i] === jmUuid) {
+              inMem = true;
+            }
+          }
+        } catch (e) {
+          inMem = false;
+        }
+        if (!inMem) {
+          const ret21: string = await bundleLoadFromPath(jmUuid, ctx21.filesDir + '/plugins/' + jmFile);
+          if (ret21 !== 'ok') {
+            throw new Error('bundleLoadFromPath returned ' + cut(ret21, 60));
+          }
+        }
+        const raw21: string = await bundleCall(jmUuid, 'dumpRuntimeInfo', '[{"extern":{}}]');
+        this.diagJm += 'load=' + (inMem ? 'cached' : 'ok') + ' raw=' + cut(raw21, 300);
+        pushFixed(21, 'jmRuntime', 'INFO', jmProbeHint(raw21), 720);
+      }
+    } catch (e) {
+      // 已有部分读数时保留它（file= 段就是证据），只在完全没拿到时记异常。
+      if (this.diagJm.length === 0) {
+        this.diagJm = 'throw: ' + em(e as Object);
+      }
+      pushFixed(21, 'jmRuntime', 'FAIL', this.diagJm, 720);
+    }
+
+    // ---- 22 pluginInit（s46 P1b）：新装载插件补发 init 的三态读数（INFO 不计入判定）。
+    // 判读：ok≥1 且 21 行 VERDICT 由 never-init 改判 init-ran ⇒ P1b 生效（init 真跑了、端点池建立了）；
+    // ni = 该插件本来就没导出 init（真机 26 枚里 7 枚属正常态，不算失败）；
+    // err>0 看行尾 last= 段（只留最后一条消息前 160 字符）；mark= 是发起总数，q=/running= 是队列态。
+    try {
+      const ihint: string = PluginInit.hint();
+      this.diagInit = ihint;
+      pushFixed(22, 'pluginInit', 'INFO', ihint, 720);
+    } catch (e) {
+      this.diagInit = 'throw: ' + em(e as Object);
+      pushFixed(22, 'pluginInit', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
+    // ---- 23 pluginCfgKeys（s46 P2）：持久化桶只列键名与长度（INFO 不计入判定，值绝不上屏）。
+    // 判读：JM 桶出现 auth.jwt 加星 = 登录态已落盘、只剩端点选择；
+    // auth.account/auth.password（带星）在而 auth.jwt 无 = 与 21 行 never-init 互证
+    // （凭据写了但 init 没跑，会话没换成 jwt）；no-ctx = 面板早于宿主 init 打开，重开面板即可。
+    try {
+      const khint: string = BreezeHost.configBucketKeysHint();
+      this.diagKeys = khint;
+      pushFixed(23, 'pluginCfgKeys', 'INFO', khint, 720);
+    } catch (e) {
+      this.diagKeys = 'throw: ' + em(e as Object);
+      pushFixed(23, 'pluginCfgKeys', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
     // ---- 总判定 + 可复制 JSON。S4 起前缀 S4（判定 12 项：S2 七项 + net + download + unload +
     //      fileChain + jailEscape；pluginIndex/selftest/exports 为 INFO 不计入），如需回退字样可改。
     const verdict: string = fails === 0
@@ -1038,6 +1245,9 @@ struct Index {
     report.pluginIcons = this.diagIcons;
     report.pluginConfig = this.diagCfg;
     report.featChain = this.diagFeat;
+    report.jmRuntime = this.diagJm;
+    report.pluginInit = this.diagInit;
+    report.pluginCfgKeys = this.diagKeys;
     report.storageRoot = this.diagStorageRoot;
     report.verdict = verdict;
     report.items = items;

@@ -15,6 +15,7 @@
 import { MangaSource, SearchPageResult } from './Source';
 import { MangaSummary, ChapterInfo, PageImage, SourceInfo } from '../model/Models';
 import { bundleCall, bundleCallBytes, bundleLoadFromPath, bundleList, BytesResult } from '../../util/PluginRuntime';
+import { PluginInit } from '../../util/PluginInit';
 import { jparse, jstr, jobj, jarr, jstrArr, jisEmpty, jint, jbool } from '../../util/JsonUtil';
 import { Logger } from '../../util/Logger';
 
@@ -199,6 +200,8 @@ export class PluginSourceAdapter implements MangaSource {
         throw new Error('bundleLoadFromPath 返回 "' + ret + '"');
       }
       Logger.i('插件图源首次装载：' + this.displayName + ' (' + this.uuid + ')');
+      // 懒装载 = 启动链（PluginAutoLoader）没覆盖到的件，首次取数才进引擎 ⇒ 这里补一次 init
+      PluginInit.mark(this.uuid);
     }
     this.loaded = true;
   }
@@ -656,6 +659,8 @@ export class PluginSourceAdapter implements MangaSource {
     if (ret !== 'ok') {
       throw new Error('bundleLoadFromPath 返回 "' + ret + '"');
     }
+    // reload = 同名整体替换，插件内存态被洗掉 ⇒ 撤 done 记账后补跑一次 init
+    PluginInit.rearm(this.uuid);
     this.loaded = true;
   }
 }

@@ -434,6 +434,75 @@ export class BreezeHost {
   }
 
   /**
+   * s46 P2 诊断（面板 23 行 pluginCfgKeys）：每桶只列「键名(len=值长度)」，值一律不上屏。
+   * 判据在面板注释侧：JM 桶出现 auth.jwt 加星 = 登录态已落盘；auth.account、auth.password 在
+   * 而 auth.jwt 无 = 与 21 行 never-init 互证（登录写了凭据、init 没跑所以会话没换成 jwt）。
+   * 硬约束：绝不输出值内容/前缀/哈希；凭据类键（jwt、token、password、cookie、secret、
+   * account、phone、email 任一子串）键名后加 * 提示；最多 4 桶、每桶 12 键，溢出 +N；
+   * 整行 ≤700 字符；context 未注入返回 no-ctx；桶缺失或非法 JSON 记 []；任何情况不抛。
+   */
+  static configBucketKeysHint(): string {
+    const ctx: common.Context | null = BreezeHost.context;
+    if (ctx === null) {
+      return 'no-ctx';
+    }
+    // 桶名集合：cfgRuntimes 见过的 scoped 桶 + 存量 LEGACY_RUNTIME 桶（不在集合里补一枚）。
+    const names: string[] = [];
+    BreezeHost.cfgRuntimes.forEach((v: number, k: string): void => {
+      if (names.length < 4 && !names.includes(k)) {
+        names.push(k);
+      }
+    });
+    if (!names.includes(LEGACY_RUNTIME) && names.length < 4) {
+      names.push(LEGACY_RUNTIME);
+    }
+    const segs: string[] = [];
+    for (let i = 0; i < names.length; i++) {
+      const runtime: string = names[i];
+      let keys: string = '';
+      try {
+        const opt: preferences.Options = { name: PREF_NAME };
+        const p: preferences.Preferences = preferences.getPreferencesSync(ctx, opt);
+        const raw: string = String(p.getSync(runtime, '{}'));
+        const obj: ESObject = JSON.parse(raw);
+        if (obj !== null && obj !== undefined && typeof obj === 'object' && !Array.isArray(obj)) {
+          const ks: string[] = [];
+          const all: string[] = Object.keys(obj);
+          for (let j = 0; j < all.length; j++) {
+            if (ks.length >= 12) {
+              break;
+            }
+            const key: string = all[j];
+            const v: ESObject = obj[key];
+            const len: number = (v === null || v === undefined) ? 0 : String(v).length;
+            ks.push(BreezeHost.markSensitiveKey(key) + '(len=' + String(len) + ')');
+          }
+          keys = ks.join(',') + (all.length > 12 ? '(+' + String(all.length - 12) + ')' : '');
+        }
+      } catch (e) {
+        // 单桶读失败/非法 JSON：记空桶继续下一桶，不让诊断行整体消失。
+      }
+      segs.push(runtime + '[' + keys + ']');
+    }
+    let s: string = segs.join(' ');
+    if (s.length > 700) {
+      s = s.slice(0, 699) + '…';
+    }
+    return s.length === 0 ? '-' : s;
+  }
+
+  /** configBucketKeysHint 用词表：凭据类键名只加 * 标记，不改写键名本体。 */
+  private static markSensitiveKey(key: string): string {
+    const lower: string = key.toLowerCase();
+    if (lower.includes('jwt') || lower.includes('token') || lower.includes('password')
+      || lower.includes('cookie') || lower.includes('secret') || lower.includes('account')
+      || lower.includes('phone') || lower.includes('email')) {
+      return key + '*';
+    }
+    return key;
+  }
+
+  /**
    * s19 一次性搬运用：读 scoped 之前的历史共享桶（LEGACY_RUNTIME）。同步取（设置页在 UI 线程
    * 已经 await 过 prefs），桶缺失或形态非法一律返回空对象，不抛。
    */
