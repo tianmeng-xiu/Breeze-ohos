@@ -132,7 +132,8 @@ export struct DiscoverPage {
    * 且尽量保持当前选中源不跳（找不到才回退第一个）。
    */
   onSourceEpoch(): void {
-    const next: SourceInfo[] = SourceManager.getInstance().list();
+    // s52：与 loadPopular 同口径，只比可见集合（关掉内置源时这枚 @Watch 才会真的让 chip 条变短）。
+    const next: SourceInfo[] = SourceManager.getInstance().visibleList();
     if (next.length === this.sources.length) {
       let same: boolean = true;
       for (let i = 0; i < next.length; i++) {
@@ -191,7 +192,9 @@ export struct DiscoverPage {
     });
     try {
       const sm: SourceManager = SourceManager.getInstance();
-      this.sources = sm.list();
+      // s52：读可见集合（被用户关掉的内置源不进 chip 条）。get()/require() 不受影响 ⇒
+      // 书架/收藏里那本 MangaDex 的书仍然照常打开阅读，只是这里不再提供入口（用户裁定）。
+      this.sources = sm.visibleList();
       // 第 7 条：用户还没手动选过 ⇒ 按上次记忆复原（存的是源 id，插件装卸改变了顺序也不会选错）。
       // 记忆里的源已被卸载（indexOfSource 返回 -1）就保持 0，即原来的「第一个源」口径。
       if (!this.userPickedSource) {
@@ -204,7 +207,9 @@ export struct DiscoverPage {
       if (this.sources.length === 0) {
         this.animContent((): void => {
           this.items = [];
-          this.errorMsg = '暂无可用图源';
+          // s52：文案补一句去处。内置图源改成默认关闭后，「一个插件都没装 + 内置源没开」
+          // 是新装机用户第一眼就会撞上的状态，光说「暂无可用图源」等于让人以为应用坏了。
+          this.errorMsg = '暂无可用图源：请在「更多 → 插件管理」安装插件，或开启内置图源。';
         });
         return;
       }

@@ -179,9 +179,20 @@ export class PrefKeys {
   /** JM 分块反混淆模式：`jmDeobf:<插件 uuid>` = auto / on / off（见 data/image/JmDeobfuscate）。 */
   static readonly JM_DEOBF_PREFIX: string = 'jmDeobf:';
   static readonly COOKIE_PREFIX: string = 'cookie:';
+  /**
+   * 内置图源启用开关：`sourceEnabled:<图源 id>` = true / false。
+   * 键按 id 一张一值（不是一串 JSON）：内置源将来加第二枚不用改读写法，且坏一个值不影响另一个源。
+   * 缺省一律按 false 处理（见 SourceManager 的缺省口径注释）—— 取不到键 = 未启用。
+   */
+  static readonly SOURCE_ENABLED_PREFIX: string = 'sourceEnabled:';
 
   /** Cookie 键全名：前缀只有 COOKIE_PREFIX 一处字面量，别处再拼一次迟早漂。 */
   static cookieKey(host: string): string {
     return PrefKeys.COOKIE_PREFIX + host;
+  }
+
+  /** 内置图源启用开关键全名：同上，前缀只在这里出现一次。 */
+  static sourceEnabledKey(sourceId: string): string {
+    return PrefKeys.SOURCE_ENABLED_PREFIX + sourceId;
   }
 }

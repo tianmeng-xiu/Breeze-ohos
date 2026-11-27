@@ -36,7 +36,7 @@ import { MangaSource } from '../data/source/Source';
 import { PluginDetail, ComicExtras, DetailStat } from '../data/source/PluginDetail';
 import { MangaRepository } from '../data/db/MangaRepository';
 import { ImageCache } from '../data/image/ImageCache';
-import { MangaSummary, ChapterInfo, ReadProgress, SourceInfo } from '../data/model/Models';
+import { MangaSummary, ChapterInfo, ReadProgress } from '../data/model/Models';
 import { TextConvert } from '../util/TextConvert';
 import { errBriefForScreen, errLog, errTextOf } from '../util/ErrText';
 
@@ -1067,17 +1067,17 @@ struct DetailPage {
   }
 
   /**
-   * 图源显示名。不往 SourceManager 加 nameOf（那个文件已另派他人），
-   * 就地从 list() 里找：详情页一次只看一个源，线性扫一次的成本可忽略。
+   * 图源显示名。
+   * ★ s52 改口径：走 SourceManager.nameOf() 而不是就地扫 list()。两条理由：
+   *  1) 内置图源改成可开关后，「在册」与「可见」分家了 —— 被关掉的 MangaDex 不在 list() 之外的
+   *     任何集合里（list() 仍是全量），但语义上名字该由注册表给，扫 list() 只是当年绕开
+   *     「不往 SourceManager 加 nameOf」那条历史约束的临时写法，该约束已随本轮改名失效；
+   *  2) 名字拿不到时回落成 sourceId（'mangadex' 直接上屏）这条老路保持不变 —— 已注销的插件源
+   *     正是靠它才有可读的显示，不能改成空串。
    */
   private sourceName(): string {
-    const list: SourceInfo[] = SourceManager.getInstance().list();
-    for (let i = 0; i < list.length; i++) {
-      if (list[i].id === this.sourceId) {
-        return list[i].name;
-      }
-    }
-    return this.sourceId;
+    const n: string = SourceManager.getInstance().nameOf(this.sourceId);
+    return n.length > 0 ? n : this.sourceId;
   }
 
   /** 相关推荐点击：同图源就地换页（避免路由栈越堆越深），异图源压新页。 */

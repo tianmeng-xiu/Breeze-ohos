@@ -175,7 +175,7 @@ struct SearchPage {
   /** G1 联动：插件装载/删除后 chip 条同步（与 DiscoverPage 同一个 epoch）。 */
   @StorageProp('pluginSourceEpoch') @Watch('onSourceEpoch') pluginEpoch: number = 0;
 
-  /** chips 数据 = [全部] + SourceManager.list() */
+  /** chips 数据 = [全部] + SourceManager.visibleList()（s52：被关掉的内置源不进 chip 条） */
   @State chips: SourceInfo[] = [];
   @State chipIndex: number = 0;
   @State keyword: string = '';
@@ -467,7 +467,8 @@ struct SearchPage {
    * 当前选中已被卸载才退到上次记忆，两样都没有才回落 0。
    */
   private reloadChips(clampFirst: boolean): void {
-    const srcs: SourceInfo[] = SourceManager.getInstance().list();
+    // s52：chip 条只放可见源（用户关掉的内置源不进列表，也不进「全部」的聚合目标）。
+    const srcs: SourceInfo[] = SourceManager.getInstance().visibleList();
     const all: SourceInfo = { id: ALL_SOURCES_ID, name: '全部', language: '' };
     const next: SourceInfo[] = [all];
     for (let i = 0; i < srcs.length; i++) {
@@ -497,7 +498,9 @@ struct SearchPage {
         return this.chips[i].name;
       }
     }
-    return '';
+    // s52：chip 条里没有 ≠ 这源不存在。用户在一屏结果出来后把某源关掉，旧结果的图源小字
+    // 仍该有名字（chip 已过滤，故回落去注册表按 id 取，见 SourceManager.nameOf）。
+    return SourceManager.getInstance().nameOf(sid);
   }
 
   private animContent(op: () => void): void {

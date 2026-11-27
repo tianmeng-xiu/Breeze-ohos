@@ -35,6 +35,8 @@ import { pluginScanDir, bundleUnload, bundleList, pluginRemoveFile, bundleCall, 
 import { PluginStore, PluginRecord, ShopMapEntry } from '../../util/PluginStore';
 import { PluginSourceRegistry } from '../../data/source/PluginSourceRegistry';
 import { PluginAutoLoader, LoadOutcome } from '../../data/source/PluginAutoLoader';
+import { SourceManager } from '../../data/source/SourceManager';
+import { SourceInfo } from '../../data/model/Models';
 import { deriveLocalUuid } from '../../util/PluginUuid';
 import { jparse, jstr, jnum, jbool, jarr } from '../../util/JsonUtil';
 import { util } from '@kit.ArkTS';
@@ -68,6 +70,19 @@ export class PluginRow {
   hasUpdate: boolean = false;
 }
 
+/**
+ * 内置图源行（s52：内置图源改可开关）。
+ * 与 PluginRow 分开建模：内置源没有 localFile / uuid / 版本 / 更新通道，
+ * 硬塞进 PluginRow 会让那一行的八个字段里五个恒空，还要在每个按钮前加判空。
+ */
+export class BuiltInRow {
+  id: string = '';
+  title: string = '';
+  enabled: boolean = false;
+  /** 这一行下面的说明文案（解释「关掉后已收藏的作品照样能读」）。 */
+  note: string = '';
+}
+
 /** 商店索引行（plugin_mgr.bundle.cjs fetchIndex.items）。 */
 export class ShopItem {
   uuid: string = '';
@@ -97,6 +112,23 @@ const MGR_NAME: string = 'pluginMgr';
  * 行高 52vp，仍低于 Dim.menuItemH(56)，即「加图标不把行撑高」。
  */
 const PLUGIN_ICON_SIZE: number = 32;
+
+/**
+ * s52（2026-11-27 用户裁定）：内置图源那两行说明文案。
+ * 为什么必须写出来：这一枚开关的语义与插件的「停用」不一样 —— 关掉只是从发现页/搜索页的
+ * 来源条里撤掉，书架与收藏里已存的作品仍然能打开（内置源不注销）。不写清楚，用户只会以为
+ * 「关掉之后我收藏的那本打不开 = 应用坏了」。
+ */
+const BUILT_IN_ON_NOTE: string = '开启中：出现在发现页与搜索页的图源列表里。';
+const BUILT_IN_OFF_NOTE: string = '已关闭：不再出现在图源列表里；书架与收藏里已存的本源作品仍可正常阅读。';
+
+/**
+ * s52 冷启动补试参数（见 refreshBuiltIns 的 ★ 段）：内置源排在数据层第 41 行注册，
+ * 400ms × 5 = 2 秒足够覆盖数据层初始化（同仓实测 200–400ms，见 util/ThemeStore.ets 头注释），
+ * 上限写死是为了「真注册不上」时也不会留一个永远在跑的定时器。
+ */
+const BUILT_IN_RETRY_MS: number = 400;
+const BUILT_IN_RETRY_MAX: number = 5;
 
 /**
  * 第 6 条（增强）：进页静默检查更新的节流常量，全部写在这一处。
@@ -594,9 +626,73 @@ export struct PluginManagerView {
   @State autoSilent: boolean = false;
   /** 第 7 条：本次自动装载汇总（空串 = 不显示）。自动装载无按钮，必须给一行可见证据。 */
   @State autoNote: string = '';
+  /** s52：内置图源（含被关掉的）—— 与 rows 分开的两枚状态，因为它不参与 scanDir/清单 join。 */
+  @State builtIns: BuiltInRow[] = [];
+  /** s52：内置图源冷启动补试已用次数 / 组件是否还在世（定时器落地前必须双双把关）。 */
+  private builtInTries: number = 0;
+  private alive: boolean = true;
 
   private ctx(): common.UIAbilityContext {
     return getContext(this) as common.UIAbilityContext;
+  }
+
+  /** s52：拆页即掐掉内置源补试定时器（定时器只读内存表，掐它的理由是「不给已销毁组件赋 @State」）。 */
+  aboutToDisappear(): void {
+    this.alive = false;
+  }
+
+  /**
+   * s52：读内置图源行（数据源 = SourceManager.builtInList()，含关掉的；enabled 取自注册表内存态）。
+   * 单独一个方法而不是塞进 refresh：内置源不碰磁盘也不碰引擎，refresh 里那套 busy/scanDir/自动装载
+   * 与它毫无关系，混进去只会让「读一张内存表」这件事跟着一起被 busy 闸门挡掉。
+   *
+   * ★ 冷启动补试：内置源是 data/DataBootstrap.ets:41 才注册的，而 EntryAbility **不 await** 那个
+   * 初始化（见 view/bookshelf/BookshelfPage.ets 头注释同一条事实）。若用户冷启动后直奔本页，
+   * 第一眼可能赶上「内置表还是空的」⇒ 空表时按 BUILT_IN_RETRY_MS 补读，最多 BUILT_IN_RETRY_MAX 次
+   * （有表就立刻停）。补试只读内存表，零网络零磁盘。
+   */
+  private refreshBuiltIns(): void {
+    const sm: SourceManager = SourceManager.getInstance();
+    const infos: SourceInfo[] = sm.builtInList();
+    const out: BuiltInRow[] = [];
+    for (let i = 0; i < infos.length; i++) {
+      const r: BuiltInRow = new BuiltInRow();
+      r.id = infos[i].id;
+      r.title = infos[i].name;
+      r.enabled = sm.isEnabled(infos[i].id);
+      r.note = r.enabled ? BUILT_IN_ON_NOTE : BUILT_IN_OFF_NOTE;
+      out.push(r);
+    }
+    this.builtIns = out;
+    if (out.length === 0 && this.builtInTries < BUILT_IN_RETRY_MAX) {
+      this.builtInTries++;
+      setTimeout((): void => {
+        if (this.alive) {
+          this.refreshBuiltIns();
+        }
+      }, BUILT_IN_RETRY_MS);
+    }
+  }
+
+  /**
+   * s52：内置图源开关。落盘 + 改注册表都在 SourceManager.setEnabled 里做完（写失败它返回 false
+   * 且内存态不变），这里只负责「成功才动 UI + bump epoch 让 chip 条即时同步」。
+   * 与插件停用有意不同：不注销源、不卸载任何东西 ⇒ 关掉后书架/收藏里该源作品照样能读（用户裁定）。
+   */
+  async toggleBuiltIn(row: BuiltInRow): Promise<void> {
+    const next: boolean = !row.enabled;
+    try {
+      if (!(await SourceManager.getInstance().setEnabled(row.id, next))) {
+        this.refreshBuiltIns();
+        this.toast('该内置图源尚未就绪，请稍后重试');
+        return;
+      }
+      this.bumpSourceEpoch();
+      this.refreshBuiltIns();
+    } catch (e) {
+      // setEnabled 的写盘失败从这儿走：UI 保持原状（refreshBuiltIns 读的是没被改过的内存态）
+      this.toast('开关写入失败: ' + this.errBrief(e as Object));
+    }
   }
 
   /**
@@ -718,6 +814,15 @@ export struct PluginManagerView {
   }
 
   aboutToAppear(): void {
+    // s52：内置图源那一节先读（纯内存表，与下面那条异步 refresh 无依赖，不等它）。
+    // 次数计数器按「每次进页」重新给满：补试上限的用途是「不给已销毁组件反复挂定时器」，
+    // 不是「这个进程一辈子只准试 5 次」—— 冷启动那趟 2 秒没赶上（数据层慢启）时，
+    // 用户退出再进来还该有一次新的机会。
+    this.builtInTries = 0;
+    // alive 同样要复位：框架若复用同一个组件实例（aboutToDisappear 刚把它置 false），
+    // 不复位会让这一趟的补试定时器永远被 alive 闸门挡死。
+    this.alive = true;
+    this.refreshBuiltIns();
     // 第 6 条（增强）：refresh 之后再决定要不要静默补一次检查更新 —— rows 是 refresh 里 join 出来的，
     // 没 join 完就查等于拿空表白跑一趟（还会把节流时钟白白推进）。
     this.refresh()
@@ -1415,6 +1520,11 @@ export struct PluginManagerView {
 
   build() {
     Column() {
+      // s52（2026-11-27 用户裁定）：内置图源一节排在插件清单之前。
+      // 为什么放最前：内置源不需要下载、不需要目录、开机就在，用户想「把那个示例源关掉」时
+      // 不该先翻过一屏第三方插件才找到它。
+      this.builtInSection()
+
       Row() {
         // 第 3 条：原来这行是「插件目录 filesDir/plugins（清单 N 项）」= 直接把沙箱目录打在屏上
         Text('插件清单 ' + this.rows.length + ' 项')
@@ -1565,6 +1675,62 @@ export struct PluginManagerView {
     .height('100%')
     .backgroundColor(Theme.background(this.isDark))
     .bindContentCover($$this.shopOpen, this.shopSheet(), ModalTransition.DEFAULT)
+  }
+
+  /**
+   * s52：内置图源那一节（标题 + 每源一行：名称 + 说明 + 开关）。
+   * 不并入下面那个 List：那个 List 带 layoutWeight(1) 与 contentEndOffset，且空态判定只看插件行数 ——
+   * 混进去会让「一个插件都没装」时内置源跟着空态文案一起被顶到下面，而内置源恰恰那时候最需要能关。
+   * ForEach 的 key 带 enabled（与插件行同口径）：@State 数组元素属性改动不触发重渲染，
+   * 只能靠 key 变化让整行重建 ⇒ Toggle 才会跟着翻。
+   */
+  @Builder
+  builtInSection() {
+    Column() {
+      // 空表不占屏：冷启动赶上数据层还没注册（refreshBuiltIns 正在按 400ms 补试）时，
+      // 顶着一行「内置图源 0 项」比什么都没有更像 bug。真注册不上由诊断面板 25 号行说话。
+      if (this.builtIns.length > 0) {
+        Text('内置图源 ' + this.builtIns.length + ' 项')
+          .fontSize(12)
+          .fontColor(Theme.text2(this.isDark))
+          .width('100%')
+          .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: 8 })
+      }
+      ForEach(this.builtIns, (row: BuiltInRow) => {
+        Row() {
+          Column() {
+            Text(row.title)
+              .fontSize(15)
+              .fontColor(Theme.text1(this.isDark))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+            Text(row.note)
+              .fontSize(11)
+              .fontColor(Theme.text3(this.isDark))
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+              .margin({ top: 3 })
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          Toggle({ type: ToggleType.Switch, isOn: row.enabled })
+            .margin({ left: 10 })
+            .onChange((on: boolean) => {
+              if (on !== row.enabled) {
+                this.toggleBuiltIn(row);
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: Dim.pagePadding, right: Dim.pagePadding, top: 10, bottom: 10 })
+        .backgroundColor(Theme.cardColor(this.isDark))
+        .margin({ top: 6 })
+      }, (row: BuiltInRow) => row.id + '|' + row.enabled)
+    }
+    .width('100%')
   }
 
   /** 商店弹层（判据②）：全屏覆盖层；每行「下载」= installLatest（成功只落盘 ⇒ 回列表 unregistered）。 */

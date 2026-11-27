@@ -38,6 +38,7 @@ import { PluginStore, PluginRecord } from '../util/PluginStore';
 import { deriveLocalUuid } from '../util/PluginUuid';
 import { PluginInit } from '../util/PluginInit';
 import { JmRaceDiag } from '../util/JmRaceDiag';
+import { SourceManager } from '../data/source/SourceManager';
 
 /** rawfile 路径（不带 rawfile/ 前缀）。real.bundle.cjs 可选：缺则面板第 7 项 SKIP。 */
 const RAW_SELFTEST: string = 'plugins/selftest.bundle.cjs';
@@ -99,6 +100,8 @@ class DiagReport {
   pluginCfgKeys: string = '';
   /** 24 jmRace（s49 取证探针）：章节空页表 B1/B2 判别 + 排行榜 init 冷窗口读数（纯观测）。 */
   jmRace: string = '';
+  /** 25 builtinSources（s52）：内置图源开关的在册/可见/内存态/盘上值读数（纯观测）。 */
+  builtinSources: string = '';
   storageRoot: string = '';
   verdict: string = '';
   items: DiagItem[] = [];
@@ -259,6 +262,8 @@ struct Index {
   private diagKeys: string = '';
   /** 24 jmRace 行原文（s49 取证探针）：JmRaceDiag.hint()，现算不落盘。 */
   private diagJmRace: string = '';
+  /** 25 builtinSources 行原文（s52）：SourceManager.diagHint()，现算不落盘。 */
+  private diagBuiltIn: string = '';
 
   /** 诊断面板显隐（用户 m02396 硬约束：不许压屏幕顶部 ⇒ 改底部弹层 + 可收起）。 */
   @State diagOpen: boolean = true;
@@ -1235,6 +1240,18 @@ struct Index {
       pushFixed(24, 'jmRace', 'INFO', 'unavailable: ' + em(e as Object), 200);
     }
 
+    // ---- 25 builtinSources（s52）：内置图源开关读数（INFO 不计入判定）。
+    // 判读：mem 与 disk 不一致 = 内存态与偏好不同步（applyPrefs 时机问题）；两边都 0 = 正常关闭；
+    // bi=0 且 done=0 = 面板早于数据层第 41 行打开，重开面板即可。
+    try {
+      const bhint: string = SourceManager.getInstance().diagHint();
+      this.diagBuiltIn = bhint;
+      pushFixed(25, 'builtinSources', 'INFO', bhint, 720);
+    } catch (e) {
+      this.diagBuiltIn = 'throw: ' + em(e as Object);
+      pushFixed(25, 'builtinSources', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
     // ---- 总判定 + 可复制 JSON。S4 起前缀 S4（判定 12 项：S2 七项 + net + download + unload +
     //      fileChain + jailEscape；pluginIndex/selftest/exports 为 INFO 不计入），如需回退字样可改。
     const verdict: string = fails === 0
@@ -1267,6 +1284,7 @@ struct Index {
     report.pluginInit = this.diagInit;
     report.pluginCfgKeys = this.diagKeys;
     report.jmRace = this.diagJmRace;
+    report.builtinSources = this.diagBuiltIn;
     report.storageRoot = this.diagStorageRoot;
     report.verdict = verdict;
     report.items = items;

@@ -37,7 +37,8 @@ export async function initDataLayer(context: common.UIAbilityContext): Promise<v
   // 插件取图/反混淆通道（s6j）：必须在 ImageCache 之后、图源注册之前，纯对象注册零副作用
   PluginImageOps.install();
 
-  // 注册内置图源（MangaDex），幂等
+  // 注册内置图源（MangaDex），幂等。s52：这一句同时按偏好把内置源的可见性下发一遍
+  // （内置源默认关 ⇒ 它仍在册可读，只是不进发现页/搜索页的来源条，见 data/source/SourceManager 头注释）。
   SourceManager.getInstance().initBuiltIn();
 
   // G1：插件清单 → 图源注册表。必须在 initBuiltIn() 之后；内部整体吞异常，
