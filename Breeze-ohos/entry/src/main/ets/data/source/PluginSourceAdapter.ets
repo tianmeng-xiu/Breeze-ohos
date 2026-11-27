@@ -16,6 +16,7 @@ import { MangaSource, SearchPageResult } from './Source';
 import { MangaSummary, ChapterInfo, PageImage, SourceInfo } from '../model/Models';
 import { bundleCall, bundleCallBytes, bundleLoadFromPath, bundleList, BytesResult } from '../../util/PluginRuntime';
 import { PluginInit } from '../../util/PluginInit';
+import { JmRaceDiag } from '../../util/JmRaceDiag';
 import { jparse, jstr, jobj, jarr, jstrArr, jisEmpty, jint, jbool } from '../../util/JsonUtil';
 import { Logger } from '../../util/Logger';
 
@@ -233,6 +234,11 @@ export class PluginSourceAdapter implements MangaSource {
   /** 装载后调用 bundleCall，异常统一包成「<action>（fnPath）：<原错>」。 */
   private async call(action: string, fnPath: string, arg: Object): Promise<ESObject> {
     await this.ensureLoaded(action);
+    // s50 修①（治「排行榜首次点击必失败」）：本插件的 init 还在飞时有界等它落地（上限 12 s，
+    // 见 PluginInit.INIT_WAIT_MS 的真机依据），落地/未导出/从未 mark 都零开销立即返回。
+    // 只记不拦：等完不管成败都照常发请求，超时保留原报错面 —— 等待本身不制造新错误。
+    // 真机 s49 双报告的 pf 段 init=run ∧ age=-1（t=823ms 打到死回退域拿 nginx 404）就是这条冷窗。
+    await PluginInit.awaitInitReady(this.uuid);
     let raw: string = '';
     try {
       raw = await bundleCall(this.uuid, fnPath, JSON.stringify([arg]));
@@ -416,7 +422,22 @@ export class PluginSourceAdapter implements MangaSource {
     const p1: number = Math.max(1, Math.floor(page) || 1);
     const a: RankingArg = new RankingArg();
     a.page = p1 - 1;
-    const o: ESObject = await this.call('加载热门失败', 'getRankingData', a);
+    // s49 取证（纯观测）：只包住这一跳 await 记耗时与失败快照，映射逻辑不动、异常原样上抛。
+    // 用途 = 判「排行榜首次点击必失败」是不是落在插件 init 的冷窗口内（24 号行 jmRace 的 pf 段）。
+    const t0: number = Date.now();
+    let o: ESObject;
+    try {
+      o = await this.call('加载热门失败', 'getRankingData', a);
+    } catch (e) {
+      JmRaceDiag.notePopular(Date.now() - t0, PluginInit.stateOf(this.uuid),
+        PluginInit.doneAgeMs(this.uuid), errText(e as Object));
+      // ArkTS 禁裸重抛（10605087 arkts-limited-throw）：this.call 抛的本就是 Error，命中
+      // instanceof 时抛**同一个实例**（对象身份与 message 都不变）；非 Error 才兜一层
+      // new Error(errText(...))，message 仍取原 message 原文 —— 与 :241 同款写法。
+      const again: Error = e instanceof Error ? e as Error : new Error(errText(e as Object));
+      throw again;
+    }
+    JmRaceDiag.notePopularOk(Date.now() - t0);
     return PluginSourceAdapter.itemsToSummaries(o, PLUGIN_SOURCE_PREFIX + this.uuid);
   }
 
@@ -515,6 +536,10 @@ export class PluginSourceAdapter implements MangaSource {
     }
     this.rememberManga(mangaId);
     this.rememberChapter(mangaId, out);
+    // s49 取证（纯观测）：覆盖式记最近一次章节列表的枚数与首枚 id/title。
+    // 用途 = 与页表为空那次联立判「假单章」（eps=1 且首章 id 等于作品 id ⇒ 插件伪造，见 24 号行 ch 段）。
+    JmRaceDiag.noteChapters(this.uuid, mangaId, out.length,
+      out.length > 0 ? out[0].id : '', out.length > 0 ? out[0].title : '');
     return out;
   }
 
@@ -533,43 +558,95 @@ export class PluginSourceAdapter implements MangaSource {
     a.chapterId = this.outChapterId(chapterId);
     const cached: string | undefined = this.chapterComic.get(chapterId);
     a.comicId = cached !== undefined ? cached : this.lastMangaId;
-    const o: ESObject = await this.call('加载章节内容失败', 'getChapter', a);
-    let chapter: ESObject = jobj(jobj(o, 'data'), 'chapter');
-    let pages: ESObject[] = jarr(chapter, 'pages');
-    if (pages.length === 0) {
-      chapter = jobj(o, 'chapter');
-      pages = jarr(chapter, 'pages');
-    }
-    if (pages.length === 0) {
-      throw new Error('章节页表为空（' + this.displayName + ' chapterId=' + chapterId + '）');
-    }
-    const out: PageImage[] = [];
-    let usable: number = 0;
-    for (let i = 0; i < pages.length; i++) {
-      const pg: ESObject = pages[i];
-      const url: string = jstr(pg, 'url', jstr(jobj(pg, 'extern'), 'url', ''));
-      if (url.length > 0) {
-        usable++;
+    // s49 取证（纯观测）：只记一次取数耗时与两个失败分支的现场快照，**成功路径零额外开销**
+    //（rawText 的整包 stringify 只在要抛的那条路上做）。异常文案与返回语义一字未动。
+    const t0: number = Date.now();
+    // s50 修②（治「章节页表为空」）：空页表 / 全空地址都先补跑一次 init（端点池走缓存、
+    // 登录重发把插件进程内 30 min TTL 的登录态补回来）再重试**一次**；仍然空才按原文案抛。
+    // 依据 = s48/s49 取证：JM 0.1.1 的 getChapter 在登录态缺失时拿 HTTP 200 + images 缺位，
+    // 插件自己不抛错 ⇒ 宿主只能看到干净的空页表；而真机「杀掉重开就自己好了」= 重登补上了 jwt。
+    // kicked 是本轮局部量：每次 fetchPages 至多自愈一次，绝不做二次重试。
+    let kicked: boolean = false;
+    for (let round = 0; round < 2; round++) {
+      const o: ESObject = await this.call('加载章节内容失败', 'getChapter', a);
+      let chapter: ESObject = jobj(jobj(o, 'data'), 'chapter');
+      let pages: ESObject[] = jarr(chapter, 'pages');
+      if (pages.length === 0) {
+        chapter = jobj(o, 'chapter');
+        pages = jarr(chapter, 'pages');
       }
-      // s17 第 5 条：把这一页的 extern 原样带上（空对象记空串，与「非空才透传」的出口对齐）。
-      // 这是 e-hentai 这类哨兵 url 图源唯一的取图入参，也是同章各页唯一可分标识。
-      const extObj: ESObject = jobj(pg, 'extern');
-      let ext: string = '';
-      if (!jisEmpty(extObj)) {
-        try {
-          ext = JSON.stringify(extObj);
-        } catch (e) {
-          ext = '';
+      if (pages.length === 0) {
+        if (!kicked) {
+          kicked = true;
+          JmRaceDiag.noteChapterKick();
+          await PluginInit.kickInit(this.uuid);
+          continue;
         }
+        // s49 取证：init 态与 age= 判 B2（事件早于登录生效 / 超 30 min TTL），
+        // 两个 id 与 img= 判 B1（章节 id 被伪造成 albumId）。a.chapterId 是出口值、a.comicId 本就是 string。
+        let rawText: string = '';
+        try {
+          rawText = JSON.stringify(o);
+        } catch (e) {
+          rawText = '';
+        }
+        JmRaceDiag.noteChapterEmpty(Date.now() - t0, PluginInit.stateOf(this.uuid),
+          PluginInit.doneAgeMs(this.uuid), a.chapterId, a.comicId, Object.keys(o), Object.keys(chapter),
+          JmRaceDiag.imgStateOf(o), JmRaceDiag.sigOf(rawText));
+        throw new Error('章节页表为空（' + this.displayName + ' chapterId=' + chapterId + '）');
       }
-      const p: PageImage = { index: i, url: url, ext: ext };
-      out.push(p);
+      const out: PageImage[] = [];
+      let usable: number = 0;
+      for (let i = 0; i < pages.length; i++) {
+        const pg: ESObject = pages[i];
+        const url: string = jstr(pg, 'url', jstr(jobj(pg, 'extern'), 'url', ''));
+        if (url.length > 0) {
+          usable++;
+        }
+        // s17 第 5 条：把这一页的 extern 原样带上（空对象记空串，与「非空才透传」的出口对齐）。
+        // 这是 e-hentai 这类哨兵 url 图源唯一的取图入参，也是同章各页唯一可分标识。
+        const extObj: ESObject = jobj(pg, 'extern');
+        let ext: string = '';
+        if (!jisEmpty(extObj)) {
+          try {
+            ext = JSON.stringify(extObj);
+          } catch (e) {
+            ext = '';
+          }
+        }
+        const p: PageImage = { index: i, url: url, ext: ext };
+        out.push(p);
+      }
+      if (usable === 0) {
+        // 全空 URL 的页表同样是白屏（JM 需要 jwt/风控时会返回这种壳），一并转中文 Error。
+        // s49 取证：pages 非空 ⇒ imgState 恒按 3（数组非空，反向对照位）；同样 stringify 只走这条路。
+        if (!kicked) {
+          kicked = true;
+          JmRaceDiag.noteChapterKick();
+          await PluginInit.kickInit(this.uuid);
+          continue;
+        }
+        let rawText2: string = '';
+        try {
+          rawText2 = JSON.stringify(o);
+        } catch (e) {
+          rawText2 = '';
+        }
+        JmRaceDiag.noteChapterEmpty(Date.now() - t0, PluginInit.stateOf(this.uuid),
+          PluginInit.doneAgeMs(this.uuid), a.chapterId, a.comicId, Object.keys(o), Object.keys(chapter),
+          3, JmRaceDiag.sigOf(rawText2));
+        throw new Error('章节页表缺少图片地址（' + this.displayName + ' chapterId=' + chapterId + '）');
+      }
+      JmRaceDiag.noteChapterOk(out.length);
+      if (kicked) {
+        // 24 号行 kickOk= = 「补跑 init 之后这次读成了」的直读证据（kick= 只证明触发自愈，
+        // kickOk= 才证明自愈有效；两数联立才不会把「试了但没用」读成「修好了」）。
+        JmRaceDiag.noteChapterKickOk();
+      }
+      return out;
     }
-    if (usable === 0) {
-      // 全空 URL 的页表同样是白屏（JM 需要 jwt/风控时会返回这种壳），一并转中文 Error。
-      throw new Error('章节页表缺少图片地址（' + this.displayName + ' chapterId=' + chapterId + '）');
-    }
-    return out;
+    // 循环内两条出路必居其一（return 或 throw），这行只是编译器要的可达性兜底，文案与首分支同形。
+    throw new Error('章节页表为空（' + this.displayName + ' chapterId=' + chapterId + '）');
   }
 
   /**

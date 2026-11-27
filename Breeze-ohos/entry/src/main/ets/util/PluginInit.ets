@@ -15,7 +15,13 @@
  * 三态记账：ok = init 跑完；ni = 该插件没导出 init（引擎报 target is not function / function path
  * not found，判正常）；err = 其它异常（只留最后一条消息前 160 字符）。
  * hint() 只输出计数与 uuid 前 8 位的三态，绝不输出凭据、URL 查询参数、响应体。
- * 依据系统 Kit：无（全部走 util/PluginRuntime 的宿主通道）。
+ * s50 起新增「就绪信号」（真机定案 s49 双报告：pf 段 init=run ∧ age=-1 = 数据调用撞进
+ * init 冷窗；章节空页 = 插件 30 min TTL 登录态过期无自愈）：
+ *  - awaitInitReady(uuid)：仅当该 uuid 的 init 正在飞时有界等待，其余情形同步立即返回；
+ *  - kickInit(uuid)：重挂一次 init 并有界等完（端点池走缓存是快路径，登录会重跑补 jwt）。
+ *  两条都不改 mark/rearm/pump 的既有语义；mark 硬约束 1（调用方绝不 await）依旧成立，
+ *  等待只发生在 awaitInitReady / kickInit 这两个显式入口里。
+ * 依据系统 Kit：无（全部走 util/PluginRuntime 的宿主通道；定时器只用全局 setTimeout/clearTimeout）。
  */
 import { bundleCall } from './PluginRuntime';
 import { Logger } from './Logger';
@@ -34,6 +40,28 @@ function cut160(s: string): string {
   return s.length > 160 ? s.slice(0, 160) : s;
 }
 
+/**
+ * s50 修①：等一次 init 落地的上限。依据 = 插件冷路径（拉域名列表 + ≤6 探针 + ≤3 次登录），
+ * 真机 s49 回传池建立 ≈1.2 s（探针 538/546/635 ms），12 s 留足余量；引擎侧单次调用上限 30 s，
+ * 等待必须显著小于它，超时就放行、保留原有报错面（等待绝不制造新的错误面）。
+ */
+const INIT_WAIT_MS: number = 12000;
+
+/** s50：就绪轮询间隔（与 BookshelfPage READY_RETRY_DELAYS 的退避同量级；单次开销 = 一次 Map 取值）。 */
+const INIT_POLL_MS: number = 150;
+
+/** s50：轮询次数上限 = 80 × 150 ms ≈ 12 s，与 INIT_WAIT_MS 同量级（deadline 是第一道，这一枚是兜底）。 */
+const INIT_POLL_MAX: number = 80;
+
+/** 让出若干毫秒：与 view/bookshelf/BookshelfPage.ets:32 sleepMs、data/image/ImageCache.ets:76 yieldFrame 同型写法（Promise 包 setTimeout）。 */
+function sleepInit(ms: number): Promise<void> {
+  return new Promise<void>((resolve: () => void): void => {
+    setTimeout((): void => {
+      resolve();
+    }, ms);
+  });
+}
+
 export class PluginInit {
   /** 已 mark 过的 uuid（每 bundle 每进程至多一次 init 的唯一权威）。 */
   private static readonly done: Set<string> = new Set<string>();
@@ -48,6 +76,11 @@ export class PluginInit {
   private static errCount: number = 0;
   /** 最后一条真失败消息（截 160），诊断 22 行 last= 段。 */
   private static lastErr: string = '';
+  /**
+   * 每 uuid 的 init 落地时刻（s49 取证用：s24 号行要知道「事件距 init 完成多久」，
+   * 因为插件侧端点池与 jwt 都是 30 min TTL）。只加记账，不参与任何判定。
+   */
+  private static readonly finishedAt: Map<string, number> = new Map<string, number>();
 
   /**
    * 「该插件没导出 init」的引擎原文形态（vendored host_runtime.rs 的两条报错前缀），
@@ -110,10 +143,99 @@ export class PluginInit {
           }
         }
         PluginInit.states.set(uuid, note);
+        PluginInit.finishedAt.set(uuid, Date.now());
       }
     } finally {
       PluginInit.running = false;
     }
+  }
+
+  /**
+   * s50 修①（治「排行榜首次点击必失败」）：该插件的 init 正在飞时**有界等完**，其余情形立即返回。
+   * 返回 true = init 已落地且成功（或本就没导出 init / 从未 mark —— 那两种没有可等的东西）；
+   * false = 仍在飞（已超时放行）或落地但失败。调用方**只记不拦**：超时也照常发请求，
+   * 保留原报错面（真机 s49 的 pf 段 init=run ∧ age=-1 就是这么来的）。
+   * 有界性靠 deadline + 轮询上限双保险，绝不无界挂起。
+   */
+  static async awaitInitReady(uuid: string): Promise<boolean> {
+    if (uuid.length === 0) {
+      return false;
+    }
+    if (PluginInit.stateOf(uuid) !== 'run') {
+      return true;
+    }
+    const deadline: number = Date.now() + INIT_WAIT_MS;
+    for (let i = 0; i < INIT_POLL_MAX; i++) {
+      await sleepInit(INIT_POLL_MS);
+      const st: string = PluginInit.stateOf(uuid);
+      if (st !== 'run') {
+        return st === 'ok';
+      }
+      if (Date.now() >= deadline) {
+        break;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * s50 修②（治「章节页表为空」）：重挂一次 init 并有界等完。
+   * 为什么这样能治：插件侧登录态 jwt 只活在进程内缓存（30 min TTL），且只有 /login 响应里的
+   * jwttoken 会写它 ⇒ 用户挂机超 30 min 后取章节必然空页表，而插件自己不会自愈。
+   * 重跑 init = 端点池走缓存（rf() 命中即 return，快路径）+ 登录重发（把 jwt 补回来）。
+   * 与 rearm 的区别 = rearm 发完不管（fire-and-forget，硬约束 1），kickInit 会等它落地再返回。
+   * 真失败照实写日志与 last=（不吞），只是不把异常抛给取数链路 —— 由调用方重试那一次请求裁决。
+   * 返回 true = 本次重挂跑成功；false = 没等完 / 未导出 init / 失败。
+   */
+  static async kickInit(uuid: string): Promise<boolean> {
+    if (uuid.length === 0) {
+      return false;
+    }
+    // 已有一次在飞（别的装载路径刚 mark）：不再重复入队，直接等那一枚落地。
+    if (PluginInit.stateOf(uuid) === 'run') {
+      return PluginInit.awaitInitReady(uuid);
+    }
+    // 判「这一次新落地」的锚 = finishedAt 是否换了值。不能只看 stateOf：rearm 之后 states 里
+    // 还是上一轮的 'ok'，据此判就绪会立刻返回真值而根本没等到新 init 跑完。
+    // （-1 哨兵：本进程从未落地过的 uuid，get 是 undefined，两帧比较必须先归成同一数值。）
+    const prevRaw: number | undefined = PluginInit.finishedAt.get(uuid);
+    const prev: number = prevRaw === undefined ? -1 : prevRaw;
+    PluginInit.rearm(uuid);
+    const deadline: number = Date.now() + INIT_WAIT_MS;
+    for (let i = 0; i < INIT_POLL_MAX; i++) {
+      await sleepInit(INIT_POLL_MS);
+      const curRaw: number | undefined = PluginInit.finishedAt.get(uuid);
+      const cur: number = curRaw === undefined ? -1 : curRaw;
+      if (cur !== prev) {
+        return PluginInit.stateOf(uuid) === 'ok';
+      }
+      if (Date.now() >= deadline) {
+        break;
+      }
+    }
+    Logger.w('plugin init kick 超时未落地 ' + uuid.slice(0, 8) + ' state=' + PluginInit.stateOf(uuid));
+    return false;
+  }
+
+  /**
+   * s49 取证出口：某 uuid 的 init 态三档（ok/ni/err 已落地；run = 已 mark 未落地；
+   * none = 本进程从未 mark）。**只读**，不改任何行为。
+   */
+  static stateOf(uuid: string): string {
+    const v: string | undefined = PluginInit.states.get(uuid);
+    if (v !== undefined) {
+      return v;
+    }
+    return PluginInit.done.has(uuid) ? 'run' : 'none';
+  }
+
+  /** s49 取证出口：距该 uuid init 完成的毫秒；未完成/未 mark = -1。 */
+  static doneAgeMs(uuid: string): number {
+    const t: number | undefined = PluginInit.finishedAt.get(uuid);
+    if (t === undefined) {
+      return -1;
+    }
+    return Date.now() - t;
   }
 
   /**

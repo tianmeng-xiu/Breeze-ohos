@@ -37,6 +37,7 @@ import { UserSettings } from '../util/UserSettings';
 import { PluginStore, PluginRecord } from '../util/PluginStore';
 import { deriveLocalUuid } from '../util/PluginUuid';
 import { PluginInit } from '../util/PluginInit';
+import { JmRaceDiag } from '../util/JmRaceDiag';
 
 /** rawfile 路径（不带 rawfile/ 前缀）。real.bundle.cjs 可选：缺则面板第 7 项 SKIP。 */
 const RAW_SELFTEST: string = 'plugins/selftest.bundle.cjs';
@@ -96,6 +97,8 @@ class DiagReport {
   pluginInit: string = '';
   /** 23 pluginCfgKeys（s46 P2）：持久化桶键名清单（只有键名与长度，无值）。 */
   pluginCfgKeys: string = '';
+  /** 24 jmRace（s49 取证探针）：章节空页表 B1/B2 判别 + 排行榜 init 冷窗口读数（纯观测）。 */
+  jmRace: string = '';
   storageRoot: string = '';
   verdict: string = '';
   items: DiagItem[] = [];
@@ -254,6 +257,8 @@ struct Index {
   private diagInit: string = '';
   /** 23 pluginCfgKeys 行原文（s46 P2）：BreezeHost.configBucketKeysHint()，现算不落盘。 */
   private diagKeys: string = '';
+  /** 24 jmRace 行原文（s49 取证探针）：JmRaceDiag.hint()，现算不落盘。 */
+  private diagJmRace: string = '';
 
   /** 诊断面板显隐（用户 m02396 硬约束：不许压屏幕顶部 ⇒ 改底部弹层 + 可收起）。 */
   @State diagOpen: boolean = true;
@@ -1217,6 +1222,19 @@ struct Index {
       pushFixed(23, 'pluginCfgKeys', 'INFO', 'unavailable: ' + em(e as Object), 200);
     }
 
+    // ---- 24 jmRace（s49 取证探针）：JM 章节空页表的 B1/B2 判别 + 排行榜 init 冷窗口（INFO 不计入判定）。
+    // 判读：pc 段 same=1 且 fake=1 ⇒ B1（插件把作品 id 当章节 id 伪造单章，宿主侧无需改链路）；
+    // init=none/run 或 age=-1 ⇒ B2（事件早于登录/init 生效）；age>1800000 = 已过插件 30 min TTL；
+    // img= 四档 0 无 images 键、1 非数组、2 空数组、3 非空数组；pf 段是排行榜首次点击的失败现场。
+    try {
+      const rhint24: string = JmRaceDiag.hint();
+      this.diagJmRace = rhint24;
+      pushFixed(24, 'jmRace', 'INFO', rhint24, 720);
+    } catch (e) {
+      this.diagJmRace = 'throw: ' + em(e as Object);
+      pushFixed(24, 'jmRace', 'INFO', 'unavailable: ' + em(e as Object), 200);
+    }
+
     // ---- 总判定 + 可复制 JSON。S4 起前缀 S4（判定 12 项：S2 七项 + net + download + unload +
     //      fileChain + jailEscape；pluginIndex/selftest/exports 为 INFO 不计入），如需回退字样可改。
     const verdict: string = fails === 0
@@ -1248,6 +1266,7 @@ struct Index {
     report.jmRuntime = this.diagJm;
     report.pluginInit = this.diagInit;
     report.pluginCfgKeys = this.diagKeys;
+    report.jmRace = this.diagJmRace;
     report.storageRoot = this.diagStorageRoot;
     report.verdict = verdict;
     report.items = items;
